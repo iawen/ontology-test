@@ -1,0 +1,291 @@
+import os
+import json
+import hashlib
+import sqlite3
+
+from configs.global_config import Cfg
+
+def get_db():
+    os.makedirs(os.path.dirname(Cfg.db_path), exist_ok=True)
+    conn = sqlite3.connect(Cfg.db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT DEFAULT 'admin',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS scenarios (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            data_dir TEXT NOT NULL,
+            ontology_dir TEXT NOT NULL,
+            is_active INTEGER DEFAULT 0,
+            is_default INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS schema_classes (
+            id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            name_cn TEXT DEFAULT '',
+            description TEXT DEFAULT '',
+            properties TEXT DEFAULT '[]',
+            fields TEXT DEFAULT '[]',
+            csv_file TEXT DEFAULT '',
+            primary_key TEXT DEFAULT '',            
+            PRIMARY KEY (id, scenario_id)
+        );
+        CREATE TABLE IF NOT EXISTS schema_relationships (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scenario_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            target TEXT NOT NULL,
+            type TEXT DEFAULT '',
+            source_key TEXT DEFAULT '',
+            target_key TEXT DEFAULT '',
+            description TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS conversations (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            title TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT DEFAULT '',
+            visualization TEXT DEFAULT '',
+            steps TEXT DEFAULT '',
+            action_confirm TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS suggested_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scenario_id TEXT NOT NULL,
+            question TEXT NOT NULL,
+            icon TEXT DEFAULT '💬',
+            sort_order INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS metrics (
+            id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            category TEXT DEFAULT '',
+            target_class TEXT DEFAULT '',
+            calculation TEXT DEFAULT '',
+            formula TEXT DEFAULT '',
+            dimensions TEXT DEFAULT '[]',
+            required_dimensions TEXT DEFAULT '[]',
+            filters_hint TEXT DEFAULT '',
+            chart_type TEXT DEFAULT 'bar',
+            sort_order INTEGER DEFAULT 0,
+            PRIMARY KEY (id, scenario_id)
+        );
+        CREATE TABLE IF NOT EXISTS concepts (
+            id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            parent_id TEXT DEFAULT '',
+            level INTEGER DEFAULT 0,
+            concept_type TEXT DEFAULT '',
+            related_class TEXT DEFAULT '',
+            sort_order INTEGER DEFAULT 0,
+            PRIMARY KEY (id, scenario_id)
+        );
+        CREATE TABLE IF NOT EXISTS chart_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scenario_id TEXT NOT NULL,
+            data_pattern TEXT NOT NULL,
+            chart_type TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            priority INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS glossary_terms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scenario_id TEXT NOT NULL,
+            term TEXT NOT NULL,
+            standard_name TEXT DEFAULT '',
+            aliases TEXT DEFAULT '[]',
+            description TEXT DEFAULT '',
+            category TEXT DEFAULT '',
+            sort_order INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS skills (
+            id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            trigger_condition TEXT DEFAULT '',
+            content TEXT DEFAULT '',
+            is_active INTEGER DEFAULT 1,
+            sort_order INTEGER DEFAULT 0,
+            PRIMARY KEY (id, scenario_id)
+        );
+        CREATE TABLE IF NOT EXISTS extraction_logs (
+            id TEXT PRIMARY KEY,
+            scenario_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'running',
+            started_at TEXT DEFAULT '',
+            finished_at TEXT DEFAULT '',
+            duration REAL DEFAULT 0,
+            message TEXT DEFAULT '',
+            trigger TEXT DEFAULT 'manual'
+        );
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER DEFAULT 0,
+            username TEXT DEFAULT '',
+            action TEXT NOT NULL,
+            resource_type TEXT DEFAULT '',
+            resource_id TEXT DEFAULT '',
+            scenario_id TEXT DEFAULT '',
+            detail TEXT DEFAULT '',
+            ip TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS data_connections (
+            id TEXT PRIMARY KEY,
+            scenario_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            db_type TEXT NOT NULL DEFAULT 'postgresql',
+            connection_url TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS actions (
+            id TEXT PRIMARY KEY,
+            scenario_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            action_type TEXT NOT NULL DEFAULT 'notification',
+            trigger_condition TEXT DEFAULT '',
+            target_object TEXT DEFAULT '',
+            parameters TEXT DEFAULT '{}',
+            is_active INTEGER DEFAULT 1,
+            requires_confirm INTEGER DEFAULT 1,
+            sort_order INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS action_logs (
+            id TEXT PRIMARY KEY,
+            scenario_id TEXT NOT NULL,
+            action_id TEXT NOT NULL,
+            action_name TEXT DEFAULT '',
+            trigger_type TEXT DEFAULT 'manual',
+            trigger_reason TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            result TEXT DEFAULT '',
+            executed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT DEFAULT '',
+            duration REAL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS alert_rules (
+            id TEXT PRIMARY KEY,
+            scenario_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            target_class TEXT NOT NULL,
+            condition_expression TEXT NOT NULL,
+            action_id TEXT DEFAULT '',
+            severity TEXT DEFAULT 'warning',
+            is_active INTEGER DEFAULT 1,
+            last_triggered_at TEXT DEFAULT '',
+            trigger_count INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS workflow_instances (
+            id TEXT PRIMARY KEY,
+            scenario_id TEXT NOT NULL,
+            workflow_def_id TEXT DEFAULT '',
+            workflow_name TEXT NOT NULL,
+            action_id TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            current_step INTEGER DEFAULT 0,
+            total_steps INTEGER DEFAULT 0,
+            context TEXT DEFAULT '{}',
+            steps_json TEXT DEFAULT '[]',
+            result TEXT DEFAULT '',
+            triggered_by TEXT DEFAULT 'manual',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS workflow_step_logs (
+            id TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL,
+            step_index INTEGER NOT NULL,
+            step_name TEXT DEFAULT '',
+            step_type TEXT DEFAULT 'manual',
+            status TEXT NOT NULL DEFAULT 'pending',
+            assignee TEXT DEFAULT '',
+            result TEXT DEFAULT '',
+            started_at TEXT DEFAULT '',
+            finished_at TEXT DEFAULT '',
+            duration REAL DEFAULT 0
+        );
+    """)
+    # 默认管理员
+    cur = conn.execute("SELECT COUNT(*) FROM users")
+    if cur.fetchone()[0] == 0:
+        pwd_hash = hashlib.sha256("admin123".encode()).hexdigest()
+        conn.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", ("admin", pwd_hash, "admin"))
+
+
+    # 默认系统设置
+    cur = conn.execute("SELECT COUNT(*) FROM system_settings")
+    if cur.fetchone()[0] == 0:
+        default_settings = [
+            ("llm_provider", "openai"),
+            ("llm_model", "qwen-plus"),
+            ("llm_api_key", ""),
+            ("llm_base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            ("extraction_batch_size", "5"),
+            ("max_concurrent_extractions", "2"),
+            ("auto_extract_on_upload", "true"),
+            ("log_level", "INFO"),
+        ]
+        conn.executemany(
+            "INSERT INTO system_settings (key, value) VALUES (?, ?)",
+            default_settings,
+        )
+
+    conn.commit()
+
+    # ── 数据库迁移：为已有表添加新字段 ──
+    _migrate_db(conn)
+
+    conn.commit()
+    conn.close()
+
+
+def _migrate_db(conn):
+    """为已有数据库添加新字段（兼容旧数据）"""
+    # metrics 表添加 required_dimensions 和 chart_type
+    try:
+        conn.execute("SELECT required_dimensions FROM metrics LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE metrics ADD COLUMN required_dimensions TEXT DEFAULT '[]'")
+        print("[Migration] Added required_dimensions to metrics")
+
+
+if __name__ == "__main__":
+    init_db()
