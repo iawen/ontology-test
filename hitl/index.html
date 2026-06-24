@@ -1,0 +1,966 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deep Agent HITL Demo - Chat Bot</title>
+    <style>
+        :root {
+            --primary: #6366f1;
+            --primary-light: #818cf8;
+            --primary-dark: #4f46e5;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --bg: #f1f5f9;
+            --chat-bg: #ffffff;
+            --user-bubble: #6366f1;
+            --user-text: #ffffff;
+            --bot-bubble: #f8fafc;
+            --bot-text: #1e293b;
+            --border: #e2e8f0;
+            --text: #1e293b;
+            --text-light: #64748b;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Header */
+        .header {
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+            color: white;
+            padding: 16px 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .header h1 { font-size: 1.3rem; font-weight: 600; }
+        .header .subtitle { font-size: 0.8rem; opacity: 0.8; margin-top: 2px; }
+        .header-actions { display: flex; gap: 8px; }
+        .btn-header {
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border: none;
+            padding: 6px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: background 0.2s;
+        }
+        .btn-header:hover { background: rgba(255,255,255,0.3); }
+
+        /* Chat Container */
+        .chat-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            max-width: 900px;
+            width: 100%;
+            margin: 0 auto;
+        }
+
+        /* Message Bubbles */
+        .message {
+            display: flex;
+            gap: 12px;
+            max-width: 80%;
+            animation: fadeIn 0.3s ease;
+        }
+        .message.user { align-self: flex-end; flex-direction: row-reverse; }
+        .message.assistant { align-self: flex-start; }
+        .message.tool { align-self: flex-start; max-width: 90%; }
+
+        .avatar {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+            flex-shrink: 0;
+        }
+        .message.user .avatar { background: var(--user-bubble); }
+        .message.assistant .avatar { background: var(--success); }
+        .message.tool .avatar { background: var(--warning); }
+
+        .bubble {
+            padding: 12px 16px;
+            border-radius: 12px;
+            line-height: 1.6;
+            font-size: 0.95rem;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .message.user .bubble {
+            background: var(--user-bubble);
+            color: var(--user-text);
+            border-bottom-right-radius: 4px;
+        }
+        .message.assistant .bubble {
+            background: var(--bot-bubble);
+            color: var(--bot-text);
+            border: 1px solid var(--border);
+            border-bottom-left-radius: 4px;
+        }
+        .message.tool .bubble {
+            background: #fffbeb;
+            color: #92400e;
+            border: 1px solid #fde68a;
+            font-family: monospace;
+            font-size: 0.85rem;
+            border-radius: 8px;
+        }
+
+        /* HITL Cards */
+        .hitl-card {
+            align-self: flex-start;
+            max-width: 85%;
+            background: white;
+            border: 2px solid var(--primary);
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 12px rgba(99,102,241,0.15);
+            animation: slideUp 0.3s ease;
+        }
+        .hitl-card .card-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 12px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border);
+        }
+        .hitl-card .card-icon { font-size: 1.5rem; }
+        .hitl-card .card-title { font-weight: 600; color: var(--primary-dark); font-size: 1.05rem; }
+        .hitl-card .card-description { color: var(--text-light); margin-bottom: 16px; font-size: 0.9rem; }
+
+        /* Tool Approval Card */
+        .approval-action {
+            background: #f8fafc;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 16px;
+            font-family: monospace;
+            font-size: 0.85rem;
+        }
+        .approval-action .action-name {
+            font-weight: 700;
+            color: var(--primary);
+            margin-bottom: 8px;
+        }
+        .approval-action .action-args {
+            color: var(--text-light);
+            white-space: pre-wrap;
+        }
+        .approval-buttons {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .btn {
+            padding: 8px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-approve { background: var(--success); color: white; }
+        .btn-approve:hover:not(:disabled) { background: #059669; }
+        .btn-edit { background: var(--warning); color: white; }
+        .btn-edit:hover:not(:disabled) { background: #d97706; }
+        .btn-reject { background: var(--danger); color: white; }
+        .btn-reject:hover:not(:disabled) { background: #dc2626; }
+        .btn-primary { background: var(--primary); color: white; }
+        .btn-primary:hover:not(:disabled) { background: var(--primary-dark); }
+
+        /* Edit Mode */
+        .edit-form {
+            display: none;
+            margin-top: 12px;
+            padding: 12px;
+            background: #f8fafc;
+            border-radius: 8px;
+        }
+        .edit-form.active { display: block; }
+        .edit-form .form-group { margin-bottom: 10px; }
+        .edit-form label { display: block; font-size: 0.85rem; color: var(--text-light); margin-bottom: 4px; }
+        .edit-form input, .edit-form textarea {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font-size: 0.9rem;
+            font-family: inherit;
+        }
+        .edit-form textarea { min-height: 60px; resize: vertical; }
+
+        /* Reject Reason */
+        .reject-form {
+            display: none;
+            margin-top: 12px;
+            padding: 12px;
+            background: #fef2f2;
+            border-radius: 8px;
+        }
+        .reject-form.active { display: block; }
+        .reject-form textarea {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #fecaca;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            min-height: 60px;
+            resize: vertical;
+        }
+
+        /* Ask User Card */
+        .ask-options {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+        .ask-option {
+            padding: 10px 16px;
+            border: 2px solid var(--border);
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 0.9rem;
+        }
+        .ask-option:hover { border-color: var(--primary); background: #eef2ff; }
+        .ask-option.selected { border-color: var(--primary); background: var(--primary); color: white; }
+        .ask-text-input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 0.9rem;
+            margin-bottom: 12px;
+        }
+
+        /* Form Card (Complex HITL) */
+        .form-fields { display: flex; flex-direction: column; gap: 16px; margin-bottom: 16px; }
+        .form-field label {
+            display: block;
+            font-weight: 500;
+            margin-bottom: 6px;
+            font-size: 0.9rem;
+        }
+        .form-field label .required { color: var(--danger); }
+        .form-field input[type="date"],
+        .form-field select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 0.9rem;
+        }
+        .form-field .quick-options {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 8px;
+        }
+        .quick-option {
+            padding: 6px 12px;
+            background: #f1f5f9;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            transition: all 0.2s;
+        }
+        .quick-option:hover { background: #e2e8f0; }
+
+        /* Multi-select */
+        .multi-select-list {
+            max-height: 200px;
+            overflow-y: auto;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 8px;
+        }
+        .multi-select-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+        .multi-select-item:hover { background: #f1f5f9; }
+        .multi-select-item input { width: auto; }
+
+        /* Input Area */
+        .input-area {
+            padding: 16px 24px;
+            background: white;
+            border-top: 1px solid var(--border);
+            max-width: 900px;
+            width: 100%;
+            margin: 0 auto;
+        }
+        .input-wrapper {
+            display: flex;
+            gap: 12px;
+            align-items: flex-end;
+        }
+        .input-wrapper textarea {
+            flex: 1;
+            padding: 12px;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            font-size: 0.95rem;
+            font-family: inherit;
+            resize: none;
+            min-height: 48px;
+            max-height: 120px;
+            transition: border-color 0.2s;
+        }
+        .input-wrapper textarea:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+        .input-wrapper button {
+            padding: 12px 24px;
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 0.95rem;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+        .input-wrapper button:hover:not(:disabled) { background: var(--primary-dark); }
+        .input-wrapper button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        /* Status indicator */
+        .status-bar {
+            text-align: center;
+            padding: 8px;
+            color: var(--text-light);
+            font-size: 0.85rem;
+            display: none;
+        }
+        .status-bar.active { display: block; }
+        .status-bar .spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid var(--border);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+
+        /* Thread ID display */
+        .thread-info {
+            font-size: 0.75rem;
+            color: var(--text-light);
+            margin-top: 4px;
+            font-family: monospace;
+        }
+
+        /* Animations */
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Scrollbar */
+        .chat-container::-webkit-scrollbar { width: 6px; }
+        .chat-container::-webkit-scrollbar-track { background: transparent; }
+        .chat-container::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+
+        /* Demo buttons */
+        .demo-section {
+            padding: 12px 24px;
+            background: #eef2ff;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .demo-btn {
+            padding: 6px 14px;
+            background: white;
+            border: 1px solid var(--primary);
+            color: var(--primary);
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            transition: all 0.2s;
+        }
+        .demo-btn:hover { background: var(--primary); color: white; }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <div>
+        <h1>🤖 Deep Agent HITL Demo</h1>
+        <div class="subtitle">Human-in-the-Loop · 工具审批 · 澄清提问 · 复杂表单</div>
+    </div>
+    <div class="header-actions">
+        <button class="btn-header" onclick="clearChat()">🗑️ 清除对话</button>
+    </div>
+</div>
+
+<div class="demo-section">
+    <button class="demo-btn" onclick="sendDemo('帮我给 zhangsan@example.com 发一封邮件，主题是月度报告，内容是本月销售总额 50 万')">📧 演示：工具审批</button>
+    <button class="demo-btn" onclick="sendDemo('帮我查询数据库里上个月的订单数据')">🗄️ 演示：SQL审批</button>
+    <button class="demo-btn" onclick="startTimeRangeDemo()">📅 演示：时间范围表单</button>
+</div>
+
+<div class="chat-container" id="chatContainer">
+    <div class="message assistant">
+        <div class="avatar">🤖</div>
+        <div class="bubble">你好！我是 Deep Agent 演示助手。我可以帮你发送邮件、查询数据库。当执行敏感操作时，我会请求你的审批。试试上面的演示按钮吧！</div>
+    </div>
+</div>
+
+<div class="status-bar" id="statusBar">
+    <span class="spinner"></span>Agent 正在思考...
+</div>
+
+<div class="input-area">
+    <div class="input-wrapper">
+        <textarea id="messageInput" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" rows="1"></textarea>
+        <button id="sendBtn" onclick="sendMessage()">发送</button>
+    </div>
+    <div class="thread-info" id="threadInfo"></div>
+</div>
+
+<script>
+// ============================================================
+// 全局状态
+// ============================================================
+let currentThreadId = null;
+let isWaiting = false;
+
+// ============================================================
+// DOM 元素
+// ============================================================
+const chatContainer = document.getElementById('chatContainer');
+const messageInput = document.getElementById('messageInput');
+const sendBtn = document.getElementById('sendBtn');
+const statusBar = document.getElementById('statusBar');
+const threadInfo = document.getElementById('threadInfo');
+
+// ============================================================
+// 消息渲染
+// ============================================================
+
+function addMessage(role, content) {
+    const msgDiv = document.createElement('div');
+    msgDiv.className = `message ${role}`;
+
+    const avatar = document.createElement('div');
+    avatar.className = 'avatar';
+    avatar.textContent = role === 'user' ? '👤' : role === 'tool' ? '🔧' : '🤖';
+
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.textContent = content;
+
+    msgDiv.appendChild(avatar);
+    msgDiv.appendChild(bubble);
+    chatContainer.appendChild(msgDiv);
+    scrollToBottom();
+    return msgDiv;
+}
+
+function scrollToBottom() {
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+function setWaiting(waiting) {
+    isWaiting = waiting;
+    sendBtn.disabled = waiting;
+    statusBar.classList.toggle('active', waiting);
+    if (waiting) {
+        statusBar.innerHTML = '<span class="spinner"></span>Agent 正在思考...';
+    }
+}
+
+// ============================================================
+// HITL 卡片渲染
+// ============================================================
+
+function renderHITLCard(interrupt) {
+    if (!interrupt) return;
+
+    const card = document.createElement('div');
+    card.className = 'hitl-card';
+
+    switch (interrupt.type) {
+        case 'tool_approval':
+            renderToolApprovalCard(card, interrupt);
+            break;
+        case 'ask_user':
+            renderAskUserCard(card, interrupt);
+            break;
+        case 'form':
+            renderFormCard(card, interrupt);
+            break;
+        default:
+            card.innerHTML = `<div class="card-title">⚠️ 未知中断类型</div><pre>${JSON.stringify(interrupt, null, 2)}</pre>`;
+    }
+
+    chatContainer.appendChild(card);
+    scrollToBottom();
+}
+
+// ── 工具审批卡片 ──
+function renderToolApprovalCard(card, interrupt) {
+    const action = interrupt.action || {};
+    const args = action.args || {};
+
+    card.innerHTML = `
+        <div class="card-header">
+            <span class="card-icon">⚠️</span>
+            <span class="card-title">工具审批请求</span>
+        </div>
+        <div class="card-description">${interrupt.description || 'Agent 请求执行以下操作，请审批'}</div>
+        <div class="approval-action">
+            <div class="action-name">🔧 ${action.name || 'unknown'}</div>
+            <div class="action-args">${JSON.stringify(args, null, 2)}</div>
+        </div>
+        <div class="approval-buttons" id="approvalBtns">
+            ${interrupt.allowed_decisions?.includes('approve') ? '<button class="btn btn-approve" onclick="approveTool(this)">✅ 批准</button>' : ''}
+            ${interrupt.allowed_decisions?.includes('edit') ? '<button class="btn btn-edit" onclick="toggleEditForm(this)">✏️ 编辑</button>' : ''}
+            ${interrupt.allowed_decisions?.includes('reject') ? '<button class="btn btn-reject" onclick="toggleRejectForm(this)">❌ 拒绝</button>' : ''}
+        </div>
+        <div class="edit-form" id="editForm">
+            ${Object.entries(args).map(([k, v]) => `
+                <div class="form-group">
+                    <label>${k}</label>
+                    ${typeof v === 'string' && v.length > 50
+                        ? `<textarea id="edit_${k}">${v}</textarea>`
+                        : `<input type="text" id="edit_${k}" value="${v}">`
+                    }
+                </div>
+            `).join('')}
+            <button class="btn btn-primary" onclick="submitEdit(this)">提交编辑</button>
+        </div>
+        <div class="reject-form" id="rejectForm">
+            <textarea id="rejectReason" placeholder="请输入拒绝原因（可选）"></textarea>
+            <button class="btn btn-reject" onclick="submitReject(this)" style="margin-top:8px;">确认拒绝</button>
+        </div>
+    `;
+}
+
+function approveTool(btn) {
+    const card = btn.closest('.hitl-card');
+    card.querySelector('.approval-buttons').style.display = 'none';
+    resumeChat({ type: 'approve' }, card);
+}
+
+function toggleEditForm(btn) {
+    const card = btn.closest('.hitl-card');
+    card.querySelector('.edit-form').classList.toggle('active');
+    card.querySelector('.reject-form').classList.remove('active');
+}
+
+function toggleRejectForm(btn) {
+    const card = btn.closest('.hitl-card');
+    card.querySelector('.reject-form').classList.toggle('active');
+    card.querySelector('.edit-form').classList.remove('active');
+}
+
+function submitEdit(btn) {
+    const card = btn.closest('.hitl-card');
+    const inputs = card.querySelectorAll('.edit-form input, .edit-form textarea');
+    const editedArgs = {};
+    inputs.forEach(input => {
+        const key = input.id.replace('edit_', '');
+        editedArgs[key] = input.value;
+    });
+
+    const actionName = card.querySelector('.action-name').textContent.replace('🔧 ', '').trim();
+    card.querySelector('.approval-buttons').style.display = 'none';
+    card.querySelector('.edit-form').classList.remove('active');
+
+    resumeChat({
+        type: 'edit',
+        edited_action: { name: actionName, args: editedArgs }
+    }, card);
+}
+
+function submitReject(btn) {
+    const card = btn.closest('.hitl-card');
+    const reason = card.querySelector('#rejectReason').value;
+    card.querySelector('.approval-buttons').style.display = 'none';
+    card.querySelector('.reject-form').classList.remove('active');
+
+    resumeChat({
+        type: 'reject',
+        message: reason || '用户拒绝执行'
+    }, card);
+}
+
+// ── 澄清提问卡片 ──
+function renderAskUserCard(card, interrupt) {
+    const options = interrupt.options;
+    const isMultiple = interrupt.allow_multiple;
+
+    if (options && options.length > 0) {
+        // 多选题
+        card.innerHTML = `
+            <div class="card-header">
+                <span class="card-icon">❓</span>
+                <span class="card-title">需要你的回答</span>
+            </div>
+            <div class="card-description">${interrupt.question}</div>
+            <div class="ask-options" id="askOptions">
+                ${options.map((opt, i) => `<div class="ask-option" onclick="selectOption(this, ${isMultiple})" data-value="${opt}">${opt}</div>`).join('')}
+            </div>
+            <button class="btn btn-primary" onclick="submitAskOptions(this, ${isMultiple})" disabled>确认</button>
+        `;
+    } else {
+        // 自由文本
+        card.innerHTML = `
+            <div class="card-header">
+                <span class="card-icon">❓</span>
+                <span class="card-title">需要你的回答</span>
+            </div>
+            <div class="card-description">${interrupt.question}</div>
+            <input type="text" class="ask-text-input" id="askTextInput" placeholder="请输入你的回答..." onkeypress="if(event.key==='Enter')submitAskText()">
+            <button class="btn btn-primary" onclick="submitAskText()">提交回答</button>
+        `;
+    }
+}
+
+function selectOption(elem, isMultiple) {
+    if (!isMultiple) {
+        // 单选：取消其他选中
+        elem.parentElement.querySelectorAll('.ask-option').forEach(o => o.classList.remove('selected'));
+        elem.classList.add('selected');
+    } else {
+        elem.classList.toggle('selected');
+    }
+    // 启用确认按钮
+    const btn = elem.closest('.hitl-card').querySelector('button');
+    btn.disabled = false;
+}
+
+function submitAskOptions(btn, isMultiple) {
+    const card = btn.closest('.hitl-card');
+    const selected = Array.from(card.querySelectorAll('.ask-option.selected')).map(o => o.dataset.value);
+
+    const answer = isMultiple ? selected.join(', ') : selected[0];
+    btn.disabled = true;
+
+    resumeChat({
+        type: 'respond',
+        message: answer
+    }, card);
+}
+
+function submitAskText() {
+    const input = document.getElementById('askTextInput');
+    const answer = input.value.trim();
+    if (!answer) return;
+
+    const card = input.closest('.hitl-card');
+    resumeChat({
+        type: 'respond',
+        message: answer
+    }, card);
+}
+
+// ── 复杂表单卡片（时间范围等）──
+function renderFormCard(card, interrupt) {
+    const schema = interrupt.schema || {};
+    const formKind = interrupt.form_kind || 'generic';
+
+    let fieldsHtml = '';
+    Object.entries(schema).forEach(([key, field]) => {
+        const required = field.required ? '<span class="required">*</span>' : '';
+        let inputHtml = '';
+
+        if (field.type === 'date') {
+            inputHtml = `<input type="date" id="form_${key}" value="${field.default || ''}" ${field.required ? 'required' : ''}>`;
+            // 快捷选项
+            if (formKind === 'time_range' && key === 'start_date') {
+                inputHtml += `
+                    <div class="quick-options">
+                        <span class="quick-option" onclick="setQuickDate('${key}', -7)">最近7天</span>
+                        <span class="quick-option" onclick="setQuickDate('${key}', -30)">最近30天</span>
+                        <span class="quick-option" onclick="setQuickDate('${key}', -90)">最近90天</span>
+                    </div>
+                `;
+            }
+        } else if (field.type === 'select') {
+            inputHtml = `<select id="form_${key}" ${field.required ? 'required' : ''}>
+                ${(field.options || []).map(opt => `<option value="${opt}" ${opt === field.default ? 'selected' : ''}>${opt}</option>`).join('')}
+            </select>`;
+        } else if (field.type === 'multi_select') {
+            inputHtml = `<div class="multi-select-list" id="form_${key}">
+                ${(field.options || []).map(opt => `<label class="multi-select-item"><input type="checkbox" value="${opt}"> ${opt}</label>`).join('')}
+            </div>`;
+        } else {
+            inputHtml = `<input type="text" id="form_${key}" value="${field.default || ''}" ${field.required ? 'required' : ''}>`;
+        }
+
+        fieldsHtml += `
+            <div class="form-field">
+                <label>${field.label || key} ${required}</label>
+                ${inputHtml}
+            </div>
+        `;
+    });
+
+    card.innerHTML = `
+        <div class="card-header">
+            <span class="card-icon">📝</span>
+            <span class="card-title">${interrupt.prompt || '请填写表单'}</span>
+        </div>
+        <div class="form-fields">${fieldsHtml}</div>
+        <button class="btn btn-primary" onclick="submitForm(this)">提交</button>
+    `;
+}
+
+function setQuickDate(key, daysOffset) {
+    const date = new Date();
+    date.setDate(date.getDate() + daysOffset);
+    const dateStr = date.toISOString().split('T')[0];
+    document.getElementById(`form_${key}`).value = dateStr;
+}
+
+function submitForm(btn) {
+    const card = btn.closest('.hitl-card');
+    const values = {};
+
+    // 收集所有字段值
+    card.querySelectorAll('[id^="form_"]').forEach(elem => {
+        const key = elem.id.replace('form_', '');
+        if (elem.tagName === 'DIV') {
+            // multi_select
+            const checked = Array.from(elem.querySelectorAll('input:checked')).map(c => c.value);
+            values[key] = checked;
+        } else {
+            values[key] = elem.value;
+        }
+    });
+
+    btn.disabled = true;
+
+    resumeChat({
+        type: 'form_result',
+        values: values
+    }, card);
+}
+
+// ============================================================
+// API 调用
+// ============================================================
+
+async function sendMessage() {
+    const message = messageInput.value.trim();
+    if (!message || isWaiting) return;
+
+    messageInput.value = '';
+    messageInput.style.height = 'auto';
+    addMessage('user', message);
+
+    await callChatApi(message);
+}
+
+async function sendDemo(message) {
+    if (isWaiting) return;
+    messageInput.value = message;
+    await sendMessage();
+}
+
+async function callChatApi(message) {
+    setWaiting(true);
+
+    try {
+        const response = await fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                message: message,
+                thread_id: currentThreadId
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.thread_id) {
+            currentThreadId = data.thread_id;
+            threadInfo.textContent = `Thread ID: ${currentThreadId}`;
+        }
+
+        // 渲染新的 assistant 消息
+        if (data.messages && data.messages.length > 0) {
+            // 只渲染最后一条 assistant 消息
+            const lastMsg = data.messages[data.messages.length - 1];
+            if (lastMsg.role === 'assistant' || lastMsg.role === 'tool') {
+                addMessage(lastMsg.role, lastMsg.content);
+            }
+        }
+
+        // 如果被中断，渲染 HITL 卡片
+        if (data.status === 'interrupted' && data.interrupt) {
+            setWaiting(false);
+            renderHITLCard(data.interrupt);
+        } else {
+            setWaiting(false);
+        }
+
+    } catch (error) {
+        setWaiting(false);
+        addMessage('assistant', `❌ 错误: ${error.message}`);
+    }
+}
+
+async function resumeChat(decision, cardElement) {
+    if (!currentThreadId) {
+        alert('错误：没有活跃的会话');
+        return;
+    }
+
+    // 禁用卡片
+    if (cardElement) {
+        cardElement.style.opacity = '0.6';
+        cardElement.style.pointerEvents = 'none';
+    }
+
+    setWaiting(true);
+
+    try {
+        const response = await fetch('/api/chat/resume', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                thread_id: currentThreadId,
+                decision: decision
+            })
+        });
+
+        const data = await response.json();
+
+        // 渲染新的消息
+        if (data.messages && data.messages.length > 0) {
+            const lastMsg = data.messages[data.messages.length - 1];
+            if (lastMsg.role === 'assistant' || lastMsg.role === 'tool') {
+                addMessage(lastMsg.role, lastMsg.content);
+            }
+        }
+
+        // 可能又触发了新的 interrupt
+        if (data.status === 'interrupted' && data.interrupt) {
+            setWaiting(false);
+            renderHITLCard(data.interrupt);
+        } else {
+            setWaiting(false);
+        }
+
+    } catch (error) {
+        setWaiting(false);
+        addMessage('assistant', `❌ 恢复失败: ${error.message}`);
+    }
+}
+
+// ============================================================
+// 时间范围演示
+// ============================================================
+
+async function startTimeRangeDemo() {
+    if (isWaiting) return;
+
+    addMessage('user', '帮我分析销售数据（需要选择时间范围）');
+    setWaiting(true);
+
+    try {
+        // 启动时间范围选择流程
+        const response = await fetch('/api/hitl/time-range', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                prompt: '请选择要分析的销售数据时间范围',
+                thread_id: currentThreadId
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.thread_id) {
+            currentThreadId = data.thread_id;
+            threadInfo.textContent = `Thread ID: ${currentThreadId}`;
+        }
+
+        if (data.status === 'interrupted' && data.interrupt) {
+            setWaiting(false);
+            renderHITLCard(data.interrupt);
+        }
+
+    } catch (error) {
+        setWaiting(false);
+        addMessage('assistant', `❌ 错误: ${error.message}`);
+    }
+}
+
+// ============================================================
+// 工具函数
+// ============================================================
+
+async function clearChat() {
+    if (!confirm('确定清除当前对话？')) return;
+
+    if (currentThreadId) {
+        try {
+            await fetch(`/api/chat/${currentThreadId}`, { method: 'DELETE' });
+        } catch (e) {}
+    }
+
+    currentThreadId = null;
+    threadInfo.textContent = '';
+    chatContainer.innerHTML = `
+        <div class="message assistant">
+            <div class="avatar">🤖</div>
+            <div class="bubble">对话已清除。开始新的对话吧！</div>
+        </div>
+    `;
+}
+
+// 输入框自适应高度
+messageInput.addEventListener('input', function() {
+    this.style.height = 'auto';
+    this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+});
+
+// Enter 发送
+messageInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+    }
+});
+</script>
+
+</body>
+</html>
