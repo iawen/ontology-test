@@ -1,11 +1,10 @@
 
 import os
 import shutil
-import sqlite3
 from fastapi import APIRouter, HTTPException, Body
 
 from configs.global_config import Cfg
-from tools.db import get_db
+from tools.db import IntegrityError, get_db
 
 
 router = APIRouter()
@@ -43,7 +42,7 @@ async def create_scenario(body: dict = Body(...)):
         conn.execute("INSERT INTO scenarios (id, name, description, data_dir, ontology_dir) VALUES (?,?,?,?,?)",
                      (sid, name, desc, data_dir, ontology_dir))
         conn.commit()
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         conn.close()
         raise HTTPException(400, f"场景 {sid} 已存在")
     conn.close()

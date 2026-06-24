@@ -21,7 +21,10 @@ load_dotenv()
 class Cfg:
     base_dir = os.path.join(str(Path(__file__).resolve().parent.parent), "data")
     
+    db_type = os.getenv("DB_TYPE", "sqlite3")
+    db_dsn = os.getenv("DATABASE_URL", "sqlite:///" + os.path.join(base_dir, "admin.db"))
     db_path = os.path.join(base_dir, "admin.db")
+
     jwt_secret = os.getenv("JWT_SECRET", "on-budget-ai-admin-2026")
     scenarios_root = os.path.join(base_dir, "scenarios")
 
@@ -30,6 +33,7 @@ class Cfg:
     openai_base_url = os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 
 
+print(f"====== database type:      {Cfg.db_type} ======")
 print(f"====== data base dir:      {Cfg.base_dir} ======")
 print(f"====== scenarios root dir: {Cfg.scenarios_root} ======")
 
@@ -38,9 +42,7 @@ client = AsyncClient(
     base_url = Cfg.openai_base_url,
 )
 
-# LLM_API_BASE = os.getenv("LLM_API_BASE", "https://aicl-poc-dsi-cn-llm.openai.azure.com/openai/deployments/gpt-4o-mini-2024-08-06/chat/completions?api-version=2024-06-01")
-	# LLM_API_KEY=os.getenv("LLM_API_KEY", "xxx")
-	
+
 hostname = urlparse(Cfg.openai_base_url).hostname
 context = SSL.Context(SSL.TLSv1_2_METHOD)
 conn = SSL.Connection(context, socket.socket())

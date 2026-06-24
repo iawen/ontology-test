@@ -488,6 +488,9 @@ class OntologyExtractor:
         # ---- Step 3: 核心重构：智能合并、跨表语义去重与拓扑映射追踪 ----
         merged_classes, class_id_map = self._merge_and_track_classes(raw_classes)
 
+        # ---- Step 4: 物理字段覆盖校验，补齐 LLM 遗漏的底层表/CSV 字段 ----
+        self._ensure_class_fields_coverage(merged_classes, summaries)
+
         # 核心修复：基于 ID 映射矩阵反向刷新指标的 target_class 引用关系，防止指针悬空
         for metric in all_metrics:
             old_tc = metric.get("target_class")
@@ -621,6 +624,76 @@ class OntologyExtractor:
                 deduped[cid] = c
                 
         return list(deduped.values()), class_id_map
+
+    def _ensure_class_fields_coverage(self, classes: list[dict], summaries: list[dict]) -> None:
+        """对照原始表/CSV 元数据，补齐 Class.fields 中被模型遗漏的物理字段。"""
+        summary_index = self._build_summary_index(summaries)
+        for cls in classes:
+            source = self._resolve_class_source(cls)
+            summary = summary_index.get(source) or summary_index.get(source.lower())
+            if not summary:
+                continue
+
+            existing_fields = cls.get("fields", [])
+            if not isinstance(existing_fields, list):
+                existing_fields = []
+
+            existing_physical_names = {
+                str(f.get("physical_name") or f.get("name") or "").strip()
+                for f in existing_fields
+                if isinstance(f, dict)
+            }
+            existing_physical_names = {name for name in existing_physical_names if name}
+
+            missing_fields = []
+            for column in summary.get("columns", []):
+                column_name = str(column).strip()
+                if not column_name or column_name in existing_physical_names:
+                    continue
+                missing_fields.append(self._build_missing_field(cls, summary, column_name))
+                existing_physical_names.add(column_name)
+
+            print(f"missing_fields = {missing_fields}")
+
+            if missing_fields:
+                cls["fields"] = existing_fields + missing_fields
+
+    def _build_summary_index(self, summaries: list[dict]) -> dict[str, dict]:
+        summary_index = {}
+        for summary in summaries:
+            file_name = str(summary.get("file", "")).strip()
+            if not file_name:
+                continue
+            keys = {file_name, file_name.lower(), Path(file_name).name, Path(file_name).name.lower()}
+            if file_name.endswith(".csv"):
+                stem = file_name[:-4]
+                keys.update({stem, stem.lower(), Path(stem).name, Path(stem).name.lower()})
+            for key in keys:
+                if key:
+                    summary_index[key] = summary
+        return summary_index
+
+    def _resolve_class_source(self, cls: dict) -> str:
+        for key in ("_source_origin", "csv_file", "table_name"):
+            value = str(cls.get(key, "")).strip()
+            if value:
+                return value
+        return ""
+
+    def _build_missing_field(self, cls: dict, summary: dict, column_name: str) -> dict:
+        column_comments = summary.get("column_comments", {}) or {}
+        column_types = summary.get("column_types", {}) or {}
+        comment = str(column_comments.get(column_name, "")).strip()
+        primary_key = str(cls.get("primary_key", "")).strip()
+        primary_key_parts = {part.strip() for part in primary_key.split(",") if part.strip()}
+        return {
+            "name": comment or column_name,
+            "physical_name": column_name,
+            "type": column_types.get(column_name, "text"),
+            "description": comment or "底层数据源字段，模型初始提取遗漏后自动补齐",
+            "is_primary_key": column_name in primary_key_parts,
+            "is_foreign_key": False,
+        }
 
     def _normalize_metric(self, m: dict) -> dict:
         dimensions = m.get("dimensions", [])
@@ -791,6 +864,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # main()
-    summaries = read_db_summary("mysql+pymysql://cibinqo_chatbot_reader:O0KfXsq22A93MIrgCNgXuVZtbctmOlHS@APCAPiX0jRe1we5.apac.pfizer.com:60000/chatbot_data_source_cib")
-    print(json.dumps(summaries, ensure_ascii=False, indent=2))
+    main()
