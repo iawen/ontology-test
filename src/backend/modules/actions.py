@@ -15,9 +15,9 @@ from datetime import datetime
 import re
 from fastapi import APIRouter, HTTPException
 
-from configs.global_config import Cfg, client  # 动态导入配置与 OpenAI 异步客户端
+from core.llm.chat_model import get_async_client, get_model_name # 动态导入配置与 OpenAI 异步客户端
 from tools.db import get_db
-from modules.models import ActionCreate, ActionUpdate, ActionExecuteRequest
+from core.models.models import ActionCreate, ActionUpdate, ActionExecuteRequest
 
 router = APIRouter()
 
@@ -437,8 +437,8 @@ async def find_matching_actions(scenario_id: str, user_intent: str) -> list[dict
 
     try:
         # 4. 调用大模型进行智能推理
-        response = await client.chat.completions.create(
-            model=Cfg.model_name,
+        response = await get_async_client().chat.completions.create(
+            model=get_model_name(),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}

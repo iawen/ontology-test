@@ -10,7 +10,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from tools.db import get_db
-from modules.models import AuditLogCreate
+from core.models.models import AuditLogCreate
 
 router = APIRouter()
 

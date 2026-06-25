@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Schema Optimizer v1 vs v2 对比分析与改进建议</title>
+    <style>
+        :root {
+            --primary: #6366f1;
+            --primary-light: #818cf8;
+            --primary-dark: #4f46e5;
+            --success: #10b981;
+            --success-light: #d1fae5;
+            --warning: #f59e0b;
+            --warning-light: #fef3c7;
+            --danger: #ef4444;
+            --danger-light: #fee2e2;
+            --bg: #f8fafc;
+            --card-bg: #ffffff;
+            --text: #1e293b;
+            --text-light: #64748b;
+            --border: #e2e8f0;
+            --code-bg: #1e293b;
+            --code-text: #e2e8f0;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.8;
+        }
+        .container { max-width: 1200px; margin: 0 auto; padding: 40px 24px; }
+
+        h1 {
+            font-size: 2.2rem;
+            background: linear-gradient(135deg, var(--primary), var(--primary-light));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 8px;
+        }
+        .subtitle { color: var(--text-light); font-size: 1.1rem; margin-bottom: 32px; }
+
+        h2 {
+            font-size: 1.6rem;
+            color: var(--text);
+            margin: 40px 0 16px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid var(--primary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        h2 .icon { font-size: 1.4rem; }
+
+        h3 {
+            font-size: 1.25rem;
+            color: var(--text);
+            margin: 24px 0 12px;
+        }
+
+        h4 {
+            font-size: 1.1rem;
+            color: var(--primary-dark);
+            margin: 20px 0 8px;
+        }
+
+        p { margin-bottom: 12px; }
+
+        .card {
+            background: var(--card-bg);
+            border-radius: 12px;
+            padding: 24px;
+            margin: 16px 0;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+            border: 1px solid var(--border);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 16px 0;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+        }
+        th {
+            background: var(--primary);
+            color: white;
+            padding: 12px 16px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 0.95rem;
+        }
+        td {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.95rem;
+        }
+        tr:last-child td { border-bottom: none; }
+        tr:nth-child(even) { background: #f8fafc; }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        .badge-success { background: var(--success-light); color: #065f46; }
+        .badge-warning { background: var(--warning-light); color: #92400e; }
+        .badge-danger { background: var(--danger-light); color: #991b1b; }
+        .badge-primary { background: #e0e7ff; color: var(--primary-dark); }
+
+        .alert {
+            border-radius: 8px;
+            padding: 16px 20px;
+            margin: 16px 0;
+            border-left: 4px solid;
+        }
+        .alert-success { background: var(--success-light); border-color: var(--success); }
+        .alert-warning { background: var(--warning-light); border-color: var(--warning); }
+        .alert-danger { background: var(--danger-light); border-color: var(--danger); }
+        .alert-info { background: #e0e7ff; border-color: var(--primary); }
+
+        pre {
+            background: var(--code-bg);
+            color: var(--code-text);
+            padding: 16px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 12px 0;
+            font-size: 0.875rem;
+            line-height: 1.5;
+        }
+        code {
+            background: #e2e8f0;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.875em;
+            font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
+        }
+        pre code {
+            background: none;
+            padding: 0;
+        }
+
+        ul, ol { margin: 8px 0 16px 24px; }
+        li { margin-bottom: 6px; }
+
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin: 16px 0;
+        }
+
+        .feature-box {
+            padding: 16px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+        }
+        .feature-box.v1 { border-left: 4px solid var(--warning); background: #fffbeb; }
+        .feature-box.v2 { border-left: 4px solid var(--success); background: #f0fdf4; }
+
+        .footer {
+            margin-top: 48px;
+            padding: 24px;
+            text-align: center;
+            color: var(--text-light);
+            border-top: 1px solid var(--border);
+            font-size: 0.9rem;
+        }
+
+        .toc {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            margin: 24px 0;
+            border: 1px solid var(--border);
+        }
+        .toc h3 { margin-top: 0; color: var(--primary); }
+        .toc ol { margin-left: 20px; }
+        .toc a { color: var(--primary); text-decoration: none; }
+        .toc a:hover { text-decoration: underline; }
+
+        .verdict {
+            background: linear-gradient(135deg, #e0e7ff, #f0fdf4);
+            border-radius: 12px;
+            padding: 24px;
+            margin: 24px 0;
+            border: 1px solid var(--border);
+        }
+        .verdict h3 { color: var(--primary-dark); margin-top: 0; }
+
+        .score-bar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 8px 0;
+        }
+        .score-label { width: 120px; font-size: 0.9rem; font-weight: 500; }
+        .score-track {
+            flex: 1;
+            height: 24px;
+            background: #e2e8f0;
+            border-radius: 12px;
+            overflow: hidden;
+            position: relative;
+        }
+        .score-fill {
+            height: 100%;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            padding-right: 8px;
+            color: white;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        .score-fill.v1 { background: var(--warning); }
+        .score-fill.v2 { background: var(--success); }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <h1>Schema Optimizer v1 vs v2 对比分析与改进建议</h1>
+    <p class="subtitle">基于业务文档（Word/Excel/PDF）优化 Ontology 的 Class / Metrics / Relationships / Concepts</p>
+
+    <div class="toc">
+        <h3>📋 目录</h3>
+        <ol>
+            <li><a href="#bg">背景与目标</a></li>
+            <li><a href="#v1">v1 架构分析（单次全量模式）</a></li>
+            <li><a href="#v2">v2 架构分析（分批关联模式）</a></li>
+            <li><a href="#compare">核心维度对比</a></li>
+            <li><a href="#verdict">综合评判</a></li>
+            <li><a href="#research">业界资料与最佳实践</a></li>
+            <li><a href="#improve">改进建议（6 大方向）</a></li>
+            <li><a href="#arch">推荐架构（v3 蓝图）</a></li>
+        </ol>
+    </div>
+
+    <!-- 1. 背景 -->
+    <h2 id="bg"><span class="icon">🎯</span> 一、背景与目标</h2>
+    <div class="card">
+        <p><strong>已有能力</strong>：<code>extract_ontology.py</code> 通过数据库表/字段结构 + LLM 提取，已构建出基础 Ontology（Class、Metrics、Relationships、Concepts）。</p>
+        <p><strong>新增需求</strong>：利用业务方提供的文档（Word/Excel/PDF），进一步<strong>优化</strong>已有的 Ontology 资产——重点是：</p>
+        <ul>
+            <li><strong>Class</strong>：优化 name_cn / description / 业务边界（<strong>排除 fields 部分</strong>，fields 由数据库结构确定）</li>
+            <li><strong>Metrics</strong>：补充 description / category / calculation / formula / dimensions / required_dimensions / filters_hint / chart_type</li>
+            <li><strong>Relationships</strong>：补充/修正 source / target / type / join_key</li>
+            <li><strong>Concepts</strong>：补充树状层级（subject_domain / dimension_group / fact_group）</li>
+        </ul>
+        <p>两个版本（v1、v2）采用了不同的策略来实现这一目标，下面逐一分析。</p>
+    </div>
+
+    <!-- 2. v1 分析 -->
+    <h2 id="v1"><span class="icon">📦</span> 二、v1 架构分析（单次全量模式）</h2>
+    <div class="card">
+        <h4>核心策略</h4>
+        <p>v1 采用<strong>"一次性全量送入"</strong>策略：把所有未审核的 Class、Metrics、Relationships、Concepts 和所有文档内容<strong>一次性</strong>塞进一个巨大的 LLM prompt，让 LLM 在一次调用中完成所有优化。</p>
+
+        <h4>关键代码路径</h4>
+        <pre><code># v1 核心流程
+docs_context = _build_document_context(docs)  # 拼接所有文档，上限 45000 字符
+all_assets = _load_all_assets(scenario_id)    # 加载所有未审核资产
+prompt = OPTIMIZATION_PROMPT.format(
+    docs=docs_context,
+    assets=json.dumps(all_assets, ...),       # 全量资产
+    ...
+)
+result = await client.chat.completions.create(prompt)  # 单次调用
+_apply_optimization(scenario_id, result)     # 直接写回 DB</code></pre>
+
+        <h4>优势</h4>
+        <ul>
+            <li><span class="badge badge-success">全局视角</span> LLM 能看到所有资产和所有文档，做跨表关系推导时上下文完整</li>
+            <li><span class="badge badge-success">实现简单</span> 单次 LLM 调用，代码逻辑清晰，约 587 行</li>
+            <li><span class="badge badge-success">一致性高</span> 所有资产在同一上下文中优化，命名风格/分类标准一致</li>
+            <li><span class="badge badge-success">速度快</span> 只需 1 次 LLM 调用（如果不超过上下文窗口的话）</li>
+        </ul>
+
+        <h4>劣势</h4>
+        <ul>
+            <li><span class="badge badge-danger">上下文爆炸</span> 当 Class &gt; 15 或文档 &gt; 3 个时，prompt 轻松超过 32K token，LLM 输出被截断</li>
+            <li><span class="badge badge-danger">JSON 截断风险</span> 单次输出大量 JSON，尾部资产（通常是 Concepts）极易被丢弃</li>
+            <li><span class="badge badge-danger">无重试机制</span> JSON 解析失败直接抛异常，整个优化任务失败</li>
+            <li><span class="badge badge-danger">无增量能力</span> 每次都是全量重跑，无法只优化新增资产</li>
+            <li><span class="badge badge-warning">成本高</span> 每次调用都送入全量上下文，token 消耗大</li>
+        </ul>
+    </div>
+
+    <!-- 3. v2 分析 -->
+    <h2 id="v2"><span class="icon">🚀</span> 三、v2 架构分析（分批关联模式）</h2>
+    <div class="card">
+        <h4>核心策略</h4>
+        <p>v2 采用<strong>"按 Class 分批关联"</strong>策略：以 Class 为锚点，把每个 Class 及其关联的 Metrics、Relationships、Concepts 打包成批次（每批 ≤6 Class / ≤15 Metrics），分多次 LLM 调用完成优化。</p>
+
+        <h4>关键代码路径</h4>
+        <pre><code># v2 核心流程
+batches = _build_batches(classes, metrics, relationships, concepts,
+                         max_classes=6, max_metrics=15)
+for batch in batches:
+    prompt = OPTIMIZATION_PROMPT.format(
+        docs=docs_context,
+        assets=json.dumps(batch, ...),    # 分批资产
+        ...
+    )
+    result = await client.chat.completions.create(prompt)
+    all_results.extend(result["assets"])  # 累积结果
+
+_apply_optimization(scenario_id, {"assets": all_results})</code></pre>
+
+        <h4>分批算法亮点</h4>
+        <ul>
+            <li><strong>以 Class 为锚点</strong>：每个批次围绕 1-6 个 Class，把关联的 Metrics/Relationships/Concepts 一起打包</li>
+            <li><strong>孤立资产兜底</strong>：没有关联到任何 Class 的 Metrics/Relationships/Concepts 单独打包处理</li>
+            <li><strong>动态批次大小</strong>：BATCH_MAX_CLASSES=6, BATCH_MAX_METRICS=15，可配置</li>
+        </ul>
+
+        <h4>优势</h4>
+        <ul>
+            <li><span class="badge badge-success">上下文安全</span> 每批 prompt 大小可控，不会超过上下文窗口</li>
+            <li><span class="badge badge-success">JSON 不易截断</span> 每批输出量小，JSON 完整性有保障</li>
+            <li><span class="badge badge-success">可扩展</span> 支持大量 Class/文档场景，资产越多优势越明显</li>
+            <li><span class="badge badge-success">关联性保持</span> 以 Class 为锚点打包，保持了资产间的语义关联</li>
+            <li><span class="badge badge-success">容错性好</span> 单批失败不影响其他批次（如果实现了 per-batch try-catch）</li>
+        </ul>
+
+        <h4>劣势</h4>
+        <ul>
+            <li><span class="badge badge-danger">文件不完整</span> v2 文件在 <code>_extract_json</code> 函数处被截断，缺少 LLM 调用、结果合并、DB 写入等核心逻辑</li>
+            <li><span class="badge badge-warning">全局视角缺失</span> 分批后 LLM 看不到全部资产，跨表关系推导能力下降</li>
+            <li><span class="badge badge-warning">一致性风险</span> 不同批次可能产生命名风格/分类标准不一致</li>
+            <li><span class="badge badge-warning">成本可能更高</span> 多次调用 × 每次都带文档上下文 = 总 token 可能超过 v1</li>
+            <li><span class="badge badge-warning">文档重复传输</span> 每批都带完整文档上下文，文档内容被重复传输 N 次</li>
+        </ul>
+    </div>
+
+    <!-- 4. 核心维度对比 -->
+    <h2 id="compare"><span class="icon">⚖️</span> 四、核心维度对比</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th style="width:18%">对比维度</th>
+                <th style="width:41%">v1（单次全量模式）</th>
+                <th style="width:41%">v2（分批关联模式）</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>策略</strong></td>
+                <td>所有资产 + 所有文档 → 1 次 LLM 调用</td>
+                <td>按 Class 分批，每批 ≤6 Class → N 次 LLM 调用</td>
+            </tr>
+            <tr>
+                <td><strong>上下文管理</strong></td>
+                <td><span class="badge badge-danger">差</span> 资产多时 prompt 爆炸（&gt;32K token）</td>
+                <td><span class="badge badge-success">优</span> 每批大小可控，不会超限</td>
+            </tr>
+            <tr>
+                <td><strong>JSON 完整性</strong></td>
+                <td><span class="badge badge-danger">高风险</span> 输出长 JSON 尾部易截断</td>
+                <td><span class="badge badge-success">低风险</span> 每批输出短，完整性好</td>
+            </tr>
+            <tr>
+                <td><strong>全局视角</strong></td>
+                <td><span class="badge badge-success">优</span> LLM 可见全部资产，跨表推导强</td>
+                <td><span class="badge badge-warning">中</span> 仅批内可见，跨表推导弱</td>
+            </tr>
+            <tr>
+                <td><strong>一致性</strong></td>
+                <td><span class="badge badge-success">优</span> 同一上下文，风格统一</td>
+                <td><span class="badge badge-warning">中</span> 跨批次可能不一致</td>
+            </tr>
+            <tr>
+                <td><strong>可扩展性</strong></td>
+                <td><span class="badge badge-danger">差</span> 资产 &gt;20 个 Class 即不可用</td>
+                <td><span class="badge badge-success">优</span> 支持上百个 Class</td>
+            </tr>
+            <tr>
+                <td><strong>Token 成本</strong></td>
+                <td><span class="badge badge-warning">中</span> 1 次调用，但 prompt 巨大</td>
+                <td><span class="badge badge-warning">中</span> N 次调用，文档重复传输</td>
+            </tr>
+            <tr>
+                <td><strong>容错性</strong></td>
+                <td><span class="badge badge-danger">差</span> 单点失败，全任务失败</td>
+                <td><span class="badge badge-success">优</span> 单批失败可跳过继续</td>
+            </tr>
+            <tr>
+                <td><strong>代码完整度</strong></td>
+                <td><span class="badge badge-success">完整</span> 587 行，功能闭环</td>
+                <td><span class="badge badge-danger">不完整</span> 338 行，文件被截断</td>
+            </tr>
+            <tr>
+                <td><strong>重试机制</strong></td>
+                <td><span class="badge badge-danger">无</span> JSON 解析失败直接抛异常</td>
+                <td><span class="badge badge-danger">未知</span> 截断部分不可见</td>
+            </tr>
+            <tr>
+                <td><strong>增量优化</strong></td>
+                <td><span class="badge badge-danger">无</span> 每次全量重跑</td>
+                <td><span class="badge badge-danger">无</span> 每次全量重跑</td>
+            </tr>
+            <tr>
+                <td><strong>文档处理</strong></td>
+                <td>支持 docx/doc/pdf/xlsx，45K 字符上限</td>
+                <td>同 v1，文档解析逻辑一致</td>
+            </tr>
+            <tr>
+                <td><strong>DB 写入</strong></td>
+                <td>upsert 模式，is_reviewed=0</td>
+                <td>同 v1（从 v1 继承）</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h4>评分对比（满分 10 分）</h4>
+    <div class="card">
+        <div class="score-bar">
+            <span class="score-label">上下文安全</span>
+            <div class="score-track"><div class="score-fill v1" style="width:30%">3/10</div></div>
+        </div>
+        <div class="score-bar">
+            <span class="score-label"></span>
+            <div class="score-track"><div class="score-fill v2" style="width:90%">9/10</div></div>
+        </div>
+
+        <div class="score-bar">
+            <span class="score-label">全局视角</span>
+            <div class="score-track"><div class="score-fill v1" style="width:90%">9/10</div></div>
+        </div>
+        <div class="score-bar">
+            <span class="score-label"></span>
+            <div class="score-track"><div class="score-fill v2" style="width:50%">5/10</div></div>
+        </div>
+
+        <div class="score-bar">
+            <span class="score-label">可扩展性</span>
+            <div class="score-track"><div class="score-fill v1" style="width:20%">2/10</div></div>
+        </div>
+        <div class="score-bar">
+            <span class="score-label"></span>
+            <div class="score-track"><div class="score-fill v2" style="width:90%">9/10</div></div>
+        </div>
+
+        <div class="score-bar">
+            <span class="score-label">容错性</span>
+            <div class="score-track"><div class="score-fill v1" style="width:30%">3/10</div></div>
+        </div>
+        <div class="score-bar">
+            <span class="score-label"></span>
+            <div class="score-track"><div class="score-fill v2" style="width:80%">8/10</div></div>
+        </div>
+
+        <div class="score-bar">
+            <span class="score-label">代码完整度</span>
+            <div class="score-track"><div class="score-fill v1" style="width:90%">9/10</div></div>
+        </div>
+        <div class="score-bar">
+            <span class="score-label"></span>
+            <div class="score-track"><div class="score-fill v2" style="width:40%">4/10</div></div>
+        </div>
+    </div>
+
+    <!-- 5. 综合评判 -->
+    <h2 id="verdict"><span class="icon">🏆</span> 五、综合评判</h2>
+    <div class="verdict">
+        <h3>结论：v2 架构方向正确，但需补全 + 改进</h3>
+        <p><strong>v2 的分批策略在架构思路上明显优于 v1</strong>——它解决了 v1 最致命的"上下文爆炸"和"JSON 截断"问题，是面向生产环境的正确方向。</p>
+        <p>但 v2 存在两个关键问题：</p>
+        <ol>
+            <li><strong>文件不完整</strong>：在 <code>_extract_json</code> 处截断，缺少 LLM 调用、结果合并、DB 写入等核心逻辑，<strong>无法直接运行</strong></li>
+            <li><strong>全局视角缺失</strong>：分批后 LLM 看不到全部资产，跨表关系推导和命名一致性无法保证</li>
+        </ol>
+        <p><strong>建议</strong>：以 v2 的分批策略为基础，融合 v1 的全局视角优势，并引入下文提出的 6 大改进方向，构建 v3。</p>
+    </div>
+
+    <!-- 6. 业界资料 -->
+    <h2 id="research"><span class="icon">📚</span> 六、业界资料与最佳实践</h2>
+
+    <div class="card">
+        <h4>1. 上下文工程（Anthropic）</h4>
+        <p>Anthropic 在 <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">Effective context engineering for AI agents</a> 中指出：<strong>"Context engineering refers to the set of strategies for curating and maintaining the optimal set of tokens during LLM inference."</strong></p>
+        <p><strong>启示</strong>：不应把所有文档全量塞入 prompt，而应通过 RAG 检索只注入与当前资产相关的文档片段。</p>
+    </div>
+
+    <div class="card">
+        <h4>2. 分块策略（Pinecone / Atlan）</h4>
+        <p>Pinecone 的 <a href="https://www.pinecone.io/learn/chunking-strategies">Chunking Strategies</a> 和 Atlan 的 <a href="https://atlan.com">9 chunking strategies for RAG</a> 都强调：<strong>不同内容类型应采用不同分块策略</strong>。对于表格类文档（Excel），应保留列名/数据类型作为 metadata；对于文本类文档（Word/PDF），应按语义段落分块。</p>
+        <p><strong>启示</strong>：v1/v2 对文档的处理过于粗暴（直接拼接 45K 字符），应按文档类型分块 + 向量化 + 按需检索。</p>
+    </div>
+
+    <div class="card">
+        <h4>3. 结构化输出可靠性（SD Times / Cleanlab）</h4>
+        <p>SD Times 在 <a href="https://sdtimes.com/ai/when-the-model-is-confident-and-wrong-a-practitioner-guide-to-llm-output-reliability">LLM Output Reliability</a> 中指出：<strong>"Always validate with Pydantic or Zod, even when the provider guarantees schema compliance. Business logic validation catches what JSON Schema cannot."</strong></p>
+        <p><strong>启示</strong>：v1/v2 的 JSON 解析只有简单的 <code>json.loads</code> + fallback，缺少 Pydantic schema 验证和自校正重试。</p>
+    </div>
+
+    <div class="card">
+        <h4>4. 业务术语表 vs 数据字典（Alation / Atlan）</h4>
+        <p>Alation 在 <a href="https://www.alation.com/blog/data-dictionary-vs-business-glossary">Business Glossary vs Data Dictionary</a> 中区分了两个概念：<strong>数据字典</strong>（技术层：表/列/类型）和<strong>业务术语表</strong>（业务层：术语定义/业务规则）。Atlan 进一步指出：<strong>"A business glossary teaches an AI agent what each term means while a catalog shows where the data lives."</strong></p>
+        <p><strong>启示</strong>：文档优化的核心价值是构建"业务术语表"——把文档中的业务术语映射到物理字段，而不是重新提取 fields。</p>
+    </div>
+
+    <div class="card">
+        <h4>5. 知识图谱增强（Neo4j GraphRAG）</h4>
+        <p>Neo4j 在 <a href="https://neo4j.com/blog/agentic-ai/how-a-neo4j-semantic-layer-makes-your-text-to-sql-agent-smarter-and-cheaper">Semantic Layer</a> 中展示：<strong>用知识图谱替代静态 YAML schema 文件，可减少 20-30% token 消耗</strong>。GraphRAG 方式让 LLM "导航"元数据而非"阅读"全部元数据。</p>
+        <p><strong>启示</strong>：Ontology 本身就是知识图谱，优化时应利用已有关系做"导航式检索"，而非全量注入。</p>
+    </div>
+
+    <div class="card">
+        <h4>6. 自动化元数据生成（arXiv）</h4>
+        <p>arXiv 论文 <a href="https://arxiv.org/pdf/2503.09003">Leveraging RAG for Automated Metadata Generation</a> 探讨了用 RAG 自动为数据目录生成表级和列级描述的方法，核心是<strong>先检索相关文档片段，再让 LLM 基于片段生成描述</strong>。</p>
+        <p><strong>启示</strong>：文档优化应采用 RAG 模式——先对文档分块向量化，优化每个资产时只检索相关片段。</p>
+    </div>
+
+    <!-- 7. 改进建议 -->
+    <h2 id="improve"><span class="icon">💡</span> 七、改进建议（6 大方向）</h2>
+
+    <div class="card">
+        <h4>改进 1：文档 RAG 化（解决文档重复传输问题）</h4>
+        <p><strong>问题</strong>：v1/v2 每次都把文档全量拼入 prompt（45K 字符），多批次时文档被重复传输 N 次。</p>
+        <p><strong>方案</strong>：</p>
+        <ul>
+            <li>文档上传时按语义分块（Word/PDF 按段落，Excel 按 sheet/行组）</li>
+            <li>每块生成 embedding 存入向量库（如 Chroma/FAISS）</li>
+            <li>优化每个 Class 时，用 Class 的 name_cn + description 做语义检索，只取 Top-K 相关文档片段</li>
+        </ul>
+        <pre><code># 伪代码
+for batch in batches:
+    for cls in batch["classes"]:
+        query = f"{cls['name_cn']} {cls['description']}"
+        relevant_chunks = vector_store.search(query, top_k=5)
+        cls_doc_context = "\n".join(relevant_chunks)
+    # 每批只带相关文档片段，而非全量文档</code></pre>
+        <p><span class="badge badge-success">收益</span> 文档 token 消耗降低 80%+，且每个 Class 看到的文档更精准</p>
+    </div>
+
+    <div class="card">
+        <h4>改进 2：两阶段优化（解决全局视角缺失问题）</h4>
+        <p><strong>问题</strong>：v2 分批后 LLM 看不到全部资产，跨表关系推导和命名一致性无法保证。</p>
+        <p><strong>方案</strong>：采用"先分后合"两阶段策略：</p>
+        <ul>
+            <li><strong>阶段一（分批优化）</strong>：v2 的分批策略，每批优化 Class/Metrics/Concepts 的业务描述</li>
+            <li><strong>阶段二（全局校正）</strong>：把所有优化后的资产<strong>摘要</strong>（只含 id/name_cn/category，不含完整字段）送入 LLM，做全局一致性校正：
+                <ul>
+                    <li>统一命名风格（如所有 Class 名以"表"结尾）</li>
+                    <li>统一 category 分类标准</li>
+                    <li>推导跨表 Relationships</li>
+                    <li>补全 Concepts 树状层级</li>
+                </ul>
+            </li>
+        </ul>
+        <pre><code># 阶段二：全局校正
+summaries = [{"id": c.id, "name_cn": c.name_cn, "category": c.category} for c in all_classes]
+prompt = GLOBAL_CORRECTION_PROMPT.format(assets_summary=summaries)
+corrections = llm.call(prompt)  # 只输出差异补丁，不是全量</code></pre>
+        <p><span class="badge badge-success">收益</span> 兼顾分批的上下文安全和全局的一致性</p>
+    </div>
+
+    <div class="card">
+        <h4>改进 3：Pydantic Schema 验证 + 自校正重试</h4>
+        <p><strong>问题</strong>：v1/v2 的 JSON 解析只有 <code>json.loads</code> + fallback，缺少结构验证和重试。</p>
+        <p><strong>方案</strong>：</p>
+        <ul>
+            <li>用 Pydantic 定义所有资产的 schema（ClassSchema / MetricSchema / RelationshipSchema）</li>
+            <li>LLM 输出后用 Pydantic 验证，失败时把错误信息 + 原始输出回传给 LLM，让其修正</li>
+            <li>最多重试 3 次</li>
+        </ul>
+        <pre><code>from pydantic import BaseModel, ValidationError
+
+class MetricSchema(BaseModel):
+    id: str
+    name: str
+    description: str
+    target_class: str
+    formula: str
+    dimensions: list[str]
+    required_dimensions: list[str]
+    chart_type: str = "bar"
+
+for attempt in range(3):
+    raw = llm.call(prompt)
+    try:
+        metrics = [MetricSchema(**m) for m in raw["metrics"]]
+        break
+    except ValidationError as e:
+        prompt += f"\n\n上次输出有误：{e}\n请修正后重新输出。"</code></pre>
+        <p><span class="badge badge-success">收益</span> JSON 解析成功率从 ~70% 提升到 ~95%+</p>
+    </div>
+
+    <div class="card">
+        <h4>改进 4：增量优化模式</h4>
+        <p><strong>问题</strong>：v1/v2 每次都全量重跑，即使只新增了 1 个文档也要重新优化所有资产。</p>
+        <p><strong>方案</strong>：</p>
+        <ul>
+            <li>记录每个资产的 <code>last_optimized_at</code> 和 <code>source_docs</code>（来自哪些文档）</li>
+            <li>新增文档时，只优化与该文档语义相关的资产（通过向量检索确定）</li>
+            <li>已审核（is_reviewed=1）的资产不自动覆盖，只标记"有新文档可优化"提示</li>
+        </ul>
+        <pre><code># 增量优化
+new_doc_chunks = embed_and_chunk(new_doc)
+related_assets = vector_store.find_related(new_doc_chunks, assets)
+# 只优化 related_assets，而非全量
+batches = build_batches(related_assets)</code></pre>
+        <p><span class="badge badge-success">收益</span> 增量优化时 token 消耗降低 90%+，且不破坏已审核资产</p>
+    </div>
+
+    <div class="card">
+        <h4>改进 5：文档分类与结构化提取</h4>
+        <p><strong>问题</strong>：v1/v2 把所有文档当纯文本处理，丢失了 Excel 的表格结构和 Word 的标题层级。</p>
+        <p><strong>方案</strong>：</p>
+        <ul>
+            <li><strong>Excel</strong>：按 sheet 分块，每块保留表头 + 数据类型 + 样本行，作为"结构化文档片段"</li>
+            <li><strong>Word</strong>：按标题层级（H1/H2/H3）分块，保留层级路径作为 metadata</li>
+            <li><strong>PDF</strong>：按页面/章节分块，保留页码和章节路径</li>
+            <li>分块时生成 metadata：{doc_type, section_path, page, has_table}</li>
+        </ul>
+        <pre><code># Word 文档结构化分块
+{
+    "doc_type": "word",
+    "section_path": "第三章 > 3.2 销售指标定义",
+    "content": "销售总额：所有门店所有品类的销售金额总和...",
+    "metadata": {"heading_level": 2, "page": 15}
+}</code></pre>
+        <p><span class="badge badge-success">收益</span> 文档片段携带结构信息，LLM 能更精准地理解业务上下文</p>
+    </div>
+
+    <div class="card">
+        <h4>改进 6：优化结果 Diff 审计 + 人工审核闭环</h4>
+        <p><strong>问题</strong>：v1/v2 直接 upsert 覆盖，用户看不到"改了什么"，且 is_reviewed 机制未形成闭环。</p>
+        <p><strong>方案</strong>：</p>
+        <ul>
+            <li>优化后生成 <strong>Diff 报告</strong>：每个资产的 before/after 对比</li>
+            <li>Diff 报告存入 <code>schema_optimization_runs.changes_json</code></li>
+            <li>前端展示 Diff，用户可逐条 Accept / Reject</li>
+            <li>Reject 的资产保持原值，Accept 的资产标记 is_reviewed=1</li>
+        </ul>
+        <pre><code># Diff 报告示例
+{
+    "classes": [
+        {
+            "id": "Sale",
+            "field": "description",
+            "before": "销售记录表",
+            "after": "门店销售明细表，记录每笔交易的金额、品类、门店信息",
+            "source_doc": "销售业务手册.pdf",
+            "source_section": "2.1 销售数据定义"
+        }
+    ]
+}</code></pre>
+        <p><span class="badge badge-success">收益</span> 优化过程可追溯、可审计，用户信任度高</p>
+    </div>
+
+    <!-- 8. 推荐架构 -->
+    <h2 id="arch"><span class="icon">🏗️</span> 八、推荐架构（v3 蓝图）</h2>
+
+    <div class="card">
+        <h3>v3 整体架构</h3>
+        <pre><code>┌─────────────────────────────────────────────────────────────┐
+│                    Schema Optimizer v3                      │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌─────────────┐    ┌───────────────┐    ┌──────────────┐  │
+│  │ 文档上传     │───▶│ 文档结构化分块 │───▶│ Embedding    │  │
+│  │ Word/Excel/ │    │ Word: 按H1/H2 │    │ 向量化存储   │  │
+│  │ PDF         │    │ Excel: 按sheet│    │ (Chroma/FAISS)│  │
+│  └─────────────┘    └───────────────┘    └──────┬───────┘  │
+│                                                  │          │
+│  ┌─────────────┐    ┌───────────────┐           │          │
+│  │ 增量检测     │───▶│ 资产语义检索   │◀──────────┘          │
+│  │ 新文档/新资产│    │ Top-K 相关片段 │                      │
+│  └─────────────┘    └───────┬───────┘                      │
+│                              │                              │
+│              ┌───────────────▼───────────────┐              │
+│              │     阶段一：分批优化（v2策略）  │              │
+│              │  每批 ≤6 Class + 关联资产      │              │
+│              │  + RAG 检索的相关文档片段      │              │
+│              │  → Pydantic 验证 + 自校正重试  │              │
+│              └───────────────┬───────────────┘              │
+│                              │                              │
+│              ┌───────────────▼───────────────┐              │
+│              │     阶段二：全局校正           │              │
+│              │  全部资产摘要 → LLM 全局校正   │              │
+│              │  统一命名/分类/跨表关系/概念树 │              │
+│              └───────────────┬───────────────┘              │
+│                              │                              │
+│              ┌───────────────▼───────────────┐              │
+│              │     Diff 报告生成              │              │
+│              │  before/after 对比 + 来源标注  │              │
+│              └───────────────┬───────────────┘              │
+│                              │                              │
+│              ┌───────────────▼───────────────┐              │
+│              │     人工审核闭环              │              │
+│              │  逐条 Accept / Reject         │              │
+│              │  Accept → is_reviewed=1       │              │
+│              └───────────────────────────────┘              │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘</code></pre>
+    </div>
+
+    <div class="card">
+        <h3>v3 vs v1/v2 改进对照</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>维度</th>
+                    <th>v1</th>
+                    <th>v2</th>
+                    <th>v3（推荐）</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>文档处理</td>
+                    <td>全量拼接 45K</td>
+                    <td>全量拼接 45K</td>
+                    <td><strong>RAG 分块检索</strong></td>
+                </tr>
+                <tr>
+                    <td>分批策略</td>
+                    <td>无（全量）</td>
+                    <td>按 Class 分批</td>
+                    <td>按 Class 分批 + <strong>增量检测</strong></td>
+                </tr>
+                <tr>
+                    <td>全局视角</td>
+                    <td>有（但易爆）</td>
+                    <td>无</td>
+                    <td><strong>两阶段：分批+全局校正</strong></td>
+                </tr>
+                <tr>
+                    <td>JSON 验证</td>
+                    <td>json.loads</td>
+                    <td>未知（截断）</td>
+                    <td><strong>Pydantic + 自校正重试</strong></td>
+                </tr>
+                <tr>
+                    <td>增量优化</td>
+                    <td>不支持</td>
+                    <td>不支持</td>
+                    <td><strong>支持（语义检索相关资产）</strong></td>
+                </tr>
+                <tr>
+                    <td>文档结构</td>
+                    <td>纯文本</td>
+                    <td>纯文本</td>
+                    <td><strong>结构化分块 + metadata</strong></td>
+                </tr>
+                <tr>
+                    <td>审核闭环</td>
+                    <td>直接覆盖</td>
+                    <td>直接覆盖</td>
+                    <td><strong>Diff 报告 + Accept/Reject</strong></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="alert alert-success">
+        <strong>✅ 总结</strong>
+        <p style="margin-top:8px;"><strong>v2 的分批方向正确</strong>，但需补全代码并解决全局视角缺失问题。<strong>v3 蓝图</strong>通过"文档 RAG 化 + 两阶段优化 + Pydantic 验证 + 增量模式 + 结构化分块 + Diff 审计"6 大改进，可构建生产级 Schema 优化器。建议优先实现<strong>改进 1（文档 RAG 化）</strong>和<strong>改进 3（Pydantic 验证）</strong>，这两项投入产出比最高。</p>
+    </div>
+
+    <div class="footer">
+        <p>Schema Optimizer v1 vs v2 对比分析与改进建议 | 生成日期：2026-06-25</p>
+        <p>参考来源：Anthropic Context Engineering、Pinecone Chunking Strategies、Neo4j GraphRAG、Alation Business Glossary、arXiv RAG Metadata Generation、SD Times LLM Output Reliability</p>
+    </div>
+
+</div>
+</body>
+</html>

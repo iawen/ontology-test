@@ -5,13 +5,15 @@ from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 from tools.db import get_db
-from ontology.schema_optimizer import (
-    create_optimization_run,
-    delete_optimization_file,
-    list_optimization_files,
-    list_optimization_runs,
-    run_schema_optimization,
-    save_optimization_files,
+
+from core.ontology.schema_optimizer import (
+    SchemaOptimizer
+    # create_optimization_run,
+    # delete_optimization_file,
+    # list_optimization_files,
+    # list_optimization_runs,
+    # run_schema_optimization,
+    # save_optimization_files,
 )
 
 

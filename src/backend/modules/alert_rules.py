@@ -12,7 +12,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 
 from tools.db import get_db
-from modules.models import AlertRuleCreate, AlertRuleUpdate
+from core.models.models import AlertRuleCreate, AlertRuleUpdate
 
 router = APIRouter()
 

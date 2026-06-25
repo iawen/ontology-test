@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException
 
 from tools.db import get_db
 from configs.global_config import Cfg
-from modules.models import SystemSettingsUpdate
+from core.models.models import SystemSettingsUpdate
 
 router = APIRouter()
 

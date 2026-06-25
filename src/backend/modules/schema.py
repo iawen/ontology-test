@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException
 
 from configs.global_config import Cfg
 from tools.db import get_db
-from modules.models import SchemaClassEdit, SchemaRelationEdit
+from core.models.models import SchemaClassEdit, SchemaRelationEdit
 
 
 router = APIRouter()

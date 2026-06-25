@@ -9,7 +9,7 @@ import json
 from fastapi import APIRouter, HTTPException
 
 from tools.db import get_db
-from modules.models import GlossaryTermCreate, GlossaryTermUpdate
+from core.models.models import GlossaryTermCreate, GlossaryTermUpdate
 
 router = APIRouter()
 

@@ -9,7 +9,7 @@ import hashlib
 from fastapi import APIRouter, HTTPException
 
 from tools.db import get_db
-from modules.models import UserCreate, UserUpdate
+from core.models.models import UserCreate, UserUpdate
 
 router = APIRouter()
 

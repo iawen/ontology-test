@@ -7,7 +7,7 @@
 from fastapi import APIRouter, HTTPException
 
 from tools.db import get_db
-from modules.models import ChartRuleCreate, ChartRuleUpdate
+from core.models.models import ChartRuleCreate, ChartRuleUpdate
 
 router = APIRouter()
 

@@ -10,9 +10,9 @@ v2: Skill.md 模式
 import json
 from fastapi import APIRouter, HTTPException, Request
 
-from configs.global_config import Cfg, client
+from core.llm.chat_model import get_async_client, get_model_name
 from tools.db import get_db
-from modules.models import SkillCreate, SkillUpdate
+from core.models.models import SkillCreate, SkillUpdate
 
 router = APIRouter()
 
@@ -183,8 +183,8 @@ async def route_skills(scenario_id: str, user_message: str, conversation_history
 
     # 调用 LLM
     try:
-        response = await client.chat.completions.create(
-            model=Cfg.model_name,
+        response = await get_async_client().chat.completions.create(
+            model=get_model_name(),
             messages=[{"role": "user", "content": routing_prompt}],
             temperature=0.1,  # 低温度，确保稳定输出
             max_tokens=256,

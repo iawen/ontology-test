@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional, Any, Dict, List
 
 from tools.db_connector import create_db_engine
-from ontology.ontology_engine import OntologyEngine
+from core.ontology.ontology_engine import OntologyEngine
 
 class DataQueryEngine:
     def __init__(self, engine: OntologyEngine, db_connection_url: str = ""):

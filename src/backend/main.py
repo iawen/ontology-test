@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from configs.global_config import Cfg
-from modules.models import LoginReq
+from core.models.models import LoginReq
 from tools.db import get_db, init_db
 from prompts.prompt import get_engine
 from modules.helpers import create_token

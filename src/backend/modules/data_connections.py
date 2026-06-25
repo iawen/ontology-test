@@ -17,7 +17,7 @@ from tools.db_connector import (
     read_table_sample,
     mask_connection_url,
 )
-from modules.models import DataConnectionCreate, DataConnectionUpdate
+from core.models.models import DataConnectionCreate, DataConnectionUpdate
 
 router = APIRouter()
 

@@ -17,11 +17,11 @@ from typing import Optional, Generator, Any
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
-from configs.global_config import Cfg, client
-from ontology.ontology_engine import OntologyEngine
-from ontology.data_query import DataQueryEngine
+from core.llm.chat_model import get_async_client, get_model_name
+from core.ontology.ontology_engine import OntologyEngine
+from core.ontology.data_query import DataQueryEngine
 from tools.db import get_db
-from modules.models import ChatRequest
+from core.models.models import ChatRequest
 from prompts.prompt import (
     init_prompt, get_system_prompt, get_system_tools, get_engine, get_query_engine,
 )
@@ -338,8 +338,8 @@ async def chat_stream_generator(req: ChatRequest):
         query_history = []
 
         for _round_idx in range(MAX_TOOL_ROUNDS):
-            response = await client.chat.completions.create(
-                model=Cfg.model_name,
+            response = await get_async_client().chat.completions.create(
+                model=get_model_name(),
                 messages=messages_to_send,
                 tools=get_system_tools(),
                 tool_choice="auto",
@@ -444,8 +444,8 @@ async def chat_stream_generator(req: ChatRequest):
                 s["status"] = "completed"
         yield f"data: {json.dumps({'type': 'plan', 'title': '智能体 Plan-and-Execute 认知循环', 'steps': accumulated_plan_steps, 'current_step': len(accumulated_plan_steps), 'total_steps': len(accumulated_plan_steps)}, ensure_ascii=False)}\n\n"
 
-        final_stream = await client.chat.completions.create(
-            model=Cfg.model_name,
+        final_stream = await get_async_client().chat.completions.create(
+            model=get_model_name(),
             messages=messages_to_send,
             temperature=0.5,
             max_tokens=2048,

@@ -18,8 +18,8 @@ from datetime import datetime, timezone
 
 from configs.global_config import Cfg
 from tools.db import get_db
-from ontology.ontology_engine import OntologyEngine
-from ontology.data_query import DataQueryEngine
+from core.ontology.ontology_engine import OntologyEngine
+from core.ontology.data_query import DataQueryEngine
 
 
 def _build_ontology_context(engine: OntologyEngine, scenario_id: str) -> str:
