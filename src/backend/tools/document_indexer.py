@@ -1,12 +1,11 @@
 """
-Schema Optimizer v3.1 - 文档分块与向量化模块
-============================================
-改进点：
-  1. 降级解析链：fitz → pdfplumber → 纯文本兜底
-  2. 分块重叠（chunk_overlap）：避免语义边界丢失
-  3. 元数据增强：提取标题层级
-  4. Embedding 缓存：避免重复计算
-  5. 本地备选模型：API失败时降级到 sentence-transformers
+Schema Optimizer v4 - 文档分块与 BM25 索引模块
+===============================================
+改进点（基于建议1）：
+  1. 使用 BM25 (关键词统计) 替代 Embedding 向量检索
+  2. 保留结构化分块（Word/PDF/Excel/TXT）
+  3. 保留分块重叠机制，避免边界信息丢失
+  4. 保留降级解析链（fitz → pdfplumber → 纯文本兜底）
 """
 
 import os
@@ -16,14 +15,19 @@ import hashlib
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
-from typing import Optional, List, Dict, Tuple, Callable
-from functools import lru_cache
+from typing import List, Dict, Optional, Tuple
+
+# BM25 库
+try:
+    from rank_bm25 import BM25Okapi
+except ImportError:
+    raise ImportError("请安装 rank_bm25: pip install rank_bm25")
 
 import numpy as np
 
 
 # ============================================================
-# 文档解析（降级链 + 重叠分块）
+# 文档解析（与 v3.1 相同，保留降级链和重叠分块）
 # ============================================================
 
 def parse_document(path: Path, chunk_size: int = 800, chunk_overlap: int = 150) -> List[Dict]:
@@ -33,10 +37,10 @@ def parse_document(path: Path, chunk_size: int = 800, chunk_overlap: int = 150) 
     Args:
         path: 文档路径
         chunk_size: 每块目标字符数
-        chunk_overlap: 块间重叠字符数（防止边界信息丢失）
+        chunk_overlap: 块间重叠字符数
 
     Returns:
-        [{"chunk_id": str, "content": str, "metadata": {"source": str, "page": int, "type": str, "section": str}}]
+        [{"chunk_id": str, "content": str, "metadata": {"source": str, ...}}]
     """
     ext = path.suffix.lower()
     if ext == ".docx":
@@ -65,9 +69,7 @@ def _split_text_with_overlap(text: str, chunk_size: int, chunk_overlap: int, met
     idx = 0
     while start < len(text):
         end = min(start + chunk_size, len(text))
-        # 尽量在句号/换行处切断，避免截断词语
         if end < len(text):
-            # 找最近的句号、问号、感叹号或换行
             for sep in ["。", "！", "？", "\n\n", "\n", ". ", "! ", "? "]:
                 pos = text.rfind(sep, start, end)
                 if pos != -1 and pos > start + chunk_size // 2:
@@ -87,87 +89,54 @@ def _split_text_with_overlap(text: str, chunk_size: int, chunk_overlap: int, met
 
 
 def _parse_docx(path: Path, chunk_size: int, chunk_overlap: int) -> List[Dict]:
-    """解析 Word 文档，提取段落 + 标题层级"""
     ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-    all_chunks = []
     try:
         with zipfile.ZipFile(path) as archive:
             xml = archive.read("word/document.xml")
         root = ElementTree.fromstring(xml)
-
-        current_section = ""
-        section_level = 0
         paragraphs = []
-
+        current_section = ""
         for para in root.findall(".//w:p", ns):
             texts = [t.text for t in para.findall(".//w:t", ns) if t.text]
             text = "".join(texts).strip()
             if not text:
                 continue
-
-            # 检测标题样式（Heading1, Heading2, ...）
             style_elems = para.findall(".//w:pStyle", ns)
-            style = ""
-            if style_elems:
-                style = style_elems[0].get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val") or ""
-
-            if style and "Heading" in style:
-                try:
-                    section_level = int(style.replace("Heading", "")) if style.replace("Heading", "").isdigit() else 0
-                except:
-                    section_level = 0
+            style = style_elems[0].get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val") if style_elems else ""
+            if "Heading" in style:
                 current_section = text
-                # 标题本身也作为内容保留
-                paragraphs.append((text, current_section, section_level))
-            else:
-                paragraphs.append((text, current_section, section_level))
-
-        # 合并段落为文本块
-        full_text = "\n".join([p[0] for p in paragraphs])
-        metadata = {
-            "source": path.name,
-            "type": "docx",
-            "section": current_section,
-            "section_level": section_level,
-        }
-        all_chunks = _split_text_with_overlap(full_text, chunk_size, chunk_overlap, metadata)
-
+            paragraphs.append(text)
+        full_text = "\n".join(paragraphs)
+        metadata = {"source": path.name, "type": "docx", "section": current_section}
+        return _split_text_with_overlap(full_text, chunk_size, chunk_overlap, metadata)
     except Exception as e:
         print(f"[Warning] 解析 DOCX 失败: {e}")
-        # 降级：尝试直接读文本
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
             metadata = {"source": path.name, "type": "docx_fallback"}
-            all_chunks = _split_text_with_overlap(text, chunk_size, chunk_overlap, metadata)
+            return _split_text_with_overlap(text, chunk_size, chunk_overlap, metadata)
         except:
-            pass
-    return all_chunks
+            return []
 
 
 def _parse_pdf_with_fallback(path: Path, chunk_size: int, chunk_overlap: int) -> List[Dict]:
-    """解析 PDF，带降级链：fitz → pdfplumber → 纯文本兜底"""
-    chunks = []
-
-    # 尝试1: PyMuPDF (fitz)
+    # 尝试 PyMuPDF
     try:
         import fitz
         doc = fitz.open(str(path))
         full_text = ""
         for page_num in range(len(doc)):
-            page = doc[page_num]
-            text = page.get_text().strip()
+            text = doc[page_num].get_text().strip()
             if text:
                 full_text += f"\n--- Page {page_num+1} ---\n{text}"
         doc.close()
         if full_text.strip():
             metadata = {"source": path.name, "type": "pdf_fitz"}
             return _split_text_with_overlap(full_text, chunk_size, chunk_overlap, metadata)
-    except ImportError:
+    except:
         pass
-    except Exception as e:
-        print(f"[Warning] PyMuPDF 解析失败: {e}")
 
-    # 尝试2: pdfplumber
+    # 尝试 pdfplumber
     try:
         import pdfplumber
         full_text = ""
@@ -179,19 +148,15 @@ def _parse_pdf_with_fallback(path: Path, chunk_size: int, chunk_overlap: int) ->
         if full_text.strip():
             metadata = {"source": path.name, "type": "pdf_plumber"}
             return _split_text_with_overlap(full_text, chunk_size, chunk_overlap, metadata)
-    except ImportError:
+    except:
         pass
-    except Exception as e:
-        print(f"[Warning] pdfplumber 解析失败: {e}")
 
-    # 尝试3: 纯文本兜底（仅提取可读字符）
+    # 纯文本兜底
     try:
         raw = path.read_bytes()
-        # 尝试常见编码
-        for encoding in ["utf-8", "gb18030", "latin-1"]:
+        for enc in ["utf-8", "gb18030", "latin-1"]:
             try:
-                text = raw.decode(encoding, errors="ignore")
-                # 过滤掉不可打印字符
+                text = raw.decode(enc, errors="ignore")
                 text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", text)
                 text = re.sub(r"\s+", " ", text)
                 if len(text.strip()) > 100:
@@ -199,41 +164,38 @@ def _parse_pdf_with_fallback(path: Path, chunk_size: int, chunk_overlap: int) ->
                     return _split_text_with_overlap(text, chunk_size, chunk_overlap, metadata)
             except:
                 continue
-    except Exception as e:
-        print(f"[Warning] PDF 纯文本兜底失败: {e}")
-
+    except:
+        pass
     print(f"[Warning] 所有 PDF 解析方式均失败: {path.name}")
-    return chunks
+    return []
 
 
 def _parse_xlsx(path: Path, chunk_size: int, chunk_overlap: int) -> List[Dict]:
-    """解析 Excel，按 sheet 分块"""
-    chunks = []
     try:
         from openpyxl import load_workbook
         wb = load_workbook(str(path), read_only=True, data_only=True)
+        chunks = []
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
             rows = list(ws.iter_rows(values_only=True))
             if not rows:
                 continue
             headers = [str(h) if h else f"col_{j}" for j, h in enumerate(rows[0])]
-            # 将整个 sheet 转为文本
             lines = []
-            for row in rows[1:]:  # 跳过表头
+            for row in rows[1:]:
                 row_dict = {headers[j]: str(row[j]) if j < len(row) and row[j] else "" for j in range(len(headers))}
                 lines.append(json.dumps(row_dict, ensure_ascii=False))
             full_text = f"Sheet: {sheet_name}\nHeaders: {', '.join(headers)}\n" + "\n".join(lines)
             metadata = {"source": path.name, "sheet": sheet_name, "type": "excel"}
             chunks.extend(_split_text_with_overlap(full_text, chunk_size, chunk_overlap, metadata))
         wb.close()
+        return chunks
     except Exception as e:
         print(f"[Warning] 解析 XLSX 失败: {e}")
-    return chunks
+        return []
 
 
 def _parse_txt(path: Path, chunk_size: int, chunk_overlap: int) -> List[Dict]:
-    """解析纯文本"""
     try:
         text = path.read_text(encoding="utf-8")
         metadata = {"source": path.name, "type": "text"}
@@ -244,71 +206,64 @@ def _parse_txt(path: Path, chunk_size: int, chunk_overlap: int) -> List[Dict]:
 
 
 # ============================================================
-# 向量化与语义检索（带缓存 + 本地备选）
+# BM25 索引（替代 Embedding 检索）
 # ============================================================
 
 class DocumentIndex:
-    """文档向量索引（内存级，带缓存）"""
+    """
+    文档索引（基于 BM25 关键词检索）
+    轻量级，无需向量库和 GPU，适合术语密集的 Schema 优化场景。
+    """
 
-    def __init__(self, embedding_func: Optional[Callable] = None):
+    def __init__(self, tokenizer=None):
+        """
+        Args:
+            tokenizer: 分词函数，接收字符串返回词列表。若未提供，使用默认中文+英文分词。
+        """
         self.chunks: List[Dict] = []
-        self.vectors: Optional[np.ndarray] = None
-        self._cache: Dict[str, np.ndarray] = {}  # 文本 → 向量缓存
-        self.embedding_func = embedding_func or self._default_embedding
+        self.bm25: Optional[BM25Okapi] = None
+        self.tokenizer = tokenizer or self._default_tokenizer
 
-    def _default_embedding(self, text: str) -> np.ndarray:
-        """降级方案：基于关键词的哈希向量（256维）"""
-        # 检查缓存
-        cache_key = hashlib.md5(text.encode()).hexdigest()
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-
-        vec = np.zeros(256)
-        words = re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z_]+|\d+", text.lower())
-        for word in words:
-            h = int(hashlib.md5(word.encode()).hexdigest(), 16) % 256
-            vec[h] += 1.0
-        norm = np.linalg.norm(vec)
-        vec = vec / norm if norm > 0 else vec
-        self._cache[cache_key] = vec
-        return vec
+    def _default_tokenizer(self, text: str) -> List[str]:
+        """
+        默认分词：提取中文词语、英文单词、数字，并转为小写。
+        针对 Schema 优化场景，保留专有名词（如表名、字段名）。
+        """
+        # 匹配中文连续字符、英文单词、数字
+        tokens = re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z_]+|\d+", text.lower())
+        return tokens
 
     def add_chunks(self, chunks: List[Dict]):
-        """添加文档分块并生成向量（使用缓存）"""
+        """添加文档分块并构建 BM25 索引"""
         if not chunks:
             return
         self.chunks.extend(chunks)
-        new_vectors = []
-        for c in chunks:
-            vec = self._get_or_compute_vector(c["content"])
-            new_vectors.append(vec)
-        new_vectors = np.array(new_vectors)
-        if self.vectors is None:
-            self.vectors = new_vectors
-        else:
-            self.vectors = np.vstack([self.vectors, new_vectors])
-
-    def _get_or_compute_vector(self, text: str) -> np.ndarray:
-        """带缓存的向量计算"""
-        cache_key = hashlib.md5(text.encode()).hexdigest()
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-        vec = self.embedding_func(text)
-        self._cache[cache_key] = vec
-        return vec
+        # 重新构建 BM25 索引（所有块）
+        tokenized_corpus = [self.tokenizer(c["content"]) for c in self.chunks]
+        self.bm25 = BM25Okapi(tokenized_corpus)
 
     def search(self, query: str, top_k: int = 5) -> List[Dict]:
-        """语义检索"""
-        if self.vectors is None or len(self.chunks) == 0:
+        """
+        BM25 检索：返回与 query 最相关的 top_k 个文档分块。
+
+        Args:
+            query: 查询文本（通常是资产描述）
+            top_k: 返回数量
+
+        Returns:
+            [{"chunk_id": str, "content": str, "score": float, "metadata": dict}]
+        """
+        if self.bm25 is None or len(self.chunks) == 0:
             return []
 
-        query_vec = self._get_or_compute_vector(query)
-        scores = self.vectors @ query_vec
+        tokenized_query = self.tokenizer(query)
+        scores = self.bm25.get_scores(tokenized_query)
+        # 获取 top_k 索引
         top_indices = np.argsort(scores)[-top_k:][::-1]
 
         results = []
         for idx in top_indices:
-            if scores[idx] > 0.01:
+            if scores[idx] > 0:
                 chunk = self.chunks[idx]
                 results.append({
                     "chunk_id": chunk["chunk_id"],
@@ -319,14 +274,23 @@ class DocumentIndex:
         return results
 
     def build_context(self, query: str, top_k: int = 5, max_chars: int = 8000) -> str:
-        """构建优化上下文"""
+        """
+        构建优化上下文：检索相关文档片段并拼接。
+
+        Args:
+            query: 查询文本
+            top_k: 检索数量
+            max_chars: 最大字符数
+
+        Returns:
+            拼接后的文档上下文字符串
+        """
         results = self.search(query, top_k)
         parts = []
         used = 0
         for r in results:
             content = r["content"]
-            meta = r["metadata"]
-            header = f"\n--- 文档片段 (来源: {meta.get('source', '?')}, 相关度: {r['score']:.2f}) ---\n"
+            header = f"\n--- 文档片段 (来源: {r['metadata'].get('source', '?')}, 相关度: {r['score']:.2f}) ---\n"
             remaining = max_chars - used - len(header)
             if remaining <= 0:
                 break
@@ -334,50 +298,3 @@ class DocumentIndex:
             parts.append(header + truncated)
             used += len(header) + len(truncated)
         return "".join(parts)
-
-
-# ============================================================
-# LLM Embedding 函数（API + 本地备选）
-# ============================================================
-
-def create_llm_embedding_func(client, model: str = "text-embedding-v1"):
-    """创建基于 LLM API 的 embedding 函数，带本地备选降级"""
-    _local_encoder = None
-
-    def _get_local_encoder():
-        """懒加载本地 sentence-transformers"""
-        nonlocal _local_encoder
-        if _local_encoder is not None:
-            return _local_encoder
-        try:
-            from sentence_transformers import SentenceTransformer
-            _local_encoder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-            return _local_encoder
-        except ImportError:
-            return None
-
-    def embed(text: str) -> np.ndarray:
-        # 尝试 API
-        try:
-            resp = client.embeddings.create(model=model, input=text[:8000])
-            return np.array(resp.data[0].embedding)
-        except Exception as e:
-            print(f"[Warning] Embedding API 调用失败，降级到本地模型: {e}")
-            # 降级到本地模型
-            local_encoder = _get_local_encoder()
-            if local_encoder:
-                try:
-                    return local_encoder.encode(text, normalize_embeddings=True)
-                except Exception as e2:
-                    print(f"[Warning] 本地 embedding 也失败: {e2}")
-
-            # 最终降级：哈希向量
-            vec = np.zeros(256)
-            words = re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z_]+|\d+", text.lower())
-            for word in words:
-                h = int(hashlib.md5(word.encode()).hexdigest(), 16) % 256
-                vec[h] += 1.0
-            norm = np.linalg.norm(vec)
-            return vec / norm if norm > 0 else vec
-
-    return embed

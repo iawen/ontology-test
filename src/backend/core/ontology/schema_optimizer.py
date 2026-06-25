@@ -1,13 +1,10 @@
 """
-Schema Optimizer v3.1 - 核心优化器
-====================================
-基于 v3 的 6 大改进：
-  1. 文档解析健壮性（降级链 + 重叠分块） → document_indexer.py
-  2. 修复孤立资产重复添加 Bug → _build_batches
-  3. 扩展全局校正（概念树 + 指标口径） → _run_global_correction
-  4. 质量评估（LLM-as-Judge） → _run_quality_assessment
-  5. Embedding 缓存 + 本地备选 → document_indexer.py
-  6. 智能重试策略（区分语法/语义错误） → _call_llm_batch
+Schema Optimizer v4 - 核心优化器 (BM25 检索版)
+=============================================
+基于 v3.1 改进，核心变更：
+  1. 使用 BM25 关键词检索替代 Embedding 向量检索
+  2. 移除所有 Embedding 模型依赖，大幅降低资源消耗
+  3. 保留所有其他改进（分批优化、全局校正、质量评估、智能重试等）
 """
 
 import os
@@ -23,7 +20,7 @@ from configs.global_config import Cfg, client
 from tools.db import get_db
 from pydantic import ValidationError
 
-from .models import (
+from core.models.schema_model import (
     OptimizationBatchResult,
     GlobalCorrectionResult,
     OptimizationDiff,
@@ -33,7 +30,7 @@ from .models import (
     RelationshipOptimization,
     ConceptOptimization,
 )
-from .document_indexer import DocumentIndex, parse_document, create_llm_embedding_func
+from tools.document_indexer import DocumentIndex, parse_document
 
 
 # ============================================================
@@ -45,11 +42,11 @@ BATCH_MAX_METRICS = 15
 BATCH_MAX_RELATIONSHIPS = 10
 BATCH_MAX_CONCEPTS = 10
 DOC_CONTEXT_LIMIT = 8000
-LLM_RETRY_MAX = 2  # 自校正重试次数
+LLM_RETRY_MAX = 2
 
 
 # ============================================================
-# 辅助函数
+# 辅助函数（与 v3.1 相同）
 # ============================================================
 
 def _json_list(value) -> list:
@@ -81,19 +78,15 @@ def _row_to_dict(row) -> dict:
 
 
 def _extract_json(text: str) -> dict:
-    """从 LLM 输出中提取 JSON（增强鲁棒性）"""
     cleaned = text.strip()
     if cleaned.startswith("```"):
         import re
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
-
-    # 尝试修复常见 JSON 错误
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         import re
-        # 尝试查找 JSON 对象
         start = cleaned.find("{")
         end = cleaned.rfind("}")
         if start >= 0 and end > start:
@@ -101,7 +94,6 @@ def _extract_json(text: str) -> dict:
             try:
                 return json.loads(candidate)
             except:
-                # 尝试修复尾随逗号
                 candidate = re.sub(r",\s*}", "}", candidate)
                 candidate = re.sub(r",\s*]", "]", candidate)
                 try:
@@ -120,23 +112,15 @@ async def _emit_progress(callback: Optional[Callable], **status):
 
 
 # ============================================================
-# 主优化器
+# 主优化器（BM25 版本）
 # ============================================================
 
-class SchemaOptimizer:
-    """Schema 优化器"""
+class SchemaOptimizerV4:
+    """Schema 优化器 v4 - 使用 BM25 检索"""
 
     def __init__(self, scenario_id: str):
         self.scenario_id = scenario_id
-        self.doc_index = DocumentIndex()
-        self._init_embedding()
-
-    def _init_embedding(self):
-        """初始化 embedding 函数（带本地备选）"""
-        try:
-            self.doc_index.embedding_func = create_llm_embedding_func(client, "text-embedding-v1")
-        except Exception as e:
-            print(f"[Warning] Embedding 初始化失败，使用默认哈希: {e}")
+        self.doc_index = DocumentIndex()  # 不再需要 embedding 初始化
 
     # --------------------------------------------------------
     # 主入口
@@ -150,32 +134,16 @@ class SchemaOptimizer:
         progress_callback: Optional[Callable] = None,
         enable_quality_assessment: bool = True,
     ) -> dict:
-        """
-        执行 Schema 优化。
-
-        Args:
-            document_paths: 业务文档路径列表
-            incremental: True=只优化未审核资产; False=全量优化
-            target_class_ids: 指定优化的 class ID 列表（None=自动选择）
-            progress_callback: 进度回调
-            enable_quality_assessment: 是否启用质量评估
-
-        Returns:
-            {"status": "success", "run_id": str, "diff": dict, "applied": dict, "quality": dict}
-        """
         run_id = str(uuid.uuid4())[:8]
         await _emit_progress(progress_callback, running=True, phase="init", progress=5, total=100, message="初始化优化任务")
 
-        # 1. 创建运行记录
         self._create_run_record(run_id)
 
         try:
-            # 2. 解析并索引文档（使用增强版 parse_document）
-            await _emit_progress(progress_callback, phase="indexing", progress=10, total=100, message="解析业务文档（支持降级链+重叠分块）")
+            await _emit_progress(progress_callback, phase="indexing", progress=10, total=100, message="解析业务文档（BM25索引）")
             if document_paths:
                 self._index_documents(document_paths, progress_callback)
 
-            # 3. 加载当前 Schema 资产
             await _emit_progress(progress_callback, phase="loading", progress=20, total=100, message="加载当前 Schema 资产")
             classes, relationships, metrics, concepts = self._load_schema_assets(incremental, target_class_ids)
 
@@ -183,45 +151,34 @@ class SchemaOptimizer:
                 await _emit_progress(progress_callback, running=False, phase="done", progress=100, total=100, message="无可优化资产")
                 return {"status": "skipped", "run_id": run_id, "message": "无可优化资产"}
 
-            # 4. 阶段一：分批优化
             await _emit_progress(progress_callback, phase="batch_optimizing", progress=30, total=100, message="阶段一：分批优化")
             batch_results = await self._run_batch_optimization(
                 classes, relationships, metrics, concepts, progress_callback
             )
 
-            # 5. 阶段二：全局校正（扩展版）
-            await _emit_progress(progress_callback, phase="global_correcting", progress=65, total=100, message="阶段二：全局校正（概念树+指标口径）")
+            await _emit_progress(progress_callback, phase="global_correcting", progress=65, total=100, message="阶段二：全局校正")
             global_result = await self._run_global_correction(batch_results, progress_callback)
 
-            # 6. 合并结果
             merged = self._merge_results(batch_results, global_result)
 
-            # 7. 生成 Diff 报告
             await _emit_progress(progress_callback, phase="diffing", progress=78, total=100, message="生成差异报告")
             diff = self._generate_diff(classes, metrics, relationships, concepts, merged)
 
-            # 8. 质量评估（新增）
             quality_result = None
             if enable_quality_assessment:
-                await _emit_progress(progress_callback, phase="quality", progress=85, total=100, message="质量评估（LLM-as-Judge）")
+                await _emit_progress(progress_callback, phase="quality", progress=85, total=100, message="质量评估")
                 quality_result = await self._run_quality_assessment(merged, diff, progress_callback)
 
-            # 9. 应用优化
             await _emit_progress(progress_callback, phase="applying", progress=92, total=100, message="应用优化结果")
             applied = self._apply_optimization(merged)
 
-            # 10. 更新运行记录
             quality_data = quality_result.model_dump() if quality_result else {}
             self._update_run_success(run_id, diff, applied, quality_data)
 
             await _emit_progress(
                 progress_callback, running=False, phase="done", progress=100, total=100,
                 message="Schema 优化完成", run_id=run_id,
-                result={
-                    "diff": diff.model_dump(),
-                    "applied": applied,
-                    "quality": quality_data
-                }
+                result={"diff": diff.model_dump(), "applied": applied, "quality": quality_data}
             )
             return {
                 "status": "success",
@@ -237,22 +194,20 @@ class SchemaOptimizer:
             raise
 
     # --------------------------------------------------------
-    # 文档索引（使用增强版解析）
+    # 文档索引（使用 BM25）
     # --------------------------------------------------------
 
     def _index_documents(self, paths: List[str], progress_callback=None):
-        """解析并索引所有文档（支持降级链和重叠分块）"""
         total = len(paths)
         for idx, path_str in enumerate(paths):
             path = Path(path_str)
             if not path.exists():
                 print(f"[Warning] 文件不存在，跳过: {path_str}")
                 continue
-            # 使用增强版 parse_document（含降级链和重叠）
             chunks = parse_document(path, chunk_size=800, chunk_overlap=150)
             if chunks:
                 self.doc_index.add_chunks(chunks)
-                print(f"  [Index] {path.name}: {len(chunks)} chunks (带重叠)")
+                print(f"  [Index] {path.name}: {len(chunks)} chunks (BM25)")
             else:
                 print(f"  [Warning] {path.name}: 解析失败，无内容")
 
