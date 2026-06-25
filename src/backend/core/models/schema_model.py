@@ -1,10 +1,7 @@
 """
-Schema Optimizer v3 - Pydantic 模型定义
-========================================
-定义 LLM 输出的结构化 schema，用于：
-  1. JSON 输出验证（Pydantic 自动校验）
-  2. 自校正重试（校验失败时反馈错误给 LLM 重试）
-  3. 类型安全（下游代码可依赖类型）
+Schema Optimizer v3.1 - Pydantic 模型定义
+==========================================
+新增：质量评估模型 (QualityAssessmentResult)
 """
 
 from typing import Optional, List
@@ -24,9 +21,7 @@ class FieldOptimization(BaseModel):
     @classmethod
     def validate_type(cls, v):
         allowed = {"text", "numeric", "date", "boolean"}
-        if v not in allowed:
-            return "text"
-        return v
+        return v if v in allowed else "text"
 
 
 class ClassOptimization(BaseModel):
@@ -88,9 +83,7 @@ class MetricOptimization(BaseModel):
     @classmethod
     def validate_chart_type(cls, v):
         allowed = {"bar", "line", "pie", "table", "gauge", "scatter", "area"}
-        if v not in allowed:
-            return "bar"
-        return v
+        return v if v in allowed else "bar"
 
 
 class ConceptOptimization(BaseModel):
@@ -107,9 +100,7 @@ class ConceptOptimization(BaseModel):
     @classmethod
     def validate_concept_type(cls, v):
         allowed = {"subject_domain", "dimension_group", "fact_group", "entity", "kpi", "category"}
-        if v not in allowed:
-            return "entity"
-        return v
+        return v if v in allowed else "entity"
 
 
 class OptimizationBatchResult(BaseModel):
@@ -122,10 +113,13 @@ class OptimizationBatchResult(BaseModel):
 
 
 class GlobalCorrectionResult(BaseModel):
-    """全局校正结果"""
+    """全局校正结果（扩展版）"""
     class_renames: List[dict] = Field(default_factory=list, description="类ID重命名映射")
     relationship_corrections: List[RelationshipOptimization] = Field(default_factory=list)
     metric_corrections: List[MetricOptimization] = Field(default_factory=list)
+    concept_corrections: List[ConceptOptimization] = Field(default_factory=list, description="概念树修正")
+    metric_consistency_warnings: List[str] = Field(default_factory=list, description="指标口径不一致警告")
+    concept_tree_warnings: List[str] = Field(default_factory=list, description="概念树结构警告")
     summary: str = Field("", description="全局校正摘要")
 
 
@@ -138,3 +132,13 @@ class OptimizationDiff(BaseModel):
     added_relationships: List[str] = Field(default_factory=list)
     added_concepts: List[str] = Field(default_factory=list)
     summary: str = Field("")
+
+
+class QualityAssessmentResult(BaseModel):
+    """质量评估结果（LLM-as-Judge）"""
+    overall_score: float = Field(..., ge=0, le=10, description="综合质量评分 0-10")
+    confidence: float = Field(..., ge=0, le=1, description="置信度 0-1")
+    strengths: List[str] = Field(default_factory=list, description="优化亮点")
+    weaknesses: List[str] = Field(default_factory=list, description="需改进之处")
+    high_risk_items: List[str] = Field(default_factory=list, description="需重点人工审核项")
+    summary: str = Field("", description="评估总结")

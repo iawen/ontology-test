@@ -1,23 +1,13 @@
 """
-Schema Optimizer v3 - 核心优化器
-================================
-基于 v1/v2 分析的 6 大改进：
-  1. 文档 RAG 化：文档分块+向量化，按需检索相关片段
-  2. 两阶段优化：阶段一分批优化，阶段二全局校正
-  3. Pydantic 验证+自校正：结构化输出验证，失败自动重试
-  4. 增量优化模式：只优化未审核或指定资产
-  5. 文档结构化分块：按类型智能分块
-  6. Diff 审计+人工审核：生成差异报告，支持 Accept/Reject
-
-使用方式：
-  from schema_optimizer import SchemaOptimizer
-
-  optimizer = SchemaOptimizer(scenario_id="xueji")
-  result = await optimizer.optimize(
-      document_paths=["/path/to/doc1.docx", "/path/to/data.xlsx"],
-      incremental=True,
-      progress_callback=on_progress,
-  )
+Schema Optimizer v3.1 - 核心优化器
+====================================
+基于 v3 的 6 大改进：
+  1. 文档解析健壮性（降级链 + 重叠分块） → document_indexer.py
+  2. 修复孤立资产重复添加 Bug → _build_batches
+  3. 扩展全局校正（概念树 + 指标口径） → _run_global_correction
+  4. 质量评估（LLM-as-Judge） → _run_quality_assessment
+  5. Embedding 缓存 + 本地备选 → document_indexer.py
+  6. 智能重试策略（区分语法/语义错误） → _call_llm_batch
 """
 
 import os
@@ -33,16 +23,17 @@ from configs.global_config import Cfg, client
 from tools.db import get_db
 from pydantic import ValidationError
 
-from core.models.schema_model import (
+from .models import (
     OptimizationBatchResult,
     GlobalCorrectionResult,
     OptimizationDiff,
+    QualityAssessmentResult,
     ClassOptimization,
     MetricOptimization,
     RelationshipOptimization,
     ConceptOptimization,
 )
-from tools.document_indexer import DocumentIndex, parse_document, create_llm_embedding_func
+from .document_indexer import DocumentIndex, parse_document, create_llm_embedding_func
 
 
 # ============================================================
@@ -51,6 +42,8 @@ from tools.document_indexer import DocumentIndex, parse_document, create_llm_emb
 
 BATCH_MAX_CLASSES = 6
 BATCH_MAX_METRICS = 15
+BATCH_MAX_RELATIONSHIPS = 10
+BATCH_MAX_CONCEPTS = 10
 DOC_CONTEXT_LIMIT = 8000
 LLM_RETRY_MAX = 2  # 自校正重试次数
 
@@ -88,23 +81,33 @@ def _row_to_dict(row) -> dict:
 
 
 def _extract_json(text: str) -> dict:
-    """从 LLM 输出中提取 JSON"""
+    """从 LLM 输出中提取 JSON（增强鲁棒性）"""
     cleaned = text.strip()
     if cleaned.startswith("```"):
         import re
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    # 尝试修复常见 JSON 错误
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         import re
+        # 尝试查找 JSON 对象
         start = cleaned.find("{")
         end = cleaned.rfind("}")
         if start >= 0 and end > start:
+            candidate = cleaned[start:end + 1]
             try:
-                return json.loads(cleaned[start:end + 1])
+                return json.loads(candidate)
             except:
-                pass
+                # 尝试修复尾随逗号
+                candidate = re.sub(r",\s*}", "}", candidate)
+                candidate = re.sub(r",\s*]", "]", candidate)
+                try:
+                    return json.loads(candidate)
+                except:
+                    pass
     return {}
 
 
@@ -129,11 +132,11 @@ class SchemaOptimizer:
         self._init_embedding()
 
     def _init_embedding(self):
-        """初始化 embedding 函数"""
+        """初始化 embedding 函数（带本地备选）"""
         try:
             self.doc_index.embedding_func = create_llm_embedding_func(client, "text-embedding-v1")
-        except Exception:
-            pass  # 使用默认哈希向量
+        except Exception as e:
+            print(f"[Warning] Embedding 初始化失败，使用默认哈希: {e}")
 
     # --------------------------------------------------------
     # 主入口
@@ -145,6 +148,7 @@ class SchemaOptimizer:
         incremental: bool = True,
         target_class_ids: Optional[List[str]] = None,
         progress_callback: Optional[Callable] = None,
+        enable_quality_assessment: bool = True,
     ) -> dict:
         """
         执行 Schema 优化。
@@ -154,9 +158,10 @@ class SchemaOptimizer:
             incremental: True=只优化未审核资产; False=全量优化
             target_class_ids: 指定优化的 class ID 列表（None=自动选择）
             progress_callback: 进度回调
+            enable_quality_assessment: 是否启用质量评估
 
         Returns:
-            {"status": "success", "run_id": str, "diff": dict, "applied": dict}
+            {"status": "success", "run_id": str, "diff": dict, "applied": dict, "quality": dict}
         """
         run_id = str(uuid.uuid4())[:8]
         await _emit_progress(progress_callback, running=True, phase="init", progress=5, total=100, message="初始化优化任务")
@@ -165,8 +170,8 @@ class SchemaOptimizer:
         self._create_run_record(run_id)
 
         try:
-            # 2. 解析并索引文档
-            await _emit_progress(progress_callback, phase="indexing", progress=10, total=100, message="解析业务文档")
+            # 2. 解析并索引文档（使用增强版 parse_document）
+            await _emit_progress(progress_callback, phase="indexing", progress=10, total=100, message="解析业务文档（支持降级链+重叠分块）")
             if document_paths:
                 self._index_documents(document_paths, progress_callback)
 
@@ -184,30 +189,47 @@ class SchemaOptimizer:
                 classes, relationships, metrics, concepts, progress_callback
             )
 
-            # 5. 阶段二：全局校正
-            await _emit_progress(progress_callback, phase="global_correcting", progress=70, total=100, message="阶段二：全局校正")
+            # 5. 阶段二：全局校正（扩展版）
+            await _emit_progress(progress_callback, phase="global_correcting", progress=65, total=100, message="阶段二：全局校正（概念树+指标口径）")
             global_result = await self._run_global_correction(batch_results, progress_callback)
 
             # 6. 合并结果
             merged = self._merge_results(batch_results, global_result)
 
             # 7. 生成 Diff 报告
-            await _emit_progress(progress_callback, phase="diffing", progress=85, total=100, message="生成差异报告")
+            await _emit_progress(progress_callback, phase="diffing", progress=78, total=100, message="生成差异报告")
             diff = self._generate_diff(classes, metrics, relationships, concepts, merged)
 
-            # 8. 应用优化
-            await _emit_progress(progress_callback, phase="applying", progress=90, total=100, message="应用优化结果")
+            # 8. 质量评估（新增）
+            quality_result = None
+            if enable_quality_assessment:
+                await _emit_progress(progress_callback, phase="quality", progress=85, total=100, message="质量评估（LLM-as-Judge）")
+                quality_result = await self._run_quality_assessment(merged, diff, progress_callback)
+
+            # 9. 应用优化
+            await _emit_progress(progress_callback, phase="applying", progress=92, total=100, message="应用优化结果")
             applied = self._apply_optimization(merged)
 
-            # 9. 更新运行记录
-            self._update_run_success(run_id, diff, applied)
+            # 10. 更新运行记录
+            quality_data = quality_result.model_dump() if quality_result else {}
+            self._update_run_success(run_id, diff, applied, quality_data)
 
             await _emit_progress(
                 progress_callback, running=False, phase="done", progress=100, total=100,
                 message="Schema 优化完成", run_id=run_id,
-                result={"diff": diff.model_dump(), "applied": applied}
+                result={
+                    "diff": diff.model_dump(),
+                    "applied": applied,
+                    "quality": quality_data
+                }
             )
-            return {"status": "success", "run_id": run_id, "diff": diff.model_dump(), "applied": applied}
+            return {
+                "status": "success",
+                "run_id": run_id,
+                "diff": diff.model_dump(),
+                "applied": applied,
+                "quality": quality_data
+            }
 
         except Exception as exc:
             self._update_run_failure(run_id, str(exc))
@@ -215,18 +237,24 @@ class SchemaOptimizer:
             raise
 
     # --------------------------------------------------------
-    # 文档索引
+    # 文档索引（使用增强版解析）
     # --------------------------------------------------------
 
     def _index_documents(self, paths: List[str], progress_callback=None):
-        """解析并索引所有文档"""
-        for path_str in paths:
+        """解析并索引所有文档（支持降级链和重叠分块）"""
+        total = len(paths)
+        for idx, path_str in enumerate(paths):
             path = Path(path_str)
             if not path.exists():
+                print(f"[Warning] 文件不存在，跳过: {path_str}")
                 continue
-            chunks = parse_document(path)
-            self.doc_index.add_chunks(chunks)
-            print(f"  [Index] {path.name}: {len(chunks)} chunks")
+            # 使用增强版 parse_document（含降级链和重叠）
+            chunks = parse_document(path, chunk_size=800, chunk_overlap=150)
+            if chunks:
+                self.doc_index.add_chunks(chunks)
+                print(f"  [Index] {path.name}: {len(chunks)} chunks (带重叠)")
+            else:
+                print(f"  [Warning] {path.name}: 解析失败，无内容")
 
     # --------------------------------------------------------
     # 资产加载
@@ -237,7 +265,6 @@ class SchemaOptimizer:
         conn = get_db()
         sid = self.scenario_id
 
-        # 加载 classes
         class_sql = "SELECT * FROM schema_classes WHERE scenario_id=?"
         if incremental:
             class_sql += " AND COALESCE(is_reviewed, 0)=0"
@@ -249,20 +276,17 @@ class SchemaOptimizer:
             class_rows = conn.execute(class_sql, (sid,)).fetchall()
         classes = [_row_to_dict(r) for r in class_rows]
 
-        # 加载 metrics
         metric_sql = "SELECT * FROM metrics WHERE scenario_id=?"
         if incremental:
             metric_sql += " AND COALESCE(is_reviewed, 0)=0"
         metric_rows = conn.execute(metric_sql, (sid,)).fetchall()
         metrics = [_row_to_dict(r) for r in metric_rows]
 
-        # 加载 relationships
         rel_rows = conn.execute(
             "SELECT * FROM schema_relationships WHERE scenario_id=?", (sid,)
         ).fetchall()
         relationships = [_row_to_dict(r) for r in rel_rows]
 
-        # 加载 concepts
         concept_sql = "SELECT * FROM concepts WHERE scenario_id=?"
         if incremental:
             concept_sql += " AND COALESCE(is_reviewed, 0)=0"
@@ -273,21 +297,31 @@ class SchemaOptimizer:
         return classes, relationships, metrics, concepts
 
     # --------------------------------------------------------
-    # 阶段一：分批优化
+    # 阶段一：分批优化（修复孤立资产 Bug）
     # --------------------------------------------------------
 
     def _build_batches(self, classes, relationships, metrics, concepts) -> List[Dict]:
-        """按 Class 关联性分批"""
+        """
+        按 Class 关联性分批。
+        修复：孤立资产不再重复添加，各自独立成批。
+        """
         batches = []
+
+        # ---- 1. 构建关联索引 ----
         class_to_metrics = {}
         for m in metrics:
             tc = m.get("target_class", "")
-            class_to_metrics.setdefault(tc, []).append(m)
+            if tc:
+                class_to_metrics.setdefault(tc, []).append(m)
 
         class_to_rels = {}
         for r in relationships:
-            class_to_rels.setdefault(r.get("source", ""), []).append(r)
-            class_to_rels.setdefault(r.get("target", ""), []).append(r)
+            src = r.get("source", "")
+            tgt = r.get("target", "")
+            if src:
+                class_to_rels.setdefault(src, []).append(r)
+            if tgt and tgt != src:
+                class_to_rels.setdefault(tgt, []).append(r)
 
         class_to_concepts = {}
         for c in concepts:
@@ -299,6 +333,7 @@ class SchemaOptimizer:
         batched_rel_ids = set()
         batched_concept_ids = set()
 
+        # ---- 2. 按 Class 分批 ----
         current_batch = {"classes": [], "relationships": [], "metrics": [], "concepts": []}
 
         for cls in classes:
@@ -322,25 +357,44 @@ class SchemaOptimizer:
                     batched_concept_ids.add(c["id"])
 
             if len(current_batch["classes"]) >= BATCH_MAX_CLASSES or len(current_batch["metrics"]) >= BATCH_MAX_METRICS:
-                batches.append(current_batch)
+                if any(current_batch.values()):
+                    batches.append(current_batch)
                 current_batch = {"classes": [], "relationships": [], "metrics": [], "concepts": []}
 
         if any(current_batch.values()):
             batches.append(current_batch)
 
-        # 孤立资产兜底
+        # ---- 3. 孤立资产独立成批（修复重复添加 Bug） ----
         leftover_metrics = [m for m in metrics if m["id"] not in batched_metric_ids]
         leftover_rels = [r for r in relationships if (r.get("id") or f"rel_{r.get('source')}_{r.get('target')}") not in batched_rel_ids]
         leftover_concepts = [c for c in concepts if c["id"] not in batched_concept_ids]
 
-        if leftover_metrics or leftover_rels or leftover_concepts:
-            for i in range(0, max(len(leftover_metrics), 1), BATCH_MAX_METRICS):
-                batches.append({
-                    "classes": [],
-                    "relationships": leftover_rels if i == 0 else [],
-                    "metrics": leftover_metrics[i:i + BATCH_MAX_METRICS],
-                    "concepts": leftover_concepts if i == 0 else [],
-                })
+        # 3a. 孤立关系独立成批
+        for i in range(0, len(leftover_rels), BATCH_MAX_RELATIONSHIPS):
+            batches.append({
+                "classes": [],
+                "relationships": leftover_rels[i:i + BATCH_MAX_RELATIONSHIPS],
+                "metrics": [],
+                "concepts": []
+            })
+
+        # 3b. 孤立概念独立成批
+        for i in range(0, len(leftover_concepts), BATCH_MAX_CONCEPTS):
+            batches.append({
+                "classes": [],
+                "relationships": [],
+                "metrics": [],
+                "concepts": leftover_concepts[i:i + BATCH_MAX_CONCEPTS]
+            })
+
+        # 3c. 孤立指标独立成批
+        for i in range(0, len(leftover_metrics), BATCH_MAX_METRICS):
+            batches.append({
+                "classes": [],
+                "relationships": [],
+                "metrics": leftover_metrics[i:i + BATCH_MAX_METRICS],
+                "concepts": []
+            })
 
         return [b for b in batches if any(b.values())]
 
@@ -353,22 +407,20 @@ class SchemaOptimizer:
         for i, batch in enumerate(batches):
             await _emit_progress(
                 progress_callback, phase="batch_optimizing",
-                progress=30 + int(40 * (i / max(total, 1))), total=100,
+                progress=30 + int(35 * (i / max(total, 1))), total=100,
                 message=f"阶段一：批次 {i+1}/{total}"
             )
 
-            # 构建文档上下文（RAG 检索）
             query = self._build_batch_query(batch)
             doc_context = self.doc_index.build_context(query, top_k=5, max_chars=DOC_CONTEXT_LIMIT)
 
-            # 调用 LLM
             result = await self._call_llm_batch(batch, doc_context)
             results.append(result)
 
         return results
 
     def _build_batch_query(self, batch: Dict) -> str:
-        """构建批次查询文本（用于 RAG 检索）"""
+        """构建批次查询文本"""
         parts = []
         for c in batch.get("classes", []):
             parts.append(f"{c.get('name_cn', '')} {c.get('description', '')} {c.get('id', '')}")
@@ -376,9 +428,15 @@ class SchemaOptimizer:
             parts.append(f"{m.get('name', '')} {m.get('description', '')} {m.get('formula', '')}")
         return " ".join(parts)[:500]
 
+    # --------------------------------------------------------
+    # LLM 调用（智能重试：区分语法/语义错误）
+    # --------------------------------------------------------
+
     async def _call_llm_batch(self, batch: Dict, doc_context: str) -> OptimizationBatchResult:
-        """调用 LLM 进行单批次优化（带自校正重试）"""
+        """调用 LLM 进行单批次优化（带智能重试）"""
         prompt = self._build_batch_prompt(batch, doc_context)
+
+        last_validation_error = None
 
         for attempt in range(LLM_RETRY_MAX + 1):
             try:
@@ -396,21 +454,31 @@ class SchemaOptimizer:
                 return result
 
             except ValidationError as e:
+                last_validation_error = e
                 if attempt < LLM_RETRY_MAX:
-                    # 自校正：反馈错误给 LLM 重试
-                    prompt = self._build_retry_prompt(prompt, str(e))
+                    # 智能重试：区分错误类型
+                    error_str = str(e)
+                    if "validation error" in error_str and "Field required" in error_str:
+                        # 语义错误：字段缺失 → 提供更具体的指导
+                        prompt = self._build_retry_prompt(prompt, error_str, retry_type="semantic")
+                    else:
+                        # 语法/类型错误
+                        prompt = self._build_retry_prompt(prompt, error_str, retry_type="syntax")
                     continue
                 else:
-                    # 最终失败：返回空结果
                     print(f"  [Warning] 批次验证失败（重试耗尽）: {e}")
                     return OptimizationBatchResult(summary=f"验证失败: {e}")
+
             except Exception as e:
                 if attempt < LLM_RETRY_MAX:
+                    # 网络等临时错误，简单重试
+                    print(f"  [Retry] LLM 调用异常，重试 {attempt+1}/{LLM_RETRY_MAX}: {e}")
+                    await asyncio.sleep(1)
                     continue
                 print(f"  [Error] LLM 调用失败: {e}")
                 return OptimizationBatchResult(summary=f"LLM调用失败: {e}")
 
-        return OptimizationBatchResult()
+        return OptimizationBatchResult(summary=f"验证失败: {last_validation_error}")
 
     def _build_batch_prompt(self, batch: Dict, doc_context: str) -> str:
         """构建批次优化提示词"""
@@ -448,39 +516,51 @@ class SchemaOptimizer:
 
 严禁输出 JSON 以外的内容。"""
 
-    def _build_retry_prompt(self, original_prompt: str, error: str) -> str:
-        """构建自校正重试提示词"""
-        return f"""{original_prompt}
+    def _build_retry_prompt(self, original_prompt: str, error: str, retry_type: str = "syntax") -> str:
+        """构建自校正重试提示词（区分错误类型）"""
+        base = f"""{original_prompt}
 
 ## 上次输出验证失败
 你的上一次输出存在以下错误：
 {error}
-
-请修正错误并重新输出符合要求的 JSON。"""
+"""
+        if retry_type == "semantic":
+            base += "\n## 特别提醒（语义错误）\n检测到字段缺失，请确保所有必填字段（如 id、source、target 等）都已完整输出，且值不为空。"
+        else:
+            base += "\n## 特别提醒（格式错误）\n请确保输出是合法的 JSON 格式，注意引号、逗号、括号匹配。"
+        base += "\n请修正错误并重新输出符合要求的 JSON。"
+        return base
 
     # --------------------------------------------------------
-    # 阶段二：全局校正
+    # 阶段二：全局校正（扩展版）
     # --------------------------------------------------------
 
     async def _run_global_correction(self, batch_results: List[OptimizationBatchResult], progress_callback=None) -> GlobalCorrectionResult:
-        """全局校正：解决跨批次命名不一致、关系悬空等问题"""
+        """全局校正：检查命名一致性、关系悬空、概念树完整性、指标口径一致性"""
         # 汇总所有批次结果
         all_classes = []
         all_metrics = []
         all_rels = []
+        all_concepts = []
         for r in batch_results:
             all_classes.extend(r.classes)
             all_metrics.extend(r.metrics)
             all_rels.extend(r.relationships)
+            all_concepts.extend(r.concepts)
 
         if len(batch_results) <= 1:
-            return GlobalCorrectionResult(summary="单批次无需全局校正")
+            return GlobalCorrectionResult(
+                summary="单批次无需全局校正",
+                concept_tree_warnings=[],
+                metric_consistency_warnings=[]
+            )
 
-        # 构建全局校正提示词
+        # 构建全局校正提示词（扩展版）
         compressed_classes = [{"id": c.id, "name_cn": c.name_cn} for c in all_classes]
-        compressed_metrics = [{"id": m.id, "name": m.name, "target_class": m.target_class} for m in all_metrics]
+        compressed_metrics = [{"id": m.id, "name": m.name, "target_class": m.target_class, "formula": m.formula} for m in all_metrics]
+        compressed_concepts = [{"id": c.id, "name": c.name, "parent_id": c.parent_id, "level": c.level} for c in all_concepts]
 
-        prompt = f"""你是数据仓库建模专家。请检查以下跨批次优化结果，修正命名不一致和引用悬空问题。
+        prompt = f"""你是数据仓库建模专家。请对以下跨批次优化结果进行全局一致性校正。
 
 ## 所有 Class 摘要
 {json.dumps(compressed_classes, ensure_ascii=False, indent=2)}
@@ -491,16 +571,24 @@ class SchemaOptimizer:
 ## 所有 Relationship
 {json.dumps([r.model_dump() for r in all_rels], ensure_ascii=False, indent=2)}
 
+## 所有 Concept
+{json.dumps(compressed_concepts, ensure_ascii=False, indent=2)}
+
 ## 检查项
-1. Class ID 是否有重复或近似命名需统一
-2. Metric 的 target_class 是否引用了不存在的 Class
-3. Relationship 的 source/target 是否引用了不存在的 Class
+1. **类重命名**：是否有重复或近似命名的 Class 需要统一？
+2. **关系悬空**：Relationship 的 source/target 是否引用了不存在的 Class？
+3. **指标悬空**：Metric 的 target_class 是否引用了不存在的 Class？
+4. **概念树完整性**：Concept 的 parent_id 是否引用了不存在的概念？是否存在循环引用？
+5. **指标口径一致性**：同名的 Metric 是否使用了相同的 formula？不一致的需要标记警告。
 
 ## 输出 JSON
 {{
   "class_renames": [{{"from": "旧ID", "to": "新ID"}}],
-  "relationship_corrections": [],
-  "metric_corrections": [],
+  "relationship_corrections": [{{"source": "...", "target": "...", "type": "...", "source_key": "...", "target_key": "...", "join_key": "..."}}],
+  "metric_corrections": [{{"id": "...", "name": "...", "target_class": "...", ...}}],
+  "concept_corrections": [{{"id": "...", "parent_id": "...", "level": ...}}],
+  "metric_consistency_warnings": ["指标 '销售额' 在不同批次中 formula 不一致"],
+  "concept_tree_warnings": ["概念 '订单' 的父级 '交易' 不存在"],
   "summary": "全局校正摘要"
 }}"""
 
@@ -516,7 +604,70 @@ class SchemaOptimizer:
             return GlobalCorrectionResult(**data)
         except Exception as e:
             print(f"  [Warning] 全局校正失败: {e}")
-            return GlobalCorrectionResult(summary=f"全局校正失败: {e}")
+            return GlobalCorrectionResult(
+                summary=f"全局校正失败: {e}",
+                concept_tree_warnings=[],
+                metric_consistency_warnings=[]
+            )
+
+    # --------------------------------------------------------
+    # 质量评估（LLM-as-Judge）
+    # --------------------------------------------------------
+
+    async def _run_quality_assessment(self, merged: Dict, diff: OptimizationDiff, progress_callback=None) -> QualityAssessmentResult:
+        """使用 LLM 对优化结果进行质量评估"""
+        # 构建评估摘要
+        class_summary = []
+        for c in merged.get("classes", [])[:5]:  # 截断防止超长
+            class_summary.append(f"{c.get('id')}: {c.get('name_cn')} - {c.get('description', '')[:50]}")
+        metric_summary = []
+        for m in merged.get("metrics", [])[:5]:
+            metric_summary.append(f"{m.get('id')}: {m.get('name')} = {m.get('formula', '')}")
+
+        prompt = f"""你是一名数据建模质量评审专家。请评估以下 Schema 优化结果的质量。
+
+## 优化摘要
+{diff.summary}
+
+## 新增/修改的 Class（前5个）
+{json.dumps(class_summary, ensure_ascii=False, indent=2)}
+
+## 新增/修改的 Metric（前5个）
+{json.dumps(metric_summary, ensure_ascii=False, indent=2)}
+
+## 评估维度
+1. **业务准确性**：优化建议是否贴合业务文档语义？
+2. **命名规范性**：名称是否符合业务术语习惯？
+3. **结构完整性**：Class-Metric-Relationship 引用关系是否完整？
+4. **可执行性**：formula、dimensions 是否合理可执行？
+
+## 输出 JSON
+{{
+  "overall_score": 8.5,
+  "confidence": 0.85,
+  "strengths": ["维度划分清晰", "指标口径一致"],
+  "weaknesses": ["部分 Class 描述仍偏技术化"],
+  "high_risk_items": ["指标 'gmv' 缺少 required_dimensions"],
+  "summary": "整体质量较高，建议重点审核 high_risk_items"
+}}
+"""
+        try:
+            response = await client.chat.completions.create(
+                model=Cfg.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=2048,
+            )
+            raw = response.choices[0].message.content or ""
+            data = _extract_json(raw)
+            return QualityAssessmentResult(**data)
+        except Exception as e:
+            print(f"[Warning] 质量评估失败: {e}")
+            return QualityAssessmentResult(
+                overall_score=5.0,
+                confidence=0.3,
+                summary=f"质量评估失败: {e}"
+            )
 
     # --------------------------------------------------------
     # 结果合并
@@ -524,7 +675,6 @@ class SchemaOptimizer:
 
     def _merge_results(self, batch_results: List[OptimizationBatchResult], global_result: GlobalCorrectionResult) -> Dict:
         """合并所有批次结果 + 全局校正"""
-        # 应用 class 重命名映射
         rename_map = {r["from"]: r["to"] for r in global_result.class_renames}
 
         all_classes = {}
@@ -555,6 +705,8 @@ class SchemaOptimizer:
             all_rels[rid] = rel.model_dump()
         for m in global_result.metric_corrections:
             all_metrics[m.id] = m.model_dump()
+        for c in global_result.concept_corrections:
+            all_concepts[c.id] = c.model_dump()
 
         return {
             "classes": list(all_classes.values()),
@@ -756,13 +908,13 @@ class SchemaOptimizer:
         conn.commit()
         conn.close()
 
-    def _update_run_success(self, run_id: str, diff: OptimizationDiff, applied: dict):
+    def _update_run_success(self, run_id: str, diff: OptimizationDiff, applied: dict, quality: dict):
         conn = get_db()
         conn.execute(
             """UPDATE schema_optimization_runs
                SET status='success', summary=?, changes_json=?, finished_at=CURRENT_TIMESTAMP
                WHERE id=? AND scenario_id=?""",
-            (diff.summary, json.dumps({"diff": diff.model_dump(), "applied": applied}, ensure_ascii=False), run_id, self.scenario_id),
+            (diff.summary, json.dumps({"diff": diff.model_dump(), "applied": applied, "quality": quality}, ensure_ascii=False), run_id, self.scenario_id),
         )
         conn.commit()
         conn.close()
