@@ -44,6 +44,9 @@ def init_db():
             fields TEXT DEFAULT '[]',
             csv_file TEXT DEFAULT '',
             primary_key TEXT DEFAULT '',
+            is_reviewed INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id, scenario_id)
         );
         CREATE TABLE IF NOT EXISTS schema_relationships (
@@ -55,7 +58,33 @@ def init_db():
             source_key TEXT DEFAULT '',
             target_key TEXT DEFAULT '',
             join_key TEXT DEFAULT '',
-            description TEXT DEFAULT ''
+            description TEXT DEFAULT '',
+            is_reviewed INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS schema_optimization_files (
+            id TEXT PRIMARY KEY,
+            scenario_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            original_filename TEXT NOT NULL,
+            file_ext TEXT DEFAULT '',
+            file_path TEXT NOT NULL,
+            content_text TEXT DEFAULT '',
+            content_hash TEXT DEFAULT '',
+            size INTEGER DEFAULT 0,
+            uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS schema_optimization_runs (
+            id TEXT PRIMARY KEY,
+            scenario_id TEXT NOT NULL,
+            file_ids TEXT DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'running',
+            summary TEXT DEFAULT '',
+            changes_json TEXT DEFAULT '{}',
+            error TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS conversations (
             id TEXT PRIMARY KEY,
@@ -96,6 +125,9 @@ def init_db():
             filters_hint TEXT DEFAULT '',
             chart_type TEXT DEFAULT 'bar',
             sort_order INTEGER DEFAULT 0,
+            is_reviewed INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id, scenario_id)
         );
         CREATE TABLE IF NOT EXISTS concepts (
@@ -108,6 +140,9 @@ def init_db():
             concept_type TEXT DEFAULT '',
             related_class TEXT DEFAULT '',
             sort_order INTEGER DEFAULT 0,
+            is_reviewed INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id, scenario_id)
         );
         CREATE TABLE IF NOT EXISTS chart_rules (
@@ -283,9 +318,13 @@ def _migrate_db(conn):
         ("schema_relationships", "source_key", "ALTER TABLE schema_relationships ADD COLUMN source_key TEXT DEFAULT ''"),
         ("schema_relationships", "target_key", "ALTER TABLE schema_relationships ADD COLUMN target_key TEXT DEFAULT ''"),
         ("schema_relationships", "join_key", "ALTER TABLE schema_relationships ADD COLUMN join_key TEXT DEFAULT ''"),
+        ("schema_relationships", "is_reviewed", "ALTER TABLE schema_relationships ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
         ("schema_classes", "fields", "ALTER TABLE schema_classes ADD COLUMN fields TEXT DEFAULT '[]'"),
         ("schema_classes", "csv_file", "ALTER TABLE schema_classes ADD COLUMN csv_file TEXT DEFAULT ''"),
         ("schema_classes", "primary_key", "ALTER TABLE schema_classes ADD COLUMN primary_key TEXT DEFAULT ''"),
+        ("schema_classes", "is_reviewed", "ALTER TABLE schema_classes ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
+        ("metrics", "is_reviewed", "ALTER TABLE metrics ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
+        ("concepts", "is_reviewed", "ALTER TABLE concepts ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
     ]
     for table, column, statement in migrations:
         try:

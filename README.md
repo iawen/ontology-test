@@ -30,7 +30,11 @@ create_and_run_workflow()
 
 ```
 
-我需要如何在chat.py中触发，并能展示到前端？我不需要伪代码，请直接在我上传的文件里修改，并说明修改的位置。同时，你的修改不应该是硬编码，而是应该通用，可以适用到其他的任何Action
+我需要新增一个功能: “Schema 优化”，功能具体是：
+1. 用户在后台上传对应的文档（目前先支持docs、pdf、.xlsx，l），这些文档需要管理起来，以便用户更新文档后，重写迭代）
+2. 读取文档内容，然后通过大模型来迭代优化目前的class、relationships、metrics、concepts（is_reviewed为0的部分）
+3. “Schema 优化”过程中，需要忽略 class的fields部分
+4. “Schema 优化”的后端代码放到ontology 目录，管理部分需要你来建议（目前的SchemaManager.tsx 有点重了，文件内容偏长）
 
 ```
 故事起点：一个业务人员随口提出的问题

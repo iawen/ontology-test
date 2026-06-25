@@ -8,6 +8,7 @@ import Dashboard from "@/components/Dashboard";
 import ScenarioManager from "@/components/ScenarioManager";
 import DataManager from "@/components/DataManager";
 import SchemaManager from "@/components/SchemaManager";
+import SchemaOptimizationManager from "@/components/SchemaOptimizationManager";
 import ConceptManager from "@/components/ConceptManager";
 import MetricManager from "@/components/MetricManager";
 import ChartRulesManager from "@/components/ChartRulesManager";
@@ -29,6 +30,7 @@ const PAGE_COMPONENTS: Record<PageKey, React.ComponentType> = {
   "data": DataManager,
   "extraction-logs": ExtractionLogs,
   "schema": SchemaManager,
+  "schema-optimization": SchemaOptimizationManager,
   "concepts": ConceptManager,
   "metrics": MetricManager,
   "chart-rules": ChartRulesManager,

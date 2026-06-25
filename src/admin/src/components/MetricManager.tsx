@@ -64,7 +64,7 @@ export default function MetricManager() {
     <div>
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-lg font-semibold text-slate-800">指标管理</h2>
-        <button onClick={() => { setEditMetric({ scenario_id: activeScenario, category: "", target_class: "", calculation: "", formula: "", dimensions: [], required_dimensions: [], filters_hint: "", chart_type: "bar", sort_order: 0 }); setIsModalOpen(true); }} className="btn-primary">+ 新增指标</button>
+        <button onClick={() => { setEditMetric({ scenario_id: activeScenario, category: "", target_class: "", calculation: "", formula: "", dimensions: [], required_dimensions: [], filters_hint: "", chart_type: "bar", sort_order: 0, is_reviewed: false }); setIsModalOpen(true); }} className="btn-primary">+ 新增指标</button>
       </div>
       <ScenarioSelector />
       <div className="mb-4 flex items-center gap-3">
@@ -76,9 +76,9 @@ export default function MetricManager() {
         <EmptyState icon="📐" title="暂无指标" description="使用AI提取或手动创建" />
       ) : (
         <div className="card overflow-hidden">
-          <table className="data-table"><thead><tr><th>名称</th><th>分类</th><th>目标类</th><th>图表</th><th>描述</th><th className="text-right">操作</th></tr></thead>
+          <table className="data-table"><thead><tr><th>名称</th><th>分类</th><th>目标类</th><th>图表</th><th>审核</th><th>描述</th><th className="text-right">操作</th></tr></thead>
           <tbody>{filtered.map(m => (
-            <tr key={m.id}><td className="font-medium text-slate-700">{m.name}</td><td><span className="text-xs bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded">{m.category || "-"}</span></td><td className="text-xs">{m.target_class}</td><td><span className="text-xs bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded">{CHART_LABELS[m.chart_type] || m.chart_type}</span></td><td className="text-slate-500 max-w-xs truncate">{m.description}</td><td className="text-right"><button onClick={() => { setEditMetric(m); setIsModalOpen(true); }} className="btn-ghost text-xs">编辑</button><button onClick={() => setDeleteTarget(m.id)} className="btn-ghost text-xs text-red-500">删除</button></td></tr>
+            <tr key={m.id}><td className="font-medium text-slate-700">{m.name}</td><td><span className="text-xs bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded">{m.category || "-"}</span></td><td className="text-xs">{m.target_class}</td><td><span className="text-xs bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded">{CHART_LABELS[m.chart_type] || m.chart_type}</span></td><td><span className={`text-xs px-1.5 py-0.5 rounded ${m.is_reviewed ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>{m.is_reviewed ? "通过" : "待审"}</span></td><td className="text-slate-500 max-w-xs truncate">{m.description}</td><td className="text-right"><button onClick={() => { setEditMetric(m); setIsModalOpen(true); }} className="btn-ghost text-xs">编辑</button><button onClick={() => setDeleteTarget(m.id)} className="btn-ghost text-xs text-red-500">删除</button></td></tr>
           ))}</tbody></table>
         </div>
       )}
@@ -102,6 +102,7 @@ export default function MetricManager() {
           <div><label className="text-xs text-slate-500 font-medium block mb-1.5">维度 (逗号分隔)</label><input value={(editMetric?.dimensions || []).join(", ")} onChange={(e) => setEditMetric({ ...editMetric!, dimensions: e.target.value.split(",").map(s => s.trim()).filter(Boolean) })} className="w-full" placeholder="region, category" /></div>
           <div><label className="text-xs text-slate-500 font-medium block mb-1.5">必要维度 (逗号分隔)</label><input value={(editMetric?.required_dimensions || []).join(", ")} onChange={(e) => setEditMetric({ ...editMetric!, required_dimensions: e.target.value.split(",").map(s => s.trim()).filter(Boolean) })} className="w-full" /></div>
           <div><label className="text-xs text-slate-500 font-medium block mb-1.5">筛选提示</label><input value={editMetric?.filters_hint || ""} onChange={(e) => setEditMetric({ ...editMetric!, filters_hint: e.target.value })} className="w-full" /></div>
+          <label className="inline-flex items-center gap-2 text-sm text-slate-700"><input type="checkbox" checked={!!editMetric?.is_reviewed} onChange={(e) => setEditMetric({ ...editMetric!, is_reviewed: e.target.checked })} />人工审核通过</label>
         </div>
       </Modal>
 

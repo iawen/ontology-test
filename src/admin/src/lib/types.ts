@@ -20,6 +20,7 @@ export interface SchemaClass {
   fields: SchemaField[];
   csv_file: string;
   primary_key: string;
+  is_reviewed: boolean;
 }
 
 export interface SchemaField {
@@ -38,6 +39,7 @@ export interface SchemaRelationship {
   target: string;
   type: string;
   join_key: string;
+  is_reviewed: boolean;
 }
 
 export interface Metric {
@@ -54,6 +56,7 @@ export interface Metric {
   filters_hint: string;
   chart_type: string;
   sort_order: number;
+  is_reviewed: boolean;
 }
 
 export interface Concept {
@@ -66,6 +69,7 @@ export interface Concept {
   concept_type: string;
   related_class: string;
   sort_order: number;
+  is_reviewed: boolean;
 }
 
 export interface ChartRule {

@@ -49,6 +49,8 @@ _CONFLICT_COLUMNS = {
     "data_connections": ("id",),
     "conversations": ("id",),
     "messages": ("id",),
+    "schema_optimization_files": ("id",),
+    "schema_optimization_runs": ("id",),
 }
 
 _integrity_errors = [sqlite3.IntegrityError]
@@ -285,15 +287,30 @@ def _migrate_db(conn, dialect):
             ("SELECT source_key FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN source_key TEXT DEFAULT ''"),
             ("SELECT target_key FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN target_key TEXT DEFAULT ''"),
             ("SELECT join_key FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN join_key TEXT DEFAULT ''"),
+            ("SELECT is_reviewed FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
             ("SELECT fields FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN fields TEXT DEFAULT '[]'"),
             ("SELECT csv_file FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN csv_file TEXT DEFAULT ''"),
             ("SELECT primary_key FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN primary_key TEXT DEFAULT ''"),
+            ("SELECT is_reviewed FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
+            ("SELECT created_at FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN created_at TEXT DEFAULT ''"),
+            ("SELECT updated_at FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN updated_at TEXT DEFAULT ''"),
+            ("SELECT created_at FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN created_at TEXT DEFAULT ''"),
+            ("SELECT updated_at FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN updated_at TEXT DEFAULT ''"),
+            ("SELECT is_reviewed FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
+            ("SELECT created_at FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN created_at TEXT DEFAULT ''"),
+            ("SELECT updated_at FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN updated_at TEXT DEFAULT ''"),
+            ("SELECT is_reviewed FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
+            ("SELECT created_at FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN created_at TEXT DEFAULT ''"),
+            ("SELECT updated_at FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN updated_at TEXT DEFAULT ''"),
         ]
         for check_sql, alter_sql in migrations:
             try:
                 conn.execute(check_sql)
             except sqlite3.OperationalError:
                 conn.execute(alter_sql)
+        for table in ("schema_classes", "schema_relationships", "metrics", "concepts"):
+            conn.execute(f"UPDATE {table} SET created_at=CURRENT_TIMESTAMP WHERE created_at IS NULL OR created_at='' ")
+            conn.execute(f"UPDATE {table} SET updated_at=CURRENT_TIMESTAMP WHERE updated_at IS NULL OR updated_at='' ")
         return
 
     if dialect == "postgresql":
@@ -303,9 +320,21 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS source_key TEXT DEFAULT ''",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS target_key TEXT DEFAULT ''",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS join_key TEXT DEFAULT ''",
+            "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS fields TEXT DEFAULT '[]'",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS csv_file TEXT DEFAULT ''",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS primary_key TEXT DEFAULT ''",
+            "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
+            "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
+            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
+            "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         ]
     else:
         migrations = [
@@ -314,9 +343,21 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS source_key TEXT DEFAULT ''",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS target_key TEXT DEFAULT ''",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS join_key TEXT DEFAULT ''",
+            "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS fields TEXT DEFAULT '[]'",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS csv_file TEXT DEFAULT ''",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS primary_key TEXT DEFAULT ''",
+            "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
+            "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
+            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
+            "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         ]
     for statement in migrations:
         conn.execute(statement)
@@ -357,6 +398,9 @@ def _schema_sql(dialect):
             fields TEXT DEFAULT '[]',
             csv_file TEXT DEFAULT '',
             primary_key TEXT DEFAULT '',
+            is_reviewed INTEGER DEFAULT 0,
+            created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
+            updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id, scenario_id)
         );
         CREATE TABLE IF NOT EXISTS schema_relationships (
@@ -368,7 +412,33 @@ def _schema_sql(dialect):
             source_key TEXT DEFAULT '',
             target_key TEXT DEFAULT '',
             join_key TEXT DEFAULT '',
-            description TEXT DEFAULT ''
+            description TEXT DEFAULT '',
+            is_reviewed INTEGER DEFAULT 0,
+            created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
+            updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS schema_optimization_files (
+            id TEXT PRIMARY KEY,
+            scenario_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            original_filename TEXT NOT NULL,
+            file_ext TEXT DEFAULT '',
+            file_path TEXT NOT NULL,
+            content_text TEXT DEFAULT '',
+            content_hash TEXT DEFAULT '',
+            size INTEGER DEFAULT 0,
+            uploaded_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS schema_optimization_runs (
+            id TEXT PRIMARY KEY,
+            scenario_id TEXT NOT NULL,
+            file_ids TEXT DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'running',
+            summary TEXT DEFAULT '',
+            changes_json TEXT DEFAULT '{{}}',
+            error TEXT DEFAULT '',
+            created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS conversations (
             id TEXT PRIMARY KEY,
@@ -409,6 +479,9 @@ def _schema_sql(dialect):
             filters_hint TEXT DEFAULT '',
             chart_type TEXT DEFAULT 'bar',
             sort_order INTEGER DEFAULT 0,
+            is_reviewed INTEGER DEFAULT 0,
+            created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
+            updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id, scenario_id)
         );
         CREATE TABLE IF NOT EXISTS concepts (
@@ -421,6 +494,9 @@ def _schema_sql(dialect):
             concept_type TEXT DEFAULT '',
             related_class TEXT DEFAULT '',
             sort_order INTEGER DEFAULT 0,
+            is_reviewed INTEGER DEFAULT 0,
+            created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
+            updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id, scenario_id)
         );
         CREATE TABLE IF NOT EXISTS chart_rules (
@@ -564,7 +640,7 @@ def _schema_sql(dialect):
 
 def _normalize_params(params):
     if params is None:
-        return None
+        return {}
     if isinstance(params, tuple):
         return params
     if isinstance(params, list):

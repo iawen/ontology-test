@@ -41,6 +41,7 @@ class SchemaClassEdit(BaseModel):
     fields: list[dict] = []
     csv_file: str = ""
     primary_key: str = ""
+    is_reviewed: bool = False
 
 
 class SchemaRelationEdit(BaseModel):
@@ -48,6 +49,7 @@ class SchemaRelationEdit(BaseModel):
     target: str
     type: str = ""
     join_key: str = ""
+    is_reviewed: bool = False
 
 
 # ============================================================
@@ -67,6 +69,7 @@ class MetricCreate(BaseModel):
     filters_hint: str = ""
     chart_type: str = "bar"
     sort_order: int = 0
+    is_reviewed: bool = False
 
 
 class MetricUpdate(BaseModel):
@@ -81,6 +84,7 @@ class MetricUpdate(BaseModel):
     filters_hint: str = ""
     chart_type: str = ""
     sort_order: int | None = None
+    is_reviewed: bool | None = None
 
 
 # ============================================================
@@ -96,6 +100,7 @@ class ConceptCreate(BaseModel):
     concept_type: str = "entity"
     related_class: str = ""
     sort_order: int = 0
+    is_reviewed: bool = False
 
 
 class ConceptUpdate(BaseModel):
@@ -106,6 +111,7 @@ class ConceptUpdate(BaseModel):
     concept_type: str = ""
     related_class: str = ""
     sort_order: int | None = None
+    is_reviewed: bool | None = None
 
 
 # ============================================================

@@ -189,24 +189,31 @@ async def stream_extract_status():
 # ============================================================
 # Helper: 同步 schema.json → SQLite
 # ============================================================
+def _reviewed_value(value) -> bool:
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
 def _sync_schema_db(scenario_id: str):
     ontology_dir = os.path.join(Cfg.scenarios_root, scenario_id, "ontology")
     with open(os.path.join(ontology_dir, "schema.json"), "r", encoding="utf-8") as f:
         schema = json.loads(f.read())
 
     classes = [
-        (c["id"], scenario_id, c["name_cn"], c["description"], c.get("primary_key", ""), c.get("csv_file", ""), json.dumps(c.get("fields", []), ensure_ascii=False)) 
+        (c["id"], scenario_id, c["name_cn"], c["description"], c.get("primary_key", ""), c.get("csv_file", ""), json.dumps(c.get("fields", []), ensure_ascii=False), int(_reviewed_value(c.get("is_reviewed", False)))) 
          for c in schema.get("classes", [])
          ]
-    rels = [(scenario_id, r["source"], r["target"], r["type"], r["source_key"], r["target_key"], r["description"]) for r in schema.get("relationships", [])] 
+    rels = [(scenario_id, r["source"], r["target"], r.get("type", ""), r.get("source_key", ""), r.get("target_key", ""), r.get("description", ""), int(_reviewed_value(r.get("is_reviewed", False)))) for r in schema.get("relationships", [])] 
     concepts = [(c["id"], scenario_id, c["name"], c.get("level", 0), c.get("parent_id", ""),
-                 c.get("concept_type", ""), c.get("related_class", ""))
+                 c.get("concept_type", ""), c.get("related_class", ""), int(_reviewed_value(c.get("is_reviewed", False))))
                 for c in schema.get("concepts", [])]
     metrics = [(c["id"], scenario_id, c["name"], c.get("description", ""), c.get("category", ""),
                  c.get("target_class", ""), c.get("calculation", ""), c.get("formula", ""), 
                  c.get("required_dimensions"), 
                  c.get("filters_hint"),
-                 c.get("dimensions"))
+                 c.get("dimensions"),
+                 int(_reviewed_value(c.get("is_reviewed", False))))
                 for c in schema.get("metrics", [])]
 
     conn = get_db()
@@ -216,18 +223,18 @@ def _sync_schema_db(scenario_id: str):
     conn.execute("DELETE FROM concepts WHERE scenario_id=?", (scenario_id,))
     conn.execute("DELETE FROM metrics WHERE scenario_id=?", (scenario_id,))
 
-    conn.executemany("INSERT OR REPLACE INTO schema_classes (id, scenario_id, name_cn, description, primary_key, csv_file, fields) VALUES (?,?,?,?,?,?,?)", classes)
+    conn.executemany("INSERT OR REPLACE INTO schema_classes (id, scenario_id, name_cn, description, primary_key, csv_file, fields, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", classes)
 
-    conn.executemany("INSERT INTO schema_relationships (scenario_id, source, target, type, source_key, target_key, description) VALUES (?,?,?,?,?,?,?)", rels)
+    conn.executemany("INSERT INTO schema_relationships (scenario_id, source, target, type, source_key, target_key, description, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", rels)
 
     if metrics and len(metrics) > 0:
         conn.executemany(
-            "INSERT OR REPLACE INTO metrics (id, scenario_id, name, description, category, target_class, calculation, formula, required_dimensions, filters_hint, dimensions) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO metrics (id, scenario_id, name, description, category, target_class, calculation, formula, required_dimensions, filters_hint, dimensions, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             metrics,
         )
     if concepts and len(concepts) > 0:
         conn.executemany(
-            "INSERT OR REPLACE INTO concepts (id, scenario_id, name, level, parent_id, concept_type, related_class) VALUES (?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO concepts (id, scenario_id, name, level, parent_id, concept_type, related_class, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             concepts,
         )
 

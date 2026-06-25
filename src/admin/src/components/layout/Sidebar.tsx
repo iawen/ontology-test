@@ -8,6 +8,7 @@ export type PageKey =
   | "data"
   | "extraction-logs"
   | "schema"
+  | "schema-optimization"
   | "concepts"
   | "metrics"
   | "chart-rules"
@@ -34,6 +35,7 @@ const NAV_GROUPS: NavGroup[] = [
   ]},
   { label: "知识建模", items: [
     { key: "schema", label: "Schema", icon: "🔗" },
+    { key: "schema-optimization", label: "Schema 优化", icon: "🧭" },
     { key: "concepts", label: "概念管理", icon: "🌳" },
     { key: "metrics", label: "指标管理", icon: "📐" },
     { key: "chart-rules", label: "图表规则", icon: "📈" },

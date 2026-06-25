@@ -31,10 +31,12 @@ export default function SchemaManager() {
   const [editClass, setEditClass] = useState<Partial<SchemaClass> | null>(null);
   const [isClassModalOpen, setIsClassModalOpen] = useState(false);
   const [newRel, setNewRel] = useState({
+    id: undefined as number | undefined,
     source: "",
     target: "",
     type: "",
     join_key: "",
+    is_reviewed: false,
   });
   const [isRelModalOpen, setIsRelModalOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<{
@@ -196,14 +198,15 @@ export default function SchemaManager() {
       addToast("warning", "源、目标和类型必填");
       return;
     }
+    const isEdit = typeof newRel.id === "number";
     try {
-      await api(`/api/admin/scenarios/${activeScenario}/schema/relationships`, {
-        method: "POST",
+      await api(`/api/admin/scenarios/${activeScenario}/schema/relationships${isEdit ? `/${newRel.id}` : ""}`, {
+        method: isEdit ? "PUT" : "POST",
         body: JSON.stringify(newRel),
       });
-      addToast("success", "关系已创建");
+      addToast("success", isEdit ? "关系已更新" : "关系已创建");
       setIsRelModalOpen(false);
-      setNewRel({ source: "", target: "", type: "", join_key: "" });
+      setNewRel({ id: undefined, source: "", target: "", type: "", join_key: "", is_reviewed: false });
       invalidateCache(cacheKey);
       load(true);
     } catch (e: any) {
@@ -291,6 +294,7 @@ export default function SchemaManager() {
                 fields: [],
                 csv_file: "",
                 primary_key: "",
+                is_reviewed: false,
               });
               setIsClassModalOpen(true);
             }}
@@ -361,13 +365,14 @@ export default function SchemaManager() {
               类 ({classes.length})
             </h3>
             <div className="overflow-x-auto">
-              <table className="data-table min-w-[980px] table-fixed">
+              <table className="data-table min-w-[1060px] table-fixed">
                 <colgroup>
                   <col className="w-32" />
                   <col className="w-24" />
                   <col className="w-56" />
                   {/* <col className="w-64" /> */}
                   <col className="w-24" />
+                  <col className="w-20" />
                   <col className="w-20" />
                   <col className="w-20" />
                   <col className="w-16" />
@@ -380,6 +385,7 @@ export default function SchemaManager() {
                     <th>数据文件</th>
                     <th>主键</th>
                     <th>字段</th>
+                    <th>审核</th>
                     <th className="text-right">操作</th>
                   </tr>
                 </thead>
@@ -403,6 +409,11 @@ export default function SchemaManager() {
                       </td>
                       <td className="text-xs text-slate-500">
                         {(c.fields || []).length}
+                      </td>
+                      <td>
+                        <span className={`inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium ${c.is_reviewed ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>
+                          {c.is_reviewed ? "通过" : "待审"}
+                        </span>
                       </td>
                       <td className="text-right whitespace-nowrap">
                         <button
@@ -440,6 +451,7 @@ export default function SchemaManager() {
                   <th>目标</th>
                   <th>类型</th>
                   <th>JOIN字段</th>
+                  <th>审核</th>
                   <th className="text-right">操作</th>
                 </tr>
               </thead>
@@ -450,7 +462,28 @@ export default function SchemaManager() {
                     <td className="font-mono text-xs">{r.target}</td>
                     <td>{r.type}</td>
                     <td className="text-xs">{r.join_key}</td>
+                    <td>
+                      <span className={`text-xs px-1.5 py-0.5 rounded ${r.is_reviewed ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>
+                        {r.is_reviewed ? "通过" : "待审"}
+                      </span>
+                    </td>
                     <td className="text-right">
+                      <button
+                        onClick={() => {
+                          setNewRel({
+                            id: r.id,
+                            source: r.source,
+                            target: r.target,
+                            type: r.type,
+                            join_key: r.join_key,
+                            is_reviewed: !!r.is_reviewed,
+                          });
+                          setIsRelModalOpen(true);
+                        }}
+                        className="btn-ghost text-xs"
+                      >
+                        编辑
+                      </button>
                       <button
                         onClick={() =>
                           setDeleteTarget({ type: "rel", id: r.id })
@@ -507,6 +540,10 @@ export default function SchemaManager() {
               <input value={editClass?.primary_key || ""} onChange={(e) => setEditClass({ ...editClass!, primary_key: e.target.value })} className="w-full" placeholder="sale_id" />
             </div>
           </div>
+          <label className="inline-flex items-center gap-2 text-sm text-slate-700">
+            <input type="checkbox" checked={!!editClass?.is_reviewed} onChange={(e) => setEditClass({ ...editClass!, is_reviewed: e.target.checked })} />
+            用户审核通过
+          </label>
           {/* <div>
             <label className="text-xs text-slate-500 font-medium block mb-1.5">属性 (逗号分隔)</label>
             <input value={(editClass?.properties || []).join(", ")} onChange={(e) => setEditClass({ ...editClass!, properties: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })} className="w-full" />
@@ -618,11 +655,14 @@ export default function SchemaManager() {
 
       <Modal
         isOpen={isRelModalOpen}
-        onClose={() => setIsRelModalOpen(false)}
-        title="新增关系"
+        onClose={() => {
+          setIsRelModalOpen(false);
+          setNewRel({ id: undefined, source: "", target: "", type: "", join_key: "", is_reviewed: false });
+        }}
+        title={newRel.id ? "编辑关系" : "新增关系"}
         footer={
           <>
-            <button onClick={() => setIsRelModalOpen(false)} className="btn-outline">取消</button>
+            <button onClick={() => { setIsRelModalOpen(false); setNewRel({ id: undefined, source: "", target: "", type: "", join_key: "", is_reviewed: false }); }} className="btn-outline">取消</button>
             <button onClick={saveRelationship} className="btn-primary">保存</button>
           </>
         }
@@ -654,6 +694,10 @@ export default function SchemaManager() {
               <input value={newRel.join_key} onChange={(e) => setNewRel({ ...newRel, join_key: e.target.value })} className="w-full" placeholder="sale_id" />
             </div>
           </div>
+          <label className="inline-flex items-center gap-2 text-sm text-slate-700">
+            <input type="checkbox" checked={newRel.is_reviewed} onChange={(e) => setNewRel({ ...newRel, is_reviewed: e.target.checked })} />
+            人工审核通过
+          </label>
         </div>
       </Modal>
 
