@@ -13,6 +13,10 @@ import type { Concept } from "@/lib/types";
 
 const TYPE_COLORS: Record<string, string> = { entity: "bg-indigo-50 text-indigo-600", dimension: "bg-amber-50 text-amber-600", measure: "bg-emerald-50 text-emerald-600", attribute: "bg-purple-50 text-purple-600" };
 const TYPE_LABELS: Record<string, string> = { entity: "实体", dimension: "维度", measure: "度量", attribute: "属性" };
+const REVIEW_BADGE = {
+  approved: "bg-emerald-50 text-emerald-700",
+  pending: "bg-amber-50 text-amber-700",
+};
 
 interface TreeNode extends Concept {
   children: TreeNode[];
@@ -68,6 +72,7 @@ export default function ConceptManager() {
           <div className="flex items-center gap-2 py-2 px-3 rounded-lg hover:bg-slate-50 group">
             <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${TYPE_COLORS[node.concept_type] || "bg-slate-100 text-slate-500"}`}>{TYPE_LABELS[node.concept_type] || node.concept_type}</span>
             <span className="text-sm font-medium text-slate-700">{node.name}</span>
+            <span className={`text-xs px-1.5 py-0.5 rounded ${node.is_reviewed ? REVIEW_BADGE.approved : REVIEW_BADGE.pending}`}>{node.is_reviewed ? "通过" : "待审"}</span>
             <span className="text-xs text-slate-400 truncate max-w-xs">{node.description}</span>
             <div className="ml-auto opacity-0 group-hover:opacity-100 flex items-center gap-1">
               <button onClick={() => { setEditConcept(node); setIsModalOpen(true); }} className="btn-ghost text-xs">编辑</button>
@@ -97,7 +102,7 @@ export default function ConceptManager() {
             <button onClick={() => setViewMode("tree")} className={`px-3 py-1.5 text-xs ${viewMode === "tree" ? "bg-indigo-50 text-indigo-600" : "text-slate-500"}`}>树形</button>
             <button onClick={() => setViewMode("table")} className={`px-3 py-1.5 text-xs ${viewMode === "table" ? "bg-indigo-50 text-indigo-600" : "text-slate-500"}`}>表格</button>
           </div>
-          <button onClick={() => { setEditConcept({ scenario_id: activeScenario, parent_id: "", level: 0, concept_type: "entity", related_class: "", sort_order: 0 }); setIsModalOpen(true); }} className="btn-primary">+ 新增概念</button>
+          <button onClick={() => { setEditConcept({ scenario_id: activeScenario, parent_id: "", level: 0, concept_type: "entity", related_class: "", sort_order: 0, is_reviewed: false }); setIsModalOpen(true); }} className="btn-primary">+ 新增概念</button>
         </div>
       </div>
       <ScenarioSelector />
@@ -112,9 +117,9 @@ export default function ConceptManager() {
         <div className="card p-4">{renderTree(buildTree(filtered))}</div>
       ) : (
         <div className="card overflow-hidden">
-          <table className="data-table"><thead><tr><th>名称</th><th>类型</th><th>描述</th><th>关联类</th><th>层级</th><th className="text-right">操作</th></tr></thead>
+          <table className="data-table"><thead><tr><th>名称</th><th>类型</th><th>审核</th><th>描述</th><th>关联类</th><th>层级</th><th className="text-right">操作</th></tr></thead>
           <tbody>{filtered.sort((a, b) => a.level - b.level || a.sort_order - b.sort_order).map(c => (
-            <tr key={c.id}><td className="font-medium text-slate-700" style={{ paddingLeft: `${(c.level || 0) * 20 + 20}px` }}>{c.name}</td><td><span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${TYPE_COLORS[c.concept_type] || ""}`}>{TYPE_LABELS[c.concept_type] || c.concept_type}</span></td><td className="text-slate-500 max-w-xs truncate">{c.description}</td><td className="text-xs">{c.related_class}</td><td className="text-xs text-slate-400">{c.level}</td><td className="text-right"><button onClick={() => { setEditConcept(c); setIsModalOpen(true); }} className="btn-ghost text-xs">编辑</button><button onClick={() => setDeleteTarget(c.id)} className="btn-ghost text-xs text-red-500">删除</button></td></tr>
+            <tr key={c.id}><td className="font-medium text-slate-700" style={{ paddingLeft: `${(c.level || 0) * 20 + 20}px` }}>{c.name}</td><td><span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${TYPE_COLORS[c.concept_type] || ""}`}>{TYPE_LABELS[c.concept_type] || c.concept_type}</span></td><td><span className={`text-xs px-1.5 py-0.5 rounded ${c.is_reviewed ? REVIEW_BADGE.approved : REVIEW_BADGE.pending}`}>{c.is_reviewed ? "通过" : "待审"}</span></td><td className="text-slate-500 max-w-xs truncate">{c.description}</td><td className="text-xs">{c.related_class}</td><td className="text-xs text-slate-400">{c.level}</td><td className="text-right"><button onClick={() => { setEditConcept(c); setIsModalOpen(true); }} className="btn-ghost text-xs">编辑</button><button onClick={() => setDeleteTarget(c.id)} className="btn-ghost text-xs text-red-500">删除</button></td></tr>
           ))}</tbody></table>
         </div>
       )}
@@ -131,6 +136,7 @@ export default function ConceptManager() {
             <div><label className="text-xs text-slate-500 font-medium block mb-1.5">关联类</label><input value={editConcept?.related_class || ""} onChange={(e) => setEditConcept({ ...editConcept!, related_class: e.target.value })} className="w-full" placeholder="Sale" /></div>
             <div><label className="text-xs text-slate-500 font-medium block mb-1.5">排序</label><input type="number" value={editConcept?.sort_order || 0} onChange={(e) => setEditConcept({ ...editConcept!, sort_order: Number(e.target.value) })} className="w-full" /></div>
           </div>
+          <label className="inline-flex items-center gap-2 text-sm text-slate-700"><input type="checkbox" checked={!!editConcept?.is_reviewed} onChange={(e) => setEditConcept({ ...editConcept!, is_reviewed: e.target.checked })} />人工审核通过</label>
         </div>
       </Modal>
 

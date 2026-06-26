@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Callable, Any
 from datetime import datetime
 
-from configs.global_config import Cfg, client
+from core.llm.chat_model import get_async_client, get_model_name
 from tools.db import get_db
 from pydantic import ValidationError
 
@@ -115,8 +115,8 @@ async def _emit_progress(callback: Optional[Callable], **status):
 # 主优化器（BM25 版本）
 # ============================================================
 
-class SchemaOptimizerV4:
-    """Schema 优化器 v4 - 使用 BM25 检索"""
+class SchemaOptimizer:
+    """Schema 优化器 - 使用 BM25 检索"""
 
     def __init__(self, scenario_id: str):
         self.scenario_id = scenario_id
@@ -395,8 +395,8 @@ class SchemaOptimizerV4:
 
         for attempt in range(LLM_RETRY_MAX + 1):
             try:
-                response = await client.chat.completions.create(
-                    model=Cfg.model_name,
+                response = await get_async_client().chat.completions.create(
+                    model=get_model_name(),
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.3,
                     max_tokens=8192,
@@ -548,8 +548,8 @@ class SchemaOptimizerV4:
 }}"""
 
         try:
-            response = await client.chat.completions.create(
-                model=Cfg.model_name,
+            response = await get_async_client().chat.completions.create(
+                model=get_model_name(),
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
                 max_tokens=4096,
@@ -607,8 +607,8 @@ class SchemaOptimizerV4:
 }}
 """
         try:
-            response = await client.chat.completions.create(
-                model=Cfg.model_name,
+            response = await get_async_client().chat.completions.create(
+                model=get_model_name(),
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=2048,
@@ -821,7 +821,7 @@ class SchemaOptimizerV4:
         else:
             conn.execute(
                 """INSERT INTO metrics (id, scenario_id, name, description, category, target_class, calculation, formula, dimensions, required_dimensions, filters_hint, chart_type, is_reviewed, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
                 (mid, sid, *values),
             )
         return True

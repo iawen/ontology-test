@@ -1,11 +1,12 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import ReactEChartsCore from "echarts-for-react/lib/core";
 import * as echarts from "echarts/core";
 import { GraphChart } from "echarts/charts";
 import { TooltipComponent, LegendComponent } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
+import { Maximize2, RotateCcw, ZoomIn, ZoomOut } from "lucide-react";
 import { useApp } from "@/contexts/AppContext";
 import { useApi } from "@/hooks/useApi";
 import {
@@ -21,6 +22,19 @@ import ScenarioSelector from "@/components/ScenarioSelector";
 import type { SchemaClass, SchemaField, SchemaRelationship } from "@/lib/types";
 
 echarts.use([GraphChart, TooltipComponent, LegendComponent, CanvasRenderer]);
+
+const REVIEW_COLORS = {
+  approved: { fill: "#ecfdf5", stroke: "#10b981", text: "#047857" },
+  pending: { fill: "#fffbeb", stroke: "#f59e0b", text: "#b45309" },
+};
+
+const escapeHtml = (value: unknown) =>
+  String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 
 export default function SchemaManager() {
   const { token, activeScenario, addToast } = useApp();
@@ -151,6 +165,14 @@ export default function SchemaManager() {
     });
   };
 
+  const handleFitGraph = () => {
+    const chartInstance = echartsRef.current?.getEchartsInstance();
+    if (!chartInstance) return;
+    chartInstance.setOption({
+      series: [{ zoom: 0.82, center: ["50%", "52%"] }],
+    });
+  };
+
   const saveClass = async () => {
     if (!editClass?.id || !editClass.name_cn) {
       addToast("warning", "ID和中文名必填");
@@ -228,33 +250,138 @@ export default function SchemaManager() {
     }
   };
 
-  const graphOption = {
-    tooltip: {},
-    legend: { data: classes.map((c) => c.id) },
+  const classById = useMemo(
+    () => new Map(classes.map((schemaClass) => [schemaClass.id, schemaClass])),
+    [classes],
+  );
+
+  const reviewedClassCount = classes.filter((schemaClass) => schemaClass.is_reviewed).length;
+  const reviewedRelationshipCount = relationships.filter((relationship) => relationship.is_reviewed).length;
+  const isolatedClassCount = classes.filter(
+    (schemaClass) => !relationships.some((relationship) => relationship.source === schemaClass.id || relationship.target === schemaClass.id),
+  ).length;
+
+  const graphOption = useMemo(() => ({
+    backgroundColor: "transparent",
+    animationDurationUpdate: 450,
+    tooltip: {
+      trigger: "item",
+      appendToBody: true,
+      backgroundColor: "rgba(15, 23, 42, 0.94)",
+      borderWidth: 0,
+      padding: [10, 12],
+      textStyle: { color: "#f8fafc", fontSize: 12 },
+      formatter: (params: any) => {
+        if (params.dataType === "edge") {
+          const relationship = params.data.raw as SchemaRelationship | undefined;
+          if (!relationship) return "";
+          return `<div style="min-width:180px">
+            <div style="font-weight:600;margin-bottom:6px">${escapeHtml(relationship.type || "关系")}</div>
+            <div>源: ${escapeHtml(relationship.source)}</div>
+            <div>目标: ${escapeHtml(relationship.target)}</div>
+            <div>JOIN: ${escapeHtml(relationship.join_key || "-")}</div>
+            <div>审核: ${relationship.is_reviewed ? "通过" : "待审"}</div>
+          </div>`;
+        }
+        const schemaClass = params.data.raw as SchemaClass | undefined;
+        if (!schemaClass) return "";
+        return `<div style="min-width:220px">
+          <div style="font-weight:700;margin-bottom:6px">${escapeHtml(schemaClass.name_cn || schemaClass.id)}</div>
+          <div style="color:#cbd5e1;margin-bottom:6px">${escapeHtml(schemaClass.id)}</div>
+          <div>字段: ${(schemaClass.fields || []).length}</div>
+          <div>数据文件: ${escapeHtml(schemaClass.csv_file || "-")}</div>
+          <div>主键: ${escapeHtml(schemaClass.primary_key || "-")}</div>
+          <div>审核: ${schemaClass.is_reviewed ? "通过" : "待审"}</div>
+        </div>`;
+      },
+    },
     series: [
       {
         type: "graph",
         layout: "force",
-        roam: true,        
-        draggable: true,   
-        label: { show: true, fontSize: 12 },
-        data: classes.map((c) => ({
-          name: c.id,
-          symbolSize: 40,
-          itemStyle: { color: "#6366f1" },
-        })),
-        links: relationships.map((r) => ({
-          source: r.source,
-          target: r.target,
-          label: { show: true, formatter: r.type },
-        })),
-        force: { 
-          repulsion: 300,        // 🛠️ 略微加大排斥力使其分布更均匀
-          edgeLength: [120, 240], // 🛠️ 调整边长区间
+        roam: true,
+        draggable: true,
+        cursor: "pointer",
+        scaleLimit: { min: 0.25, max: 3 },
+        edgeSymbol: ["none", "arrow"],
+        edgeSymbolSize: [0, 10],
+        label: {
+          show: true,
+          formatter: (params: any) => params.data.label,
+          color: "#0f172a",
+          fontSize: 12,
+          fontWeight: 600,
+          width: 120,
+          overflow: "truncate",
+        },
+        edgeLabel: {
+          show: true,
+          formatter: (params: any) => params.data.label,
+          color: "#64748b",
+          fontSize: 10,
+          backgroundColor: "rgba(255,255,255,0.86)",
+          borderColor: "#e2e8f0",
+          borderWidth: 1,
+          borderRadius: 4,
+          padding: [2, 5],
+        },
+        emphasis: {
+          focus: "adjacency",
+          lineStyle: { width: 2.5, color: "#4f46e5" },
+          label: { color: "#111827" },
+        },
+        data: classes.map((schemaClass) => {
+          const fieldCount = (schemaClass.fields || []).length;
+          const palette = schemaClass.is_reviewed ? REVIEW_COLORS.approved : REVIEW_COLORS.pending;
+          return {
+            id: schemaClass.id,
+            name: schemaClass.id,
+            label: schemaClass.name_cn || schemaClass.id,
+            symbol: "roundRect",
+            symbolSize: [Math.min(170, Math.max(106, (schemaClass.name_cn || schemaClass.id).length * 13)), 46 + Math.min(fieldCount, 18)],
+            raw: schemaClass,
+            itemStyle: {
+              color: palette.fill,
+              borderColor: palette.stroke,
+              borderWidth: 2,
+              shadowBlur: 12,
+              shadowColor: "rgba(15, 23, 42, 0.08)",
+            },
+          };
+        }),
+        links: relationships
+          .filter((relationship) => classById.has(relationship.source) && classById.has(relationship.target))
+          .map((relationship) => ({
+            source: relationship.source,
+            target: relationship.target,
+            label: relationship.type || "关联",
+            raw: relationship,
+            lineStyle: {
+              color: relationship.is_reviewed ? "#94a3b8" : "#f59e0b",
+              width: relationship.is_reviewed ? 1.4 : 1.8,
+              curveness: 0.16,
+              opacity: 0.88,
+            },
+          })),
+        force: {
+          repulsion: Math.max(420, classes.length * 34),
+          gravity: 0.055,
+          edgeLength: [150, 260],
+          friction: 0.58,
         },
       },
     ],
-  };
+  }), [classById, classes, relationships]);
+
+  const graphEvents = useMemo(() => ({
+    click: (params: any) => {
+      if (params.dataType === "node" && params.data?.raw) {
+        const schemaClass = params.data.raw as SchemaClass;
+        setEditClass({ ...schemaClass, fields: schemaClass.fields || [] });
+        setIsClassModalOpen(true);
+      }
+    },
+  }), []);
 
   if (!activeScenario)
     return (
@@ -321,41 +448,67 @@ export default function SchemaManager() {
           description="上传数据后使用AI提取，或手动创建"
         />
       ) : viewMode === "graph" ? (
-        /* 🛠️ 优化图谱视窗结构：引入相对定位容器与外部控制按钮 */
-        <div className="card p-4 relative" style={{ height: 500 }}>
-          
-          {/* 工具控制浮层 */}
-          <div className="absolute top-6 right-6 z-10 flex flex-col gap-1.5 bg-white/90 backdrop-blur border border-slate-200 p-1.5 rounded-lg shadow-sm">
-            <button
-              onClick={handleZoomIn}
-              title="放大"
-              className="w-8 h-8 flex items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 active:bg-slate-200 transition-colors"
-            >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line><line x1="11" y1="8" x2="11" y2="14"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
-            </button>
-            <button
-              onClick={handleZoomOut}
-              title="缩小"
-              className="w-8 h-8 flex items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 active:bg-slate-200 transition-colors"
-            >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
-            </button>
-            <div className="h-[1px] bg-slate-100 my-0.5 mx-1" />
-            <button
-              onClick={handleResetLayout}
-              title="自动布局复位"
-              className="w-8 h-8 flex items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 active:bg-slate-200 transition-colors"
-            >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path><path d="M16 3h5v5"></path><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path><path d="M8 21H3v-5"></path></svg>
-            </button>
+        <div className="card overflow-hidden border border-slate-200 bg-white">
+          <div className="flex flex-col gap-3 border-b border-slate-100 bg-slate-50/80 px-5 py-4 lg:flex-row lg:items-center lg:justify-between">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-800">Schema 关系图谱</h3>
+              <div className="mt-1 flex flex-wrap items-center gap-3 text-xs text-slate-500">
+                <span>类 {classes.length}</span>
+                <span>关系 {relationships.length}</span>
+                <span>已审核类 {reviewedClassCount}</span>
+                <span>已审核关系 {reviewedRelationshipCount}</span>
+                <span>孤立类 {isolatedClassCount}</span>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="inline-flex items-center gap-1.5 rounded-md border border-emerald-100 bg-emerald-50 px-2 py-1 text-emerald-700">
+                <span className="h-2 w-2 rounded-full bg-emerald-500" />通过
+              </span>
+              <span className="inline-flex items-center gap-1.5 rounded-md border border-amber-100 bg-amber-50 px-2 py-1 text-amber-700">
+                <span className="h-2 w-2 rounded-full bg-amber-500" />待审
+              </span>
+            </div>
           </div>
-
-          <ReactEChartsCore
-            ref={echartsRef} // 🛠️ 绑定 Ref
-            echarts={echarts}
-            option={graphOption}
-            style={{ height: "100%" }}
-          />
+          <div className="relative h-[620px] bg-[radial-gradient(circle_at_1px_1px,#e2e8f0_1px,transparent_0)] [background-size:22px_22px]">
+            <div className="absolute right-4 top-4 z-10 flex items-center gap-1 rounded-lg border border-slate-200 bg-white/95 p-1.5 shadow-sm backdrop-blur">
+              <button
+                onClick={handleZoomIn}
+                title="放大"
+                className="flex h-8 w-8 items-center justify-center rounded-md text-slate-600 transition-colors hover:bg-slate-100 active:bg-slate-200"
+              >
+                <ZoomIn size={17} />
+              </button>
+              <button
+                onClick={handleZoomOut}
+                title="缩小"
+                className="flex h-8 w-8 items-center justify-center rounded-md text-slate-600 transition-colors hover:bg-slate-100 active:bg-slate-200"
+              >
+                <ZoomOut size={17} />
+              </button>
+              <button
+                onClick={handleFitGraph}
+                title="适配视图"
+                className="flex h-8 w-8 items-center justify-center rounded-md text-slate-600 transition-colors hover:bg-slate-100 active:bg-slate-200"
+              >
+                <Maximize2 size={16} />
+              </button>
+              <button
+                onClick={handleResetLayout}
+                title="自动布局复位"
+                className="flex h-8 w-8 items-center justify-center rounded-md text-slate-600 transition-colors hover:bg-slate-100 active:bg-slate-200"
+              >
+                <RotateCcw size={16} />
+              </button>
+            </div>
+            <ReactEChartsCore
+              ref={echartsRef}
+              echarts={echarts}
+              option={graphOption}
+              onEvents={graphEvents}
+              notMerge
+              style={{ height: "100%", width: "100%" }}
+            />
+          </div>
         </div>
       ) : (
         /* 下方表格逻辑和各种 Modal 保持原样不作改动 */
