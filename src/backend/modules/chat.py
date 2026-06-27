@@ -172,7 +172,7 @@ class ToolExecutor:
             # join_class=args.get("join_class", ""),
             join_classes=args.get("join_classes", []),
             order_by=args.get("order_by", ""),
-            limit=args.get("limit"),
+            limit=None,
             having=args.get("having", []),
         )
 

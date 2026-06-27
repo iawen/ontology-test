@@ -436,6 +436,12 @@ class ToolExecutor:
                 }
 
         elif name == "query_ontology_data":
+            if args.get("limit") is not None:
+                logger.warning(
+                    "Ignoring limit for query_ontology_data to avoid incomplete analysis: scenario_id=%s limit=%s",
+                    self.scenario_id,
+                    args.get("limit"),
+                )
             return query_engine.execute_query(
                 target_class=args.get("target_class", ""),
                 metrics=args.get("metrics", []),
@@ -443,7 +449,7 @@ class ToolExecutor:
                 filters=args.get("filters", []),
                 join_classes=args.get("join_classes", []),
                 order_by=args.get("order_by", ""),
-                limit=args.get("limit", 100),
+                limit=None,
                 having=args.get("having", []),
             )
 

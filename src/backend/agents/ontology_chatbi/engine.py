@@ -14,6 +14,7 @@ Chat v3 - 主控 Orchestrator
 
 import asyncio
 import json
+import math
 import time
 import uuid
 from datetime import datetime, timezone
@@ -400,7 +401,7 @@ class ChatEngineV3:
             tool_finished_at = int(time.time() * 1000)
             execution_duration_ms = tool_finished_at - execution_started_at
             total_duration_ms = tool_finished_at - total_started_at
-            result_preview = json.dumps(result, ensure_ascii=False, default=str)
+            result_preview = self._json_dumps(result)
             if len(result_preview) > 3000:
                 result_preview = result_preview[:3000] + "...[结果过长已截断]"
 
@@ -517,7 +518,7 @@ class ChatEngineV3:
 
     @classmethod
     def _json_dumps(cls, value) -> str:
-        return json.dumps(cls._make_json_safe(value), ensure_ascii=False, default=str)
+        return json.dumps(cls._make_json_safe(value), ensure_ascii=False, default=str, allow_nan=False)
 
     @classmethod
     def _make_json_safe(cls, value):
@@ -540,9 +541,16 @@ class ChatEngineV3:
                 }
         if np is not None:
             if isinstance(value, np.generic):
-                return value.item()
+                return cls._make_json_safe(value.item())
             if isinstance(value, np.ndarray):
                 return cls._make_json_safe(value.tolist())
+
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if pd is not None and (value is pd.NA or value is pd.NaT):
+            return None
 
         if isinstance(value, dict):
             return {str(k): cls._make_json_safe(v) for k, v in value.items()}

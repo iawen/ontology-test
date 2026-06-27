@@ -51,6 +51,19 @@ function pickLatestValidQueryResult(toolResults: any[]): QueryResultData | undef
   return undefined;
 }
 
+function parseSseEvent(raw: string): any {
+  try {
+    return JSON.parse(raw);
+  } catch (initialError) {
+    const normalized = raw.replace(/([:\[,]\s*)-?(?:NaN|Infinity)(?=\s*[,}\]])/g, "$1null");
+    if (normalized !== raw) {
+      console.warn("流式事件包含非标准 JSON 数值，已按 null 兼容处理");
+      return JSON.parse(normalized);
+    }
+    throw initialError;
+  }
+}
+
 function AppContent() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -295,7 +308,7 @@ function AppContent() {
           const raw = line.slice(6).trim();
           if (!raw) continue;
           try {
-            const event = JSON.parse(raw);
+            const event = parseSseEvent(raw);
 
             switch (event.type) {
               case "plan":

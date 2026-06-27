@@ -12,6 +12,7 @@ import io
 import sys
 import ast
 import re
+import math
 from typing import Any, Dict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
@@ -22,7 +23,7 @@ import numpy as np
 def _to_jsonable(value: Any) -> Any:
     """Convert pandas/numpy objects produced by analysis code into JSON-safe values."""
     if isinstance(value, pd.DataFrame):
-        return _df_to_preview(value)
+        return _to_jsonable(_df_to_preview(value))
     if isinstance(value, pd.Series):
         return {
             "name": value.name,
@@ -31,9 +32,15 @@ def _to_jsonable(value: Any) -> Any:
             "total": int(len(value)),
         }
     if isinstance(value, np.generic):
-        return value.item()
+        return _to_jsonable(value.item())
     if isinstance(value, np.ndarray):
         return [_to_jsonable(item) for item in value.tolist()]
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if value is pd.NA or value is pd.NaT:
+        return None
     if isinstance(value, dict):
         return {str(k): _to_jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):

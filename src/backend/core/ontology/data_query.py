@@ -13,12 +13,15 @@ import csv
 import json
 import re
 import sqlite3
+import time
+import uuid
 import pandas as pd
 from pathlib import Path
 from typing import Optional, Any, Dict, List
 
 from core.db.db_connector import create_db_engine
 from core.ontology.ontology_engine import OntologyEngine
+from tools.logger import logger
 
 class DataQueryEngine:
     def __init__(self, engine: OntologyEngine, db_connection_url: str = ""):
@@ -32,8 +35,17 @@ class DataQueryEngine:
         if self.db_connection_url:
             try:
                 self._db_engine = create_db_engine(self.db_connection_url)
+                logger.info("DataQuery engine initialized with external db connection")
             except ImportError:
-                print("[Warning] sqlalchemy not installed, falling back to SQLite")
+                logger.warning("sqlalchemy not installed, falling back to SQLite")
+
+    @staticmethod
+    def _log_json(value: Any, max_len: int = 2000) -> str:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(value)
+        return text if len(text) <= max_len else text[:max_len] + "...[truncated]"
 
     def _quote_ident(self, identifier: str) -> str:
         if identifier is None or str(identifier).strip() == "":
@@ -83,12 +95,24 @@ class DataQueryEngine:
         mapped_table = self.oe.get_table_name(class_id)
         if not self._db_engine:
             self._resolved_table_names[class_id] = mapped_table
+            logger.debug(
+                "DataQuery table resolved: class=%s mapped_table=%s mode=sqlite_memory",
+                class_id,
+                mapped_table,
+            )
             return mapped_table
 
         candidates = self._table_name_candidates(mapped_table)
         for candidate in candidates:
             if self._table_exists(candidate):
                 self._resolved_table_names[class_id] = candidate
+                logger.debug(
+                    "DataQuery table resolved: class=%s mapped_table=%s resolved_table=%s candidates=%s mode=external_db",
+                    class_id,
+                    mapped_table,
+                    candidate,
+                    self._log_json(candidates),
+                )
                 return candidate
 
         raise ValueError(
@@ -112,29 +136,44 @@ class DataQueryEngine:
         return self._conn
 
     def _execute_sql(self, sql: str) -> list[dict]:
+        started = time.time()
         if self._db_engine:
             from sqlalchemy import text
             with self._db_engine.connect() as conn:
                 result = conn.execute(text(sql))
                 columns = list(result.keys())
-                return [dict(zip(columns, row)) for row in result.fetchall()]
+                rows = [dict(zip(columns, row)) for row in result.fetchall()]
         else:
             conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute(sql)
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
             rows = cursor.fetchall()
-            return [dict(zip(columns, row)) for row in rows]
+            rows = [dict(zip(columns, row)) for row in rows]
+        logger.info(
+            "DataQuery SQL executed: rows=%d duration_ms=%d",
+            len(rows),
+            int((time.time() - started) * 1000),
+        )
+        return rows
 
     def _register_csv(self, class_id: str):
         if class_id in self._registered_tables:
+            logger.debug("DataQuery CSV already registered: class=%s", class_id)
             return
         info = self.oe.get_class_info(class_id)
         csv_file = info.get("csv_file", "")
         if not csv_file:
+            logger.debug("DataQuery CSV skipped: class=%s reason=no_csv_file", class_id)
             return
         csv_path = self.oe.data_dir / csv_file
         if not csv_path.exists():
+            logger.warning(
+                "DataQuery CSV skipped: class=%s csv_file=%s path=%s reason=file_not_found",
+                class_id,
+                csv_file,
+                str(csv_path),
+            )
             return
         table_name = self._resolve_table_name(class_id)
         df = pd.read_csv(str(csv_path), encoding="utf-8-sig")
@@ -142,6 +181,13 @@ class DataQueryEngine:
         if not self._db_engine:
             df.to_sql(table_name, conn, if_exists="replace", index=False)
         self._registered_tables.add(class_id)
+        logger.info(
+            "DataQuery CSV registered: class=%s table=%s rows=%d columns=%d",
+            class_id,
+            table_name,
+            len(df),
+            len(df.columns),
+        )
 
     def _map_field(self, class_id: str, field_name: str) -> str:
         if field_name is None or str(field_name).strip() == "":
@@ -169,6 +215,15 @@ class DataQueryEngine:
         mapped_target_keys = self._valid_mapped_keys(t_class, target_keys)
 
         if not mapped_source_keys or not mapped_target_keys:
+            logger.warning(
+                "DataQuery join condition fallback: source=%s target=%s source_keys=%s target_keys=%s mapped_source_keys=%s mapped_target_keys=%s",
+                s_class,
+                t_class,
+                self._log_json(source_keys),
+                self._log_json(target_keys),
+                self._log_json(mapped_source_keys),
+                self._log_json(mapped_target_keys),
+            )
             return "1=1"
 
         if len(mapped_source_keys) == len(mapped_target_keys):
@@ -305,6 +360,30 @@ class DataQueryEngine:
         filters = filters or []
         having = having or []
         join_classes = join_classes or []
+        query_id = uuid.uuid4().hex[:8]
+        build_started = time.time()
+
+        logger.info(
+            "DataQuery SQL build started: query_id=%s target_class=%s metrics=%s dimensions=%s filters=%s join_classes=%s order_by=%s limit=%s having=%s mode=%s",
+            query_id,
+            target_class,
+            self._log_json(metrics),
+            self._log_json(dimensions),
+            self._log_json(filters),
+            self._log_json(join_classes),
+            order_by,
+            limit,
+            self._log_json(having),
+            "external_db" if self._db_engine else "sqlite_memory",
+        )
+        if limit is not None:
+            logger.warning(
+                "DataQuery LIMIT ignored: query_id=%s target_class=%s requested_limit=%s reason=query_ontology_data_should_not_truncate_results",
+                query_id,
+                target_class,
+                limit,
+            )
+            limit = None
 
         # ── 1. 自动化依赖推导（核心优化） ──
         # 扫描所有输入的字段，自动判定其归属的语义实体类，免除 LLM 强行指定
@@ -312,7 +391,9 @@ class DataQueryEngine:
         
         for dim in dimensions:
             cls = self.oe.find_class_by_field(dim)
-            if cls: discovered_classes.add(cls)
+            if cls:
+                discovered_classes.add(cls)
+                logger.debug("DataQuery dependency discovered: query_id=%s source=dimension field=%s class=%s", query_id, dim, cls)
 
         for m in metrics:
             m_info = self.oe.get_metric_info(m)
@@ -320,26 +401,40 @@ class DataQueryEngine:
                 metric_class = self._metric_class(m_info, target_class)
                 if metric_class:
                     discovered_classes.add(metric_class)
+                    logger.debug("DataQuery dependency discovered: query_id=%s source=metric metric=%s class=%s", query_id, m, metric_class)
             else:
                 cls = self.oe.find_class_by_field(m)
-                if cls: discovered_classes.add(cls)
+                if cls:
+                    discovered_classes.add(cls)
+                    logger.debug("DataQuery dependency discovered: query_id=%s source=metric_field field=%s class=%s", query_id, m, cls)
 
         for f in filters:
             cls = self.oe.find_class_by_field(f.get("field", ""))
-            if cls: discovered_classes.add(cls)
+            if cls:
+                discovered_classes.add(cls)
+                logger.debug("DataQuery dependency discovered: query_id=%s source=filter field=%s class=%s", query_id, f.get("field", ""), cls)
 
         for h in having:
             cls = self.oe.find_class_by_field(h.get("field", ""))
-            if cls: discovered_classes.add(cls)
+            if cls:
+                discovered_classes.add(cls)
+                logger.debug("DataQuery dependency discovered: query_id=%s source=having field=%s class=%s", query_id, h.get("field", ""), cls)
 
         if order_by:
             for ob in order_by.split(","):
                 ob_clean = ob.strip().split(" ")[0]
                 cls = self.oe.find_class_by_field(ob_clean)
-                if cls: discovered_classes.add(cls)
+                if cls:
+                    discovered_classes.add(cls)
+                    logger.debug("DataQuery dependency discovered: query_id=%s source=order_by field=%s class=%s", query_id, ob_clean, cls)
 
         # 移去自身
         discovered_classes.discard(target_class)
+        logger.info(
+            "DataQuery dependencies resolved: query_id=%s discovered_classes=%s",
+            query_id,
+            self._log_json(sorted(discovered_classes)),
+        )
 
         # ── 2. 统一的数据注册与全局单态别名管理器 ──
         self._register_csv(target_class)
@@ -352,6 +447,22 @@ class DataQueryEngine:
             self._register_csv(jc)
             path = self.oe.get_join_path(target_class, jc)
             if path:
+                logger.info(
+                    "DataQuery join path found: query_id=%s target_class=%s join_class=%s path=%s",
+                    query_id,
+                    target_class,
+                    jc,
+                    self._log_json([
+                        {
+                            "source": rel.get("source"),
+                            "target": rel.get("target"),
+                            "type": rel.get("type"),
+                            "source_key": rel.get("source_key"),
+                            "target_key": rel.get("target_key"),
+                        }
+                        for rel in path
+                    ]),
+                )
                 for rel in path:
                     s_class = rel["source"]
                     t_class = rel["target"]
@@ -370,6 +481,30 @@ class DataQueryEngine:
                     on_clause = self._build_join_condition(s_class, s_alias, t_class, t_alias, rel)
                     join_sql = f'LEFT JOIN {self._quote_table(t_table)} AS {t_alias} ON {on_clause}'
                     join_parts.append(join_sql)
+                    logger.debug(
+                        "DataQuery join added: query_id=%s source=%s source_alias=%s target=%s target_alias=%s table=%s on=%s",
+                        query_id,
+                        s_class,
+                        s_alias,
+                        t_class,
+                        t_alias,
+                        t_table,
+                        on_clause,
+                    )
+            elif jc != target_class:
+                logger.warning(
+                    "DataQuery join path missing: query_id=%s target_class=%s join_class=%s",
+                    query_id,
+                    target_class,
+                    jc,
+                )
+
+        logger.info(
+            "DataQuery alias map built: query_id=%s alias_map=%s join_count=%d",
+            query_id,
+            self._log_json(alias_map),
+            len(join_parts),
+        )
 
         # ── 3. 构建多表解耦的 SELECT 与 GROUP BY ──
         select_parts = []
@@ -383,12 +518,28 @@ class DataQueryEngine:
             col_str = self._col_ref(alias, p_col)
             select_parts.append(f'{col_str} AS {self._alias_ref(dim)}')
             group_parts.append(col_str)
+            logger.debug(
+                "DataQuery dimension mapped: query_id=%s dimension=%s class=%s alias=%s physical_col=%s",
+                query_id,
+                dim,
+                cls,
+                alias,
+                p_col,
+            )
 
         # 指标映射 (严格遵循 schema.json 中定义的计算口径)
         for metric in metrics:
             m_info = self.oe.get_metric_info(metric)
             if m_info:
-                select_parts.append(f'{self._metric_expr(m_info, metric, target_class, alias_map)} AS {self._alias_ref(metric)}')
+                metric_expr = self._metric_expr(m_info, metric, target_class, alias_map)
+                select_parts.append(f'{metric_expr} AS {self._alias_ref(metric)}')
+                logger.debug(
+                    "DataQuery metric mapped: query_id=%s metric=%s class=%s expression=%s",
+                    query_id,
+                    metric,
+                    self._metric_class(m_info, target_class),
+                    metric_expr,
+                )
             else:
                 # 兼容降级逻辑
                 cls = self.oe.find_class_by_field(metric) or target_class
@@ -397,6 +548,15 @@ class DataQueryEngine:
                 f_type = self.oe.get_field_type(cls, metric)
                 agg_func = "SUM" if f_type == "numeric" else "COUNT"
                 select_parts.append(f'{agg_func}({self._col_ref(alias, p_col)}) AS {self._alias_ref(metric)}')
+                logger.debug(
+                    "DataQuery metric fallback mapped: query_id=%s metric=%s class=%s alias=%s physical_col=%s aggregation=%s",
+                    query_id,
+                    metric,
+                    cls,
+                    alias,
+                    p_col,
+                    agg_func,
+                )
 
         # 无维度无指标时的兜底查询
         if not dimensions and not metrics:
@@ -411,8 +571,23 @@ class DataQueryEngine:
             cls = self.oe.find_class_by_field(f_field) or target_class
             alias = alias_map.get(cls, "t0")
             try:
-                where_parts.append(self._build_filter_clause(cls, f, alias))
+                filter_clause = self._build_filter_clause(cls, f, alias)
+                where_parts.append(filter_clause)
+                logger.debug(
+                    "DataQuery filter mapped: query_id=%s filter=%s class=%s alias=%s clause=%s",
+                    query_id,
+                    self._log_json(f),
+                    cls,
+                    alias,
+                    filter_clause,
+                )
             except ValueError as e:
+                logger.warning(
+                    "DataQuery filter build failed: query_id=%s filter=%s error=%s",
+                    query_id,
+                    self._log_json(f),
+                    str(e),
+                )
                 return {"type": "query_result", "data": [], "error": str(e), "sql": ""}
 
         # ── 5. 构建准确的 HAVING 聚合后过滤 ──
@@ -424,14 +599,22 @@ class DataQueryEngine:
             
             m_info = self.oe.get_metric_info(h_field)
             if m_info:
-                having_parts.append(f'{self._metric_expr(m_info, h_field, target_class, alias_map)} {op} {val}')
+                having_clause = f'{self._metric_expr(m_info, h_field, target_class, alias_map)} {op} {val}'
+                having_parts.append(having_clause)
             else:
                 cls = self.oe.find_class_by_field(h_field) or target_class
                 alias = alias_map.get(cls, "t0")
                 p_col = self.oe.map_field(cls, h_field)
                 f_type = self.oe.get_field_type(cls, h_field)
                 agg = "SUM" if f_type == "numeric" else "COUNT"
-                having_parts.append(f'{agg}({self._col_ref(alias, p_col)}) {op} {val}')
+                having_clause = f'{agg}({self._col_ref(alias, p_col)}) {op} {val}'
+                having_parts.append(having_clause)
+            logger.debug(
+                "DataQuery having mapped: query_id=%s having=%s clause=%s",
+                query_id,
+                self._log_json(h),
+                having_clause,
+            )
 
         # ── 6. 构建准确的 ORDER BY 排序 ──
         order_clause = ""
@@ -444,7 +627,8 @@ class DataQueryEngine:
 
                 m_info = self.oe.get_metric_info(ob_clean)
                 if m_info:
-                    order_parts.append(f'{self._metric_expr(m_info, ob_clean, target_class, alias_map)} {ob_dir}')
+                    order_part = f'{self._metric_expr(m_info, ob_clean, target_class, alias_map)} {ob_dir}'
+                    order_parts.append(order_part)
                 else:
                     cls = self.oe.find_class_by_field(ob_clean) or target_class
                     alias = alias_map.get(cls, "t0")
@@ -452,9 +636,17 @@ class DataQueryEngine:
                     if ob_clean in metrics:
                         f_type = self.oe.get_field_type(cls, ob_clean)
                         agg = "SUM" if f_type == "numeric" else "COUNT"
-                        order_parts.append(f'{agg}({self._col_ref(alias, p_col)}) {ob_dir}')
+                        order_part = f'{agg}({self._col_ref(alias, p_col)}) {ob_dir}'
+                        order_parts.append(order_part)
                     else:
-                        order_parts.append(f'{self._col_ref(alias, p_col)} {ob_dir}')
+                        order_part = f'{self._col_ref(alias, p_col)} {ob_dir}'
+                        order_parts.append(order_part)
+                logger.debug(
+                    "DataQuery order mapped: query_id=%s order_by_item=%s clause=%s",
+                    query_id,
+                    ob,
+                    order_part,
+                )
             order_clause = ", ".join(order_parts)
 
         # ── 7. 拼装大一统 SQL ──
@@ -469,13 +661,27 @@ class DataQueryEngine:
             sql += f"\nHAVING {' AND '.join(having_parts)}"
         if order_clause:
             sql += f"\nORDER BY {order_clause}"
-        if limit:
-            sql += f"\nLIMIT {limit}"
-
-        print(f"Generated Optimized SQL:\n{sql}")
+        logger.info(
+            "DataQuery SQL built: query_id=%s build_duration_ms=%d select_count=%d join_count=%d where_count=%d group_count=%d having_count=%d order_by=%s limit=%s sql=\n%s",
+            query_id,
+            int((time.time() - build_started) * 1000),
+            len(select_parts),
+            len(join_parts),
+            len(where_parts),
+            len(group_parts),
+            len(having_parts),
+            order_clause,
+            limit,
+            sql,
+        )
         
         try:
             rows = self._execute_sql(sql)
+            logger.info(
+                "DataQuery query completed: query_id=%s row_count=%d",
+                query_id,
+                len(rows),
+            )
             return {
                 "type": "query_result",
                 "columns": list(rows[0].keys()) if rows else [],
@@ -485,6 +691,13 @@ class DataQueryEngine:
                 "target_class": target_class,
             }
         except Exception as e:
+            logger.exception(
+                "DataQuery query failed: query_id=%s target_class=%s error=%s sql=\n%s",
+                query_id,
+                target_class,
+                str(e),
+                sql,
+            )
             return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": sql}
 
     # ──────────────────────────────────────────────────────────

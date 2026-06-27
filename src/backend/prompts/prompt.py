@@ -284,6 +284,10 @@ def _build_system_prompt(engine: OntologyEngine, scenario_id: str) -> str:
 }}
 ```
 
+### 查询完整性
+- 调用 query_ontology_data 时不要传 limit，不要为了展示方便截断业务查询结果，避免遗漏月份、区域、人员或明细分组。
+- 只有需要查看少量样例行时，才调用 get_class_sample，并在该工具中使用 limit。
+
 ## 工作流程建议
 1. 先调用 get_ontology_schema 了解数据结构
 2. 如果不确定字段类型，调用 get_field_types
@@ -316,7 +320,7 @@ def _build_tools() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "query_ontology_data",
-                "description": "基于本体论执行数据查询。系统会自动将逻辑字段名映射为物理列名，并根据 field_types 确保过滤条件的类型安全。支持多表 JOIN 和聚合后过滤（HAVING）。",
+                "description": "基于本体论执行完整数据查询。系统会自动将逻辑字段名映射为物理列名，并根据 field_types 确保过滤条件的类型安全。支持多表 JOIN 和聚合后过滤（HAVING）。不要传 limit，避免遗漏数据；需要样本行时使用 get_class_sample。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -372,11 +376,6 @@ def _build_tools() -> list[dict]:
                         "order_by": {
                             "type": "string",
                             "description": "排序字段（逻辑字段名），可带 ASC/DESC，如 '销售金额 DESC'"
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "返回行数限制，默认100",
-                            "default": 100
                         }
                     },
                     "required": ["target_class"]
