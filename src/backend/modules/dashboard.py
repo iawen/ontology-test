@@ -6,7 +6,7 @@
 
 from fastapi import APIRouter
 
-from tools.db import get_db
+from core.db.db import get_db
 
 router = APIRouter()
 

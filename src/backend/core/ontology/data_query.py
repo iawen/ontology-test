@@ -17,7 +17,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Optional, Any, Dict, List
 
-from tools.db_connector import create_db_engine
+from core.db.db_connector import create_db_engine
 from core.ontology.ontology_engine import OntologyEngine
 
 class DataQueryEngine:

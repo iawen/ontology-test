@@ -17,7 +17,7 @@ import json
 from datetime import datetime, timezone
 
 from configs.global_config import Cfg
-from tools.db import get_db
+from core.db.db import get_db
 from core.ontology.ontology_engine import OntologyEngine
 from core.ontology.data_query import DataQueryEngine
 

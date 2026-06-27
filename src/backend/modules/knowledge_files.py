@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks
 
 from configs.global_config import Cfg
 from prompts.prompt import reset_engine
-from tools.db import get_db
+from core.db.db import get_db
 from core.ontology.extract_ontology import OntologyExtractor
 
 

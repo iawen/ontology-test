@@ -9,8 +9,8 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 
-from tools.db import get_db
-from tools.db_connector import (
+from core.db.db import get_db
+from core.db.db_connector import (
     test_connection,
     list_tables,
     get_table_schema,

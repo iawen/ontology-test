@@ -16,16 +16,19 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from configs.global_config import Cfg
 from core.models.models import LoginReq
-from tools.db import get_db, init_db
+from core.db.db import get_db, init_db
 from prompts.prompt import get_engine
-from modules.helpers import create_token
+from tools.helpers import create_token
+
+
+# from modules.chat import router as chat_router
+# from modules.deep_chat import router as chat_router
+# from modules.deep_chat_v2 import router as chat_router
+from agents.ontology_chatbi.views import router as chat_router
 
 from modules.scenarios import router as scenarios_router
 from modules.knowledge_files import router as kg_router
 from modules.schema import router as schema_router
-from modules.chat import router as chat_router
-# from modules.deep_chat import router as chat_router
-# from modules.deep_chat_v2 import router as chat_router
 from modules.conversations import router as conversations_router
 from modules.metrics import router as metrics_router
 from modules.glossary import router as glossary_router
@@ -65,7 +68,7 @@ async def login(req: LoginReq):
     conn.close()
     if not user:
         raise HTTPException(401, "用户名或密码错误")
-    return {"token": create_token(req.username, user["role"]), "username": req.username, "role": user["role"]}
+    return {"token": create_token(req.username, Cfg.jwt_secret, user["role"]), "username": req.username, "role": user["role"]}
 
 
 @app.get("/api/health")

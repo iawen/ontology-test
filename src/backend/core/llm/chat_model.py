@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 from openai import AsyncClient, OpenAI
 from OpenSSL import SSL, crypto
 
+from configs.global_config import Cfg
+
 load_dotenv()
 
 __g_asycn_client: AsyncClient = None
@@ -47,12 +49,18 @@ def get_async_client() -> AsyncClient:
         return __g_asycn_client
 
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    ca_file = _build_ca_file()
-    __g_asycn_client = AsyncClient(
-        api_key=os.getenv("OPENAI_API_KEY", ""),
-        base_url=base_url,
-        http_client=httpx.AsyncClient(verify=ca_file),
-    )
+    if Cfg.openai_ssl:
+        ca_file = _build_ca_file()
+        __g_asycn_client = AsyncClient(
+            api_key=os.getenv("OPENAI_API_KEY", ""),
+            base_url=base_url,
+            http_client=httpx.AsyncClient(verify=ca_file),
+        )
+    else:
+        __g_asycn_client = AsyncClient(
+            api_key=os.getenv("OPENAI_API_KEY", ""),
+            base_url=base_url,
+        )
     __g_async_client_loop = current_loop
     return __g_asycn_client
 
@@ -65,12 +73,18 @@ async def get_async_client_async() -> AsyncClient:
         return __g_asycn_client
 
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    ca_file = await asyncio.to_thread(_build_ca_file)
-    __g_asycn_client = AsyncClient(
-        api_key=os.getenv("OPENAI_API_KEY", ""),
-        base_url=base_url,
-        http_client=httpx.AsyncClient(verify=ca_file),
-    )
+    if Cfg.openai_ssl:
+        ca_file = await asyncio.to_thread(_build_ca_file)
+        __g_asycn_client = AsyncClient(
+            api_key=os.getenv("OPENAI_API_KEY", ""),
+            base_url=base_url,
+            http_client=httpx.AsyncClient(verify=ca_file),
+        )
+    else:
+        __g_asycn_client = AsyncClient(
+            api_key=os.getenv("OPENAI_API_KEY", ""),
+            base_url=base_url,
+        )
     __g_async_client_loop = current_loop
     return __g_asycn_client
 

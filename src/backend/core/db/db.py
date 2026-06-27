@@ -1,4 +1,4 @@
-from tools.db_provider import (
+from.db_provider import (
     DatabaseConfigError,
     IntegrityError,
     OperationalError,

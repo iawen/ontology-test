@@ -9,7 +9,7 @@ import json
 
 from fastapi import APIRouter, HTTPException
 
-from tools.db import get_db
+from core.db.db import get_db
 from configs.global_config import Cfg
 from core.models.models import SystemSettingsUpdate
 

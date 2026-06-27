@@ -9,7 +9,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Query
 
-from tools.db import get_db
+from core.db.db import get_db
 from core.models.models import ExtractionLogCreate
 
 router = APIRouter()

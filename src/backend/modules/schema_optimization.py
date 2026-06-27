@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
-from tools.db import get_db
+from core.db.db import get_db
 
 from core.ontology.schema_optimizer import SchemaOptimizer
 

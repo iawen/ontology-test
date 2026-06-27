@@ -20,7 +20,7 @@ from fastapi.responses import StreamingResponse
 from core.llm.chat_model import get_async_client, get_model_name
 from core.ontology.ontology_engine import OntologyEngine
 from core.ontology.data_query import DataQueryEngine
-from tools.db import get_db
+from core.db.db import get_db
 from core.models.models import ChatRequest
 from prompts.prompt import (
     init_prompt, get_system_prompt, get_system_tools, get_engine, get_query_engine,
@@ -29,7 +29,7 @@ from modules.metrics import lookup_metric as do_lookup_metric
 from modules.glossary import match_glossary_terms
 from modules.skills import route_skills
 from modules.actions import find_matching_actions, _execute_action, get_available_actions
-from tools.python_analyize import python_analyze
+from agents.tools.python_analyize import python_analyze
 
 
 router = APIRouter()

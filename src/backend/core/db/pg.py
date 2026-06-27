@@ -1,4 +1,4 @@
-from tools.db_provider import IntegrityError, OperationalError, get_db, init_db
+from .db_provider import IntegrityError, OperationalError, get_db, init_db
 
 
 __all__ = ["IntegrityError", "OperationalError", "get_db", "init_db"]

@@ -8,9 +8,9 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from tools.db import get_db
+from core.db.db import get_db
 from configs.global_config import Cfg
-from modules.helpers import verify_token
+from tools.helpers import verify_token
 
 router = APIRouter()
 
@@ -21,7 +21,7 @@ router = APIRouter()
 @router.get("/api/conversations/{scenario_id}")
 async def list_conversations(request: Request, scenario_id: str):
     """获取当前用户的会话列表"""
-    user = verify_token(request)
+    user = verify_token(request, Cfg.jwt_secret)
     conn = get_db()
     rows = conn.execute(
         "SELECT * FROM conversations WHERE user_id=? AND scenario_id=? ORDER BY updated_at DESC",
@@ -35,7 +35,7 @@ async def list_conversations(request: Request, scenario_id: str):
 async def create_conversation(scenario_id: str, request: Request):
     """创建新会话"""
 
-    user = verify_token(request)
+    user = verify_token(request, Cfg.jwt_secret)
     body = await request.json()
     title = body.get("title", "新对话")
     conv_id = body.get("id") or str(uuid.uuid4())[:8]
@@ -57,7 +57,7 @@ async def create_conversation(scenario_id: str, request: Request):
 @router.put("/api/conversations/{conv_id}")
 async def update_conversation(conv_id: str, request: Request):
     """更新会话标题"""
-    verify_token(request)
+    verify_token(request, Cfg.jwt_secret)
     body = await request.json()
     conn = get_db()
     conn.execute("UPDATE conversations SET title=?, updated_at=? WHERE id=?",
@@ -70,7 +70,7 @@ async def update_conversation(conv_id: str, request: Request):
 @router.delete("/api/conversations/{conv_id}")
 async def delete_conversation(conv_id: str, request: Request):
     """删除会话及其消息"""
-    verify_token(request)
+    verify_token(request, Cfg.jwt_secret)
     conn = get_db()
     conn.execute("DELETE FROM messages WHERE conversation_id=?", (conv_id,))
     conn.execute("DELETE FROM conversations WHERE id=?", (conv_id,))
@@ -86,7 +86,7 @@ async def delete_conversation(conv_id: str, request: Request):
 @router.get("/api/conversations/{conv_id}/messages")
 async def get_messages(conv_id: str, request: Request):
     """获取会话的所有消息"""
-    verify_token(request)
+    verify_token(request, Cfg.jwt_secret)
     conn = get_db()
     rows = conn.execute("SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at", (conv_id,)).fetchall()
     conn.close()
@@ -115,7 +115,7 @@ async def get_messages(conv_id: str, request: Request):
 @router.post("/api/conversations/{conv_id}/messages")
 async def save_message(conv_id: str, request: Request):
     """保存一条消息"""
-    verify_token(request)
+    verify_token(request, Cfg.jwt_secret)
     body = await request.json()
     conn = get_db()
     conn.executemany(
@@ -146,7 +146,7 @@ async def save_message(conv_id: str, request: Request):
 @router.get("/api/suggestions/{scenario_id}")
 async def list_suggestions(request: Request, scenario_id: str):
     """获取当前用户的会话列表"""
-    user = verify_token(request)
+    user = verify_token(request, Cfg.jwt_secret)
     conn = get_db()
     rows = conn.execute(
         "SELECT * FROM suggested_questions WHERE scenario_id=? ORDER BY sort_order ASC",
@@ -159,7 +159,7 @@ async def list_suggestions(request: Request, scenario_id: str):
 @router.post("/api/suggested-questions")
 async def add_suggested_question(request: Request):
     """新增推荐问题"""
-    verify_token(request)
+    verify_token(request, Cfg.jwt_secret)
     body = await request.json()
     conn = get_db()
     conn.execute(
@@ -174,7 +174,7 @@ async def add_suggested_question(request: Request):
 @router.delete("/api/suggested-questions/{qid}")
 async def delete_suggested_question(qid: int, request: Request):
     """删除推荐问题"""
-    verify_token(request)
+    verify_token(request, Cfg.jwt_secret)
     conn = get_db()
     conn.execute("DELETE FROM suggested_questions WHERE id=?", (qid,))
     conn.commit()
@@ -185,7 +185,7 @@ async def delete_suggested_question(qid: int, request: Request):
 @router.post("/api/suggested-questions/generate")
 async def generate_suggested_questions(request: Request):
     """基于当前场景的 Schema，用 LLM 生成推荐问题"""
-    verify_token(request)
+    verify_token(request, Cfg.jwt_secret)
     params = await request.json()
     from prompts.prompt import get_engine
     from configs.global_config import client

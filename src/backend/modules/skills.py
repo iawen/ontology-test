@@ -11,7 +11,7 @@ import json
 from fastapi import APIRouter, HTTPException, Request
 
 from core.llm.chat_model import get_async_client, get_model_name
-from tools.db import get_db
+from core.db.db import get_db
 from core.models.models import SkillCreate, SkillUpdate
 
 router = APIRouter()

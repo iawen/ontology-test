@@ -17,7 +17,7 @@ from typing import Optional, List, Dict, Callable, Any
 from datetime import datetime
 
 from core.llm.chat_model import get_async_client, get_model_name
-from tools.db import get_db
+from core.db.db import get_db
 from pydantic import ValidationError
 
 from core.models.schema_model import (

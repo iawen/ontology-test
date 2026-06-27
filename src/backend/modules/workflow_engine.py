@@ -14,7 +14,7 @@ from enum import Enum
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from tools.db import get_db
+from core.db.db import get_db
 
 router = APIRouter()
 

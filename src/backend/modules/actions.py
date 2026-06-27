@@ -16,7 +16,7 @@ import re
 from fastapi import APIRouter, HTTPException
 
 from core.llm.chat_model import get_async_client, get_model_name # 动态导入配置与 OpenAI 异步客户端
-from tools.db import get_db
+from core.db.db import get_db
 from core.models.models import ActionCreate, ActionUpdate, ActionExecuteRequest
 
 router = APIRouter()
@@ -324,7 +324,7 @@ def _execute_data_update(action: dict, context: dict) -> dict:
         from modules.data_connections import get_active_connection
         active_conn = get_active_connection(action["scenario_id"])
         if active_conn and update_sql:
-            from tools.db_connector import execute_query
+            from core.db.db_connector import execute_query
             for k, v in context.items():
                 update_sql = update_sql.replace(f"{{{k}}}", str(v))
             result = execute_query(active_conn["connection_url"], update_sql)

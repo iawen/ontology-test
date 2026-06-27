@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 
 from configs.global_config import Cfg
-from tools.db import get_db
+from core.db.db import get_db
 from core.models.models import SchemaClassEdit, SchemaRelationEdit
 
 
