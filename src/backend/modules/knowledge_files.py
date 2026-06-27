@@ -2,7 +2,7 @@ import os
 import sys
 import json
 import shutil
-import asyncio
+import time
 from pathlib import Path
 from typing import List
 
@@ -12,6 +12,7 @@ from configs.global_config import Cfg
 from prompts.prompt import reset_engine
 from core.db.db import get_db
 from core.ontology.extract_ontology import OntologyExtractor
+from modules.extraction_logs import finish_extraction_log, start_extraction_log
 
 
 router = APIRouter()
@@ -121,9 +122,22 @@ async def start_extraction(scenario_id: str, background_tasks: BackgroundTasks, 
     batch_size = (body or {}).get("batch_size", 5)
     data_source = (body or {}).get("data_source", "auto")  # auto / csv / database
     db_connection_url = (body or {}).get("db_connection_url", "")
+    db_connection_id = (body or {}).get("db_connection_id", "")
+
+    if db_connection_id and not db_connection_url:
+        conn = get_db()
+        db_row = conn.execute(
+            "SELECT connection_url FROM data_connections WHERE id=? AND scenario_id=?",
+            (db_connection_id, scenario_id),
+        ).fetchone()
+        conn.close()
+        if not db_row:
+            raise HTTPException(404, "数据库连接不存在")
+        db_connection_url = db_row["connection_url"]
+        data_source = "database"
 
     # 自动检测：如果场景有活跃的数据库连接且没有指定数据源，优先使用数据库
-    if data_source == "auto" and not db_connection_url:
+    if data_source in ("auto", "database") and not db_connection_url:
         try:
             from modules.data_connections import get_active_connection
             active_conn = get_active_connection(scenario_id)
@@ -133,17 +147,23 @@ async def start_extraction(scenario_id: str, background_tasks: BackgroundTasks, 
         except Exception:
             pass
 
+    if data_source == "database" and not db_connection_url:
+        raise HTTPException(400, "未找到可用的数据库连接")
+
     # 如果明确指定 csv 或没有数据库连接，使用 CSV 模式
     if data_source == "csv":
         db_connection_url = ""
 
+    source_label = "数据库" if db_connection_url else "CSV文件"
+    start_message = f"启动中... (数据源: {source_label})"
+    log_id = start_extraction_log(scenario_id, "ontology", trigger="manual", message=start_message)
     extract_status = {"running": True, "phase": "starting", "progress": 0, "total": 0,
-                      "message": f"启动中... (数据源: {'数据库' if db_connection_url else 'CSV文件'})", "result": None}
+                      "message": start_message, "result": None}
 
     # 在后台运行
     # asyncio.create_task(_run_extraction(scenario_id, business_name, batch_size,
     #                                      db_connection_url=db_connection_url))
-    background_tasks.add_task(_run_extraction, scenario_id, business_name, batch_size, db_connection_url)
+    background_tasks.add_task(_run_extraction, scenario_id, business_name, batch_size, db_connection_url, log_id)
     return {"status": "started", "data_source": "database" if db_connection_url else "csv"}
 
 
@@ -195,58 +215,267 @@ def _reviewed_value(value) -> bool:
     return bool(value)
 
 
+def _json_text(value, default=None) -> str:
+    if value is None:
+        value = default if default is not None else []
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _relationship_key(row: dict) -> tuple:
+    source_key = row.get("source_key") or row.get("join_key") or ""
+    target_key = row.get("target_key") or row.get("join_key") or ""
+    join_key = row.get("join_key") or (source_key if source_key == target_key else "")
+    return (
+        row.get("source", ""),
+        row.get("target", ""),
+        row.get("type", ""),
+        source_key,
+        target_key,
+        join_key,
+    )
+
+
+def _dedupe_by_id(items: list[dict]) -> list[dict]:
+    seen = set()
+    result = []
+    for item in items or []:
+        item_id = item.get("id")
+        if not item_id or item_id in seen:
+            continue
+        seen.add(item_id)
+        result.append(item)
+    return result
+
+
+def _safe_rowcount(cursor) -> int:
+    count = getattr(cursor, "rowcount", 0)
+    return count if isinstance(count, int) and count >= 0 else 0
+
+
+def _format_sync_summary(stats: dict) -> str:
+    inserted = stats["inserted"]
+    skipped_reviewed = stats["skipped_reviewed"]
+    skipped_duplicates = stats["skipped_duplicates"]
+    preserved_reviewed = stats["preserved_reviewed"]
+    final_total = stats["final_total"]
+    removed_unreviewed = stats["removed_unreviewed"]
+    return (
+        "提取完成，Schema 已增量同步到数据库。"
+        f"更新：Class {inserted['classes']} 个、关系 {inserted['relationships']} 个、"
+        f"概念 {inserted['concepts']} 个、指标 {inserted['metrics']} 个；"
+        f"保留已审核：Class {preserved_reviewed['classes']} 个、关系 {preserved_reviewed['relationships']} 个、"
+        f"概念 {preserved_reviewed['concepts']} 个、指标 {preserved_reviewed['metrics']} 个；"
+        f"跳过已审核冲突：Class {skipped_reviewed['classes']} 个、关系 {skipped_reviewed['relationships']} 个、"
+        f"概念 {skipped_reviewed['concepts']} 个、指标 {skipped_reviewed['metrics']} 个；"
+        f"跳过重复：Class {skipped_duplicates['classes']} 个、关系 {skipped_duplicates['relationships']} 个、"
+        f"概念 {skipped_duplicates['concepts']} 个、指标 {skipped_duplicates['metrics']} 个；"
+        f"清理未审核旧数据：Class {removed_unreviewed['classes']} 个、关系 {removed_unreviewed['relationships']} 个、"
+        f"概念 {removed_unreviewed['concepts']} 个、指标 {removed_unreviewed['metrics']} 个；"
+        f"当前总量：Class {final_total['classes']} 个、关系 {final_total['relationships']} 个、"
+        f"概念 {final_total['concepts']} 个、指标 {final_total['metrics']} 个。"
+    )
+
+
 def _sync_schema_db(scenario_id: str):
     ontology_dir = os.path.join(Cfg.scenarios_root, scenario_id, "ontology")
     with open(os.path.join(ontology_dir, "schema.json"), "r", encoding="utf-8") as f:
         schema = json.loads(f.read())
 
-    classes = [
-        (c["id"], scenario_id, c["name_cn"], c["description"], c.get("primary_key", ""), c.get("csv_file", ""), json.dumps(c.get("fields", []), ensure_ascii=False), int(_reviewed_value(c.get("is_reviewed", False)))) 
-         for c in schema.get("classes", [])
-         ]
-    rels = [(scenario_id, r["source"], r["target"], r.get("type", ""), r.get("source_key", ""), r.get("target_key", ""), r.get("description", ""), int(_reviewed_value(r.get("is_reviewed", False)))) for r in schema.get("relationships", [])] 
-    concepts = [(c["id"], scenario_id, c["name"], c.get("level", 0), c.get("parent_id", ""),
-                 c.get("concept_type", ""), c.get("related_class", ""), int(_reviewed_value(c.get("is_reviewed", False))))
-                for c in schema.get("concepts", [])]
-    metrics = [(c["id"], scenario_id, c["name"], c.get("description", ""), c.get("category", ""),
-                 c.get("target_class", ""), c.get("calculation", ""), c.get("formula", ""), 
-                 c.get("required_dimensions"), 
-                 c.get("filters_hint"),
-                 c.get("dimensions"),
-                 int(_reviewed_value(c.get("is_reviewed", False))))
-                for c in schema.get("metrics", [])]
+    raw_classes = schema.get("classes", []) or []
+    raw_relationships = schema.get("relationships", []) or []
+    raw_concepts = schema.get("concepts", []) or []
+    raw_metrics = schema.get("metrics", []) or []
 
     conn = get_db()
-    # 清除旧数据再插入（避免重复）
-    conn.execute("DELETE FROM schema_classes WHERE scenario_id=?", (scenario_id,))
-    conn.execute("DELETE FROM schema_relationships WHERE scenario_id=?", (scenario_id,))
-    conn.execute("DELETE FROM concepts WHERE scenario_id=?", (scenario_id,))
-    conn.execute("DELETE FROM metrics WHERE scenario_id=?", (scenario_id,))
+    reviewed_classes = {
+        row["id"] for row in conn.execute(
+            "SELECT id FROM schema_classes WHERE scenario_id=? AND is_reviewed IS TRUE",
+            (scenario_id,),
+        ).fetchall()
+    }
+    reviewed_metrics = {
+        row["id"] for row in conn.execute(
+            "SELECT id FROM metrics WHERE scenario_id=? AND is_reviewed IS TRUE",
+            (scenario_id,),
+        ).fetchall()
+    }
+    reviewed_concepts = {
+        row["id"] for row in conn.execute(
+            "SELECT id FROM concepts WHERE scenario_id=? AND is_reviewed IS TRUE",
+            (scenario_id,),
+        ).fetchall()
+    }
+    reviewed_rels = {
+        _relationship_key(dict(row)) for row in conn.execute(
+            "SELECT source, target, type, source_key, target_key, join_key FROM schema_relationships WHERE scenario_id=? AND is_reviewed IS TRUE",
+            (scenario_id,),
+        ).fetchall()
+    }
 
-    conn.executemany("INSERT OR REPLACE INTO schema_classes (id, scenario_id, name_cn, description, primary_key, csv_file, fields, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", classes)
+    # 增量刷新：仅清理未人工审核的自动提取结果，人工审核过的数据保留。
+    removed_unreviewed = {
+        "classes": _safe_rowcount(conn.execute("DELETE FROM schema_classes WHERE scenario_id=? AND is_reviewed IS NOT TRUE", (scenario_id,))),
+        "relationships": _safe_rowcount(conn.execute("DELETE FROM schema_relationships WHERE scenario_id=? AND is_reviewed IS NOT TRUE", (scenario_id,))),
+        "concepts": _safe_rowcount(conn.execute("DELETE FROM concepts WHERE scenario_id=? AND is_reviewed IS NOT TRUE", (scenario_id,))),
+        "metrics": _safe_rowcount(conn.execute("DELETE FROM metrics WHERE scenario_id=? AND is_reviewed IS NOT TRUE", (scenario_id,))),
+    }
 
-    conn.executemany("INSERT INTO schema_relationships (scenario_id, source, target, type, source_key, target_key, description, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", rels)
+    skipped_reviewed = {"classes": 0, "relationships": 0, "concepts": 0, "metrics": 0}
+    skipped_duplicates = {"classes": 0, "relationships": 0, "concepts": 0, "metrics": 0}
+
+    classes = []
+    seen_class_ids = set()
+    for c in raw_classes:
+        class_id = c.get("id")
+        if not class_id:
+            continue
+        if class_id in seen_class_ids:
+            skipped_duplicates["classes"] += 1
+            continue
+        seen_class_ids.add(class_id)
+        if c["id"] in reviewed_classes:
+            skipped_reviewed["classes"] += 1
+            continue
+        fields = c.get("fields", [])
+        properties = c.get("properties") or [
+            f.get("name") or f.get("physical_name") for f in fields if isinstance(f, dict) and (f.get("name") or f.get("physical_name"))
+        ]
+        classes.append((
+            c["id"], scenario_id, c.get("name_cn", c["id"]), c.get("description", ""),
+            _json_text(properties), c.get("primary_key", ""), c.get("csv_file", ""),
+            _json_text(fields), _reviewed_value(c.get("is_reviewed", False)),
+        ))
+
+    rels = []
+    seen_rels = set(reviewed_rels)
+    seen_extracted_rels = set()
+    for r in raw_relationships:
+        key = _relationship_key(r)
+        if key in seen_extracted_rels:
+            skipped_duplicates["relationships"] += 1
+            continue
+        seen_extracted_rels.add(key)
+        if key in reviewed_rels:
+            skipped_reviewed["relationships"] += 1
+            continue
+        if key in seen_rels:
+            skipped_duplicates["relationships"] += 1
+            continue
+        seen_rels.add(key)
+        source, target, rel_type, source_key, target_key, join_key = key
+        rels.append((
+            scenario_id, source, target, rel_type, source_key, target_key, join_key,
+            r.get("description", ""), _reviewed_value(r.get("is_reviewed", False)),
+        ))
+
+    concepts = []
+    seen_concept_ids = set()
+    for c in raw_concepts:
+        concept_id = c.get("id")
+        if not concept_id:
+            continue
+        if concept_id in seen_concept_ids:
+            skipped_duplicates["concepts"] += 1
+            continue
+        seen_concept_ids.add(concept_id)
+        if c["id"] in reviewed_concepts:
+            skipped_reviewed["concepts"] += 1
+            continue
+        concepts.append((
+            c["id"], scenario_id, c.get("name", c["id"]), c.get("description", ""),
+            c.get("parent_id", ""), c.get("level", 0), c.get("concept_type", ""),
+            c.get("related_class", ""), _reviewed_value(c.get("is_reviewed", False)),
+        ))
+
+    metrics = []
+    seen_metric_ids = set()
+    for c in raw_metrics:
+        metric_id = c.get("id")
+        if not metric_id:
+            continue
+        if metric_id in seen_metric_ids:
+            skipped_duplicates["metrics"] += 1
+            continue
+        seen_metric_ids.add(metric_id)
+        if c["id"] in reviewed_metrics:
+            skipped_reviewed["metrics"] += 1
+            continue
+        metrics.append((
+            c["id"], scenario_id, c.get("name", c.get("name_cn", c["id"])), c.get("description", ""),
+            c.get("category", ""), c.get("target_class", ""), c.get("calculation", ""),
+            c.get("formula", ""), _json_text(c.get("dimensions")), _json_text(c.get("required_dimensions")),
+            c.get("filters_hint", ""), c.get("chart_type", "bar"), c.get("sort_order", 0),
+            _reviewed_value(c.get("is_reviewed", False)),
+        ))
+
+    if classes:
+        conn.executemany(
+            "INSERT INTO schema_classes (id, scenario_id, name_cn, description, properties, primary_key, csv_file, fields, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            classes,
+        )
+
+    if rels:
+        conn.executemany(
+            "INSERT INTO schema_relationships (scenario_id, source, target, type, source_key, target_key, join_key, description, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            rels,
+        )
 
     if metrics and len(metrics) > 0:
         conn.executemany(
-            "INSERT OR REPLACE INTO metrics (id, scenario_id, name, description, category, target_class, calculation, formula, required_dimensions, filters_hint, dimensions, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO metrics (id, scenario_id, name, description, category, target_class, calculation, formula, dimensions, required_dimensions, filters_hint, chart_type, sort_order, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             metrics,
         )
     if concepts and len(concepts) > 0:
         conn.executemany(
-            "INSERT OR REPLACE INTO concepts (id, scenario_id, name, level, parent_id, concept_type, related_class, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO concepts (id, scenario_id, name, description, parent_id, level, concept_type, related_class, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             concepts,
         )
 
     conn.commit()
+    final_total = {
+        "classes": conn.execute("SELECT COUNT(*) AS count FROM schema_classes WHERE scenario_id=?", (scenario_id,)).fetchone()["count"],
+        "relationships": conn.execute("SELECT COUNT(*) AS count FROM schema_relationships WHERE scenario_id=?", (scenario_id,)).fetchone()["count"],
+        "concepts": conn.execute("SELECT COUNT(*) AS count FROM concepts WHERE scenario_id=?", (scenario_id,)).fetchone()["count"],
+        "metrics": conn.execute("SELECT COUNT(*) AS count FROM metrics WHERE scenario_id=?", (scenario_id,)).fetchone()["count"],
+    }
     conn.close()
-    print(f"[SyncDB] {scenario_id}: {len(classes)} classes, {len(rels)} relationships, {len(concepts)} concepts")    
+    from modules.schema import _sync_schema_files
+    _sync_schema_files(scenario_id)
+    stats = {
+        "extracted": {
+            "classes": len(raw_classes),
+            "relationships": len(raw_relationships),
+            "concepts": len(raw_concepts),
+            "metrics": len(raw_metrics),
+        },
+        "inserted": {
+            "classes": len(classes),
+            "relationships": len(rels),
+            "concepts": len(concepts),
+            "metrics": len(metrics),
+        },
+        "preserved_reviewed": {
+            "classes": len(reviewed_classes),
+            "relationships": len(reviewed_rels),
+            "concepts": len(reviewed_concepts),
+            "metrics": len(reviewed_metrics),
+        },
+        "skipped_reviewed": skipped_reviewed,
+        "skipped_duplicates": skipped_duplicates,
+        "removed_unreviewed": removed_unreviewed,
+        "final_total": final_total,
+    }
+    print(f"[SyncDB] {scenario_id}: {_format_sync_summary(stats)}")
+    return stats
 
 
 def _run_extraction(scenario_id:str, business_name: str, batch_size: int,
-                         db_connection_url: str = ""):
+                         db_connection_url: str = "", log_id: str = ""):
     """后台执行分批提取，支持 CSV 和数据库直连两种数据源"""
     global extract_status
+    started_at = time.time()
     
     data_dir = os.path.join(Cfg.scenarios_root, scenario_id, "data")
     ontology_dir = os.path.join(Cfg.scenarios_root, scenario_id, "ontology")
@@ -259,11 +488,7 @@ def _run_extraction(scenario_id:str, business_name: str, batch_size: int,
 
     try:
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-        extractor = OntologyExtractor(
-            api_key = Cfg.openai_api_key,
-            base_url = Cfg.openai_base_url,
-            model = Cfg.model_name,
-        )
+        extractor = OntologyExtractor()
 
         result = extractor.run(
             input_dir=data_dir,
@@ -278,7 +503,16 @@ def _run_extraction(scenario_id:str, business_name: str, batch_size: int,
         extract_status["phase"] = "done"
         extract_status["result"] = result
 
-        _sync_schema_db(scenario_id=scenario_id)
+        sync_stats = _sync_schema_db(scenario_id=scenario_id)
+        extract_status["message"] = _format_sync_summary(sync_stats)
+        reset_engine(scenario_id)
+        if log_id:
+            finish_extraction_log(
+                log_id,
+                "success",
+                extract_status["message"],
+                round(time.time() - started_at, 2),
+            )
 
     except Exception as e:
         import traceback
@@ -286,6 +520,13 @@ def _run_extraction(scenario_id:str, business_name: str, batch_size: int,
         extract_status["running"] = False
         extract_status["phase"] = "error"
         extract_status["message"] = str(e)
+        if log_id:
+            finish_extraction_log(
+                log_id,
+                "failed",
+                str(e),
+                round(time.time() - started_at, 2),
+            )
 
 
 @router.get("/api/extract/status")

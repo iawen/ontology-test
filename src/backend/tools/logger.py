@@ -64,9 +64,14 @@ class Logger(object):
     @staticmethod
     def replace_blank(msg, *args, **kwargs):
         msg = str(msg)
-        if msg.find("%") != -1:
-            return msg
-        return f"{msg % args}".replace("\r", " ").replace("\n", " ")
+        try:
+            if args:
+                msg = msg % args
+            elif kwargs:
+                msg = msg % kwargs
+        except Exception:
+            msg = " ".join([msg, *(str(arg) for arg in args)])
+        return msg.replace("\r", " ").replace("\n", " ")
 
     def debug(self, msg, *args, **kwargs):
         self.logger.debug(self.replace_blank(msg, *args, **kwargs))

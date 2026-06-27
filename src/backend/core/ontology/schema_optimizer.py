@@ -222,7 +222,7 @@ class SchemaOptimizer:
 
         class_sql = "SELECT * FROM schema_classes WHERE scenario_id=?"
         if incremental:
-            class_sql += " AND COALESCE(is_reviewed, 0)=0"
+            class_sql += " AND is_reviewed IS NOT TRUE"
         if target_class_ids:
             placeholders = ",".join("?" * len(target_class_ids))
             class_sql += f" AND id IN ({placeholders})"
@@ -233,7 +233,7 @@ class SchemaOptimizer:
 
         metric_sql = "SELECT * FROM metrics WHERE scenario_id=?"
         if incremental:
-            metric_sql += " AND COALESCE(is_reviewed, 0)=0"
+            metric_sql += " AND is_reviewed IS NOT TRUE"
         metric_rows = conn.execute(metric_sql, (sid,)).fetchall()
         metrics = [_row_to_dict(r) for r in metric_rows]
 
@@ -244,7 +244,7 @@ class SchemaOptimizer:
 
         concept_sql = "SELECT * FROM concepts WHERE scenario_id=?"
         if incremental:
-            concept_sql += " AND COALESCE(is_reviewed, 0)=0"
+            concept_sql += " AND is_reviewed IS NOT TRUE"
         concept_rows = conn.execute(concept_sql, (sid,)).fetchall()
         concepts = [_row_to_dict(r) for r in concept_rows]
 
@@ -763,12 +763,12 @@ class SchemaOptimizer:
         )
         if exists:
             conn.execute(
-                "UPDATE schema_classes SET name_cn=?, description=?, primary_key=?, csv_file=?, is_reviewed=0, updated_at=CURRENT_TIMESTAMP WHERE id=? AND scenario_id=?",
+                "UPDATE schema_classes SET name_cn=?, description=?, primary_key=?, csv_file=?, is_reviewed=FALSE, updated_at=CURRENT_TIMESTAMP WHERE id=? AND scenario_id=?",
                 (*values, cid, sid),
             )
         else:
             conn.execute(
-                "INSERT INTO schema_classes (id, scenario_id, name_cn, description, primary_key, csv_file, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO schema_classes (id, scenario_id, name_cn, description, primary_key, csv_file, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 (cid, sid, *values),
             )
         return True
@@ -814,14 +814,14 @@ class SchemaOptimizer:
         )
         if exists:
             conn.execute(
-                """UPDATE metrics SET name=?, description=?, category=?, target_class=?, calculation=?, formula=?, dimensions=?, required_dimensions=?, filters_hint=?, chart_type=?, is_reviewed=0, updated_at=CURRENT_TIMESTAMP
+                """UPDATE metrics SET name=?, description=?, category=?, target_class=?, calculation=?, formula=?, dimensions=?, required_dimensions=?, filters_hint=?, chart_type=?, is_reviewed=FALSE, updated_at=CURRENT_TIMESTAMP
                    WHERE id=? AND scenario_id=?""",
                 (*values, mid, sid),
             )
         else:
             conn.execute(
                 """INSERT INTO metrics (id, scenario_id, name, description, category, target_class, calculation, formula, dimensions, required_dimensions, filters_hint, chart_type, is_reviewed, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
                 (mid, sid, *values),
             )
         return True
@@ -839,12 +839,12 @@ class SchemaOptimizer:
         )
         if exists:
             conn.execute(
-                "UPDATE concepts SET name=?, description=?, parent_id=?, level=?, concept_type=?, related_class=?, sort_order=?, is_reviewed=0, updated_at=CURRENT_TIMESTAMP WHERE id=? AND scenario_id=?",
+                "UPDATE concepts SET name=?, description=?, parent_id=?, level=?, concept_type=?, related_class=?, sort_order=?, is_reviewed=FALSE, updated_at=CURRENT_TIMESTAMP WHERE id=? AND scenario_id=?",
                 (*values, cid, sid),
             )
         else:
             conn.execute(
-                "INSERT INTO concepts (id, scenario_id, name, description, parent_id, level, concept_type, related_class, sort_order, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO concepts (id, scenario_id, name, description, parent_id, level, concept_type, related_class, sort_order, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 (cid, sid, *values),
             )
         return True

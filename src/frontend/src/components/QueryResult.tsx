@@ -89,8 +89,20 @@ function buildEChartsOption(data: QueryResultData, chartType: string) {
 }
 
 export default function QueryResult({ data, chartConfig, onDrilldown }: Props) {
-  const { rows, columns, class_name, total, aggregated, dimensions } = data;
+  const rows = Array.isArray(data.rows) ? data.rows : [];
+  const columns = Array.isArray(data.columns)
+    ? data.columns
+    : rows.length > 0
+      ? Object.keys(rows[0] || {})
+      : [];
+  const class_name = data.class_name || data.class_id || "查询结果";
+  const total = typeof data.total === "number" ? data.total : rows.length;
+  const { aggregated, dimensions } = data;
   const displayCols = columns.slice(0, 10);
+
+  if (rows.length === 0 || columns.length === 0) {
+    return null;
+  }
 
   // 自动推断图表类型
   const chartType = chartConfig?.chart_type || inferChartType(data);
@@ -104,9 +116,8 @@ export default function QueryResult({ data, chartConfig, onDrilldown }: Props) {
     <div className="my-3 space-y-3">
       {/* 图表区域 */}
       {option && aggregated && rows.length > 0 && (
-        <div className="rounded-xl border border-slate-200/60 dark:border-slate-700/40 bg-white/80 dark:bg-slate-800/60 overflow-hidden">
+        <div className="rounded-lg border border-slate-200/60 dark:border-slate-700/40 bg-white/80 dark:bg-slate-800/60 overflow-hidden">
           <div className="flex items-center gap-2 px-4 py-2 border-b border-slate-100 dark:border-slate-700/30">
-            <span className="text-lg">📊</span>
             <span className="font-semibold text-sm" style={{ color: "var(--text-primary)" }}>
               {class_name}
             </span>
@@ -125,16 +136,15 @@ export default function QueryResult({ data, chartConfig, onDrilldown }: Props) {
         <div className="flex flex-wrap gap-1.5 px-1">
           {drillableDims.map((dim) => (
             <span key={dim} className="text-xs text-slate-400">
-              💡 点击 {dim} 值可下钻查看明细
+              点击 {dim} 值可下钻查看明细
             </span>
           ))}
         </div>
       )}
 
       {/* 数据表格 */}
-      <div className="rounded-xl border border-slate-200/60 dark:border-slate-700/40 bg-white/80 dark:bg-slate-800/60 overflow-hidden">
+      <div className="rounded-lg border border-slate-200/60 dark:border-slate-700/40 bg-white/80 dark:bg-slate-800/60 overflow-hidden">
         <div className="flex items-center gap-2 px-4 py-2 border-b border-slate-100 dark:border-slate-700/30">
-          <span className="text-lg">📋</span>
           <span className="font-semibold text-sm" style={{ color: "var(--text-primary)" }}>
             {aggregated ? "数据明细" : class_name}
           </span>

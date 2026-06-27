@@ -1,7 +1,7 @@
 "use client";
 
 import { flushSync } from 'react-dom';
-import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
@@ -18,7 +18,38 @@ import ActionConfirmCard from "@/components/ActionConfirmCard";
 import PlanProgressCard from "@/components/PlanProgressCard";
 import LoginOverlay from "@/components/LoginOverlay";
 import SidebarPanel from "@/components/SidebarPanel";
+import ToolStepsPanel from "@/components/ToolStepsPanel";
 import type { Message, Conversation, Suggestion, ToolStep } from "@/lib/types";
+
+function normalizeQueryResult(value: any): QueryResultData | undefined {
+  if (!value || value.type !== "query_result" || value.error) return undefined;
+
+  const rows = Array.isArray(value.rows) ? value.rows : [];
+  const columns = Array.isArray(value.columns)
+    ? value.columns
+    : rows.length > 0
+      ? Object.keys(rows[0] || {})
+      : [];
+
+  if (rows.length === 0 || columns.length === 0) return undefined;
+
+  return {
+    ...value,
+    class_id: value.class_id || value.target_class || "query_result",
+    class_name: value.class_name || value.target_class || "查询结果",
+    columns,
+    rows,
+    total: typeof value.total === "number" ? value.total : (value.row_count ?? rows.length),
+  };
+}
+
+function pickLatestValidQueryResult(toolResults: any[]): QueryResultData | undefined {
+  for (let index = toolResults.length - 1; index >= 0; index -= 1) {
+    const normalized = normalizeQueryResult(toolResults[index]?.result);
+    if (normalized) return normalized;
+  }
+  return undefined;
+}
 
 function AppContent() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -189,7 +220,7 @@ function AppContent() {
     loadConversations();
   };
 
-  // ================= ⚡️ 核心改良：高性能高敏感度 SSE 响应引擎 =================
+  // SSE 响应引擎
   const sendMessage = async (text: string) => {
     if (!text.trim() || isTyping) return;
 
@@ -238,6 +269,8 @@ function AppContent() {
         body: JSON.stringify({ scenario_id: currentScenario, messages: chatHistory, conversation_id: convId }),
       });
 
+      if (!response.ok) throw new Error(`Chat API 请求失败: ${response.status}`);
+
       if (!response.body) throw new Error("ReadableStream 获取失败");
 
       const reader = response.body.getReader();
@@ -246,7 +279,9 @@ function AppContent() {
       let accumulatedContent = "";
       // 🌟 核心：使用局部追踪器，确保在 React 渲染周期内高频并发的数据引用被彻底断开，强制刷新 UI
       let currentSteps: ToolStep[] = [];
-      let actionConfirm = {};
+      let latestVisualization: VisualizationData | undefined = undefined;
+      let currentPlan: Message["plan"] | undefined = undefined;
+      let actionConfirm: Message["actionConfirm"] | undefined = undefined;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -263,6 +298,13 @@ function AppContent() {
             const event = JSON.parse(raw);
 
             switch (event.type) {
+              case "plan":
+                currentPlan = event;
+                setMessages((prev) =>
+                  prev.map((m) => (m.id === aiMsgId ? { ...m, plan: currentPlan, isLoading: false } : m))
+                );
+                break;
+
               case "text":
                 accumulatedContent += event.content;
                 flushSync(() => {
@@ -278,12 +320,17 @@ function AppContent() {
 
               case "tool":
                 // 1. 工具启动：创建全新的 Step 节点，状态设为 running
+                const startedAt = event.started_at ?? Date.now();
                 currentSteps = [
                   ...currentSteps,
                   { 
                     name: event.name, 
+                    description: event.description,
                     args: event.arguments || {}, 
-                    status: "running" 
+                    status: "running",
+                    startedAt,
+                    planningFinishedAt: event.planning_finished_at,
+                    planningDurationMs: event.planning_duration_ms,
                   }
                 ];
                 // 强制更新数组引用，让 React 的 Diff 引擎立刻捕捉并逐步渲染
@@ -300,21 +347,67 @@ function AppContent() {
 
               case "tool_result":
                 // 2. 工具执行完：精准定位正在运行的节点，将其升级为 completed
+                let completedOne = false;
+                const finishedAt = event.finished_at ?? Date.now();
                 currentSteps = currentSteps.map((step) => {
-                  if (step.name === event.name && step.status === "running") {
+                  if (!completedOne && step.name === event.name && step.status === "running") {
+                    completedOne = true;
+                    const hasError = Boolean(event.result?.error);
                     return { 
                       ...step, 
-                      status: "completed" as const, 
-                      result: event.result_preview 
+                      status: hasError ? "failed" as const : "completed" as const, 
+                      description: event.description ?? step.description,
+                      result: event.result_preview ?? event.result,
+                      startedAt: event.started_at ?? step.startedAt,
+                      planningFinishedAt: event.planning_finished_at ?? step.planningFinishedAt,
+                      planningDurationMs: event.planning_duration_ms ?? step.planningDurationMs,
+                      executionStartedAt: event.execution_started_at,
+                      executionDurationMs: event.execution_duration_ms,
+                      finishedAt,
+                      durationMs: event.duration_ms ?? (step.startedAt ? finishedAt - step.startedAt : undefined),
                     };
                   }
                   return step;
                 });
+
+                if (!completedOne) {
+                  currentSteps = [
+                    ...currentSteps,
+                    {
+                      name: event.name,
+                      description: event.description,
+                      args: {},
+                      status: event.result?.error ? "failed" : "completed",
+                      result: event.result_preview ?? event.result,
+                      startedAt: event.started_at ?? finishedAt,
+                      planningFinishedAt: event.planning_finished_at,
+                      planningDurationMs: event.planning_duration_ms,
+                      executionStartedAt: event.execution_started_at,
+                      executionDurationMs: event.execution_duration_ms,
+                      finishedAt,
+                      durationMs: event.duration_ms ?? 0,
+                    },
+                  ];
+                }
+
+                if (currentPlan?.steps) {
+                  let matchedPlanStep = false;
+                  currentPlan = {
+                    ...currentPlan,
+                    steps: currentPlan.steps.map((step) => {
+                      if (!matchedPlanStep && step.tool === event.name && step.status === "running") {
+                        matchedPlanStep = true;
+                        return { ...step, status: event.result?.error ? "failed" : "completed", result: event.result };
+                      }
+                      return step;
+                    }),
+                  };
+                }
                 
                 setMessages((prev) =>
                   prev.map((m) =>
                     m.id === aiMsgId
-                      ? { ...m, steps: [...currentSteps] }
+                      ? { ...m, steps: [...currentSteps], plan: currentPlan }
                       : m
                   )
                 );
@@ -333,29 +426,29 @@ function AppContent() {
                 break;
 
               case "action_confirm":
+                actionConfirm = event.data || event.action;
                 setMessages((prev) =>
-                  prev.map((m) => (m.id === aiMsgId ? { ...m, actionConfirm: event.data, isLoading: false } : m))
+                  prev.map((m) => (m.id === aiMsgId ? { ...m, actionConfirm, isLoading: false } : m))
                 );
-                actionConfirm = event.data || {};
                 break;
 
               case "chart_data":
-                setMessages((prev) =>
-                  prev.map((m) =>
-                    m.id === aiMsgId
-                      ? { ...m, visualization: event.data, chartConfig: event.chart_config || undefined, isLoading: false }
-                      : m
-                  )
-                );
+                latestVisualization = normalizeQueryResult(event.data);
+                if (latestVisualization) {
+                  setMessages((prev) =>
+                    prev.map((m) =>
+                      m.id === aiMsgId
+                        ? { ...m, visualization: latestVisualization, chartConfig: event.chart_config || undefined, isLoading: false }
+                        : m
+                    )
+                  );
+                }
                 break;
 
               case "done":
-                let finalViz: VisualizationData | undefined = undefined;
-                if (event.tool_results) {
-                  const queryResultTool = event.tool_results.find((t: any) => t.result?.type === "query_result");
-                  if (queryResultTool) {
-                    finalViz = queryResultTool.result;
-                  }
+                let finalViz: VisualizationData | undefined = latestVisualization;
+                if (Array.isArray(event.tool_results)) {
+                  finalViz = pickLatestValidQueryResult(event.tool_results) || finalViz;
                 }
 
                 setMessages((prev) =>
@@ -365,25 +458,12 @@ function AppContent() {
                           ...m,
                           isLoading: false,
                           visualization: finalViz || m.visualization,
+                          steps: currentSteps,
+                          plan: currentPlan || m.plan,
                         }
                       : m
                   )
                 );
-
-                // 异步持久化落库
-                const payloadAiMsg = {
-                  id: aiMsgId,
-                  role: "assistant" as const,
-                  content: accumulatedContent,
-                  timestamp: Date.now(),
-                  visualization: finalViz,
-                  steps: currentSteps,
-                  action_confirm: actionConfirm,
-                };
-                api(`/api/conversations/${convId}/messages`, {
-                  method: "POST",
-                  body: JSON.stringify({ messages: [userMsg, payloadAiMsg] }),
-                }).catch(() => {});
 
                 // 首问自动更替标题
                 if (messages.length === 0) {
@@ -398,7 +478,7 @@ function AppContent() {
               case "error":
                 setMessages((prev) =>
                   prev.map((m) =>
-                    m.id === aiMsgId ? { ...m, content: m.content + `\n\n❌ 智能体系统异常: ${event.content}`, isLoading: false } : m
+                    m.id === aiMsgId ? { ...m, content: m.content + `\n\n智能体系统异常: ${event.content}`, isLoading: false } : m
                   )
                 );
                 break;
@@ -410,7 +490,7 @@ function AppContent() {
       }      
     } catch (err: any) {
       setMessages((prev) =>
-        prev.map((m) => (m.id === aiMsgId ? { ...m, isLoading: false, content: `❌ 连接错误: ${err.message}` } : m))
+        prev.map((m) => (m.id === aiMsgId ? { ...m, isLoading: false, content: `连接错误: ${err.message}` } : m))
       );
     } finally {
       setIsTyping(false);
@@ -421,13 +501,13 @@ function AppContent() {
     sendMessage(`下钻查看 ${dimension}="${value}" 的详细数据`);
   };
 
-  // ================= ⚡️ 视觉与逻辑改良后的渲染引擎 =================
+  // 消息渲染
   const renderMessage = (msg: Message) => {
     if (msg.role === "user") {
       return (
         <div key={msg.id} className="flex justify-end mb-4">
           <div
-            className="max-w-[85%] px-4 py-2.5 rounded-2xl text-sm whitespace-pre-wrap shadow-sm border border-black/5"
+            className="max-w-[85%] px-4 py-2.5 rounded-lg text-sm leading-relaxed whitespace-pre-wrap shadow-sm border border-black/5"
             style={{
               background: "var(--accent)",
               color: "#fff",
@@ -441,49 +521,33 @@ function AppContent() {
 
     return (
       <div key={msg.id} className="flex justify-start mb-6">
-        <div className="w-full max-w-[95%] space-y-4">
-          
-          {/* 🌟 修正 1：完美对接 PlanProgressCard 的 data 属性 */}
+        <div className="w-full max-w-[95%] space-y-3">
           {msg.plan && msg.plan.steps && msg.plan.steps.length > 0 && (
-            <div className="transition-all duration-300">
-              <PlanProgressCard data={msg.plan} />
-            </div>
+            <PlanProgressCard data={msg.plan} />
           )}
 
-          {/* 🌟 修正 2：独立折叠的底层工具调用时序流 */}
           {msg.steps && msg.steps.length > 0 && (
-            <div
-              className="border rounded-xl p-3 space-y-2 max-h-80 overflow-y-auto shadow-sm"
-              style={{
-                borderColor: "var(--border)",
-                background: "var(--bg-primary)",
-              }}
-            >
-              {msg.steps.map((step, idx) => {
-                return <StepItem key={idx} step={step} />;
-              })}
-            </div>
+            <ToolStepsPanel steps={msg.steps} />
           )}
 
-          {/* 🌟 3. 无缝 Loading 保持不变 */}
           {msg.isLoading && !msg.content && (!msg.steps || msg.steps.length === 0) && (
             <div 
-              className="flex items-center gap-3 p-3 rounded-xl border max-w-sm animate-pulse text-xs shadow-sm"
+              className="flex items-center gap-3 px-3 py-2.5 rounded-lg border max-w-sm text-xs shadow-sm"
               style={{
                 borderColor: "var(--border)",
-                background: "var(--sidebar-bg)",
+                background: "var(--bg-card)",
                 color: "var(--text-muted)"
               }}
             >
-              <div className="flex h-2 w-2 relative">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-600"></span>
+              <div className="flex gap-1">
+                <span className="typing-dot"></span>
+                <span className="typing-dot"></span>
+                <span className="typing-dot"></span>
               </div>
-              <span>正在唤醒数智大脑，规划多维求解路径...</span>
+              <span>正在分析问题并准备上下文...</span>
             </div>
           )}
 
-          {/* 其余交互组件卡片及富文本渲染保持原样... */}
           {msg.clarification && (
             <ClarificationCard data={msg.clarification} onSelect={(optId, val) => sendMessage(val)} />
           )}
@@ -491,12 +555,12 @@ function AppContent() {
           {msg.drilldown && (
             <DrilldownCard
               data={msg.drilldown}
-              onDrill={(opt) => sendMessage(opt.dimension ? `按 ${opt.dimension} 维度分析：${opt.label}` : opt.label)}
+              onDrill={(opt) => sendMessage(opt.dimension ? `按 ${opt.dimension} 维度分析: ${opt.label}` : opt.label)}
             />
           )}
 
           {msg.content && (
-            <div className="md-content">
+            <div className="md-content rounded-lg border border-indigo-100 bg-white px-4 py-3 text-sm text-slate-800 shadow-sm dark:border-slate-700/60 dark:bg-slate-950/30 dark:text-slate-100">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
             </div>
           )}
@@ -510,7 +574,7 @@ function AppContent() {
           )}
 
           {msg.visualization && msg.visualization.type === "query_result" && (
-            <div className="max-w-full overflow-hidden rounded-xl border border-slate-200/60 dark:border-slate-800 shadow-sm">
+            <div className="max-w-full overflow-hidden rounded-lg border border-slate-200/60 dark:border-slate-800 shadow-sm">
               <QueryResult
                 data={msg.visualization as QueryResultData}
                 chartConfig={msg.chartConfig}
@@ -540,9 +604,9 @@ function AppContent() {
     );
   }
 
-  // ================= ⚡️ 布局改良：严格限制 max-w-4xl 且全局居中对齐 =================
+  // 主布局
   return (
-    <div className="flex h-screen bg-slate-50 dark:bg-slate-950 overflow-hidden text-slate-900 dark:text-slate-100 font-sans antialiased">
+    <div className="flex h-screen bg-slate-100 dark:bg-slate-950 overflow-hidden text-slate-900 dark:text-slate-100 font-sans antialiased">
       <SidebarPanel
         username={username}
         scenarios={scenarios}
@@ -561,31 +625,30 @@ function AppContent() {
       />
 
       {/* 主视图视窗 */}
-      <main className="flex-1 flex flex-col h-full bg-white dark:bg-slate-900 relative">
+      <main className="flex-1 flex flex-col h-full bg-slate-50 dark:bg-slate-900 relative">
         
-        {/* 对话滚动区域：使用 max-w-4xl mx-auto 强行让聊天流和底部输入框完美等宽、水平对齐 */}
+        {/* 对话滚动区域 */}
         <div className="flex-1 overflow-y-auto px-4 md:px-8 py-6">
           <div className="max-w-4xl mx-auto w-full space-y-6">
             {messages.length === 0 ? (
               <div className="h-[70vh] flex flex-col items-center justify-center text-center p-8">
-                <div className="p-4 bg-indigo-50 dark:bg-indigo-950/40 rounded-3xl text-indigo-600 dark:text-indigo-400 mb-4 shadow-inner text-3xl animate-bounce">
-                  🤖
+                <div className="mb-4 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 shadow-sm dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300">
+                  Ontology AI
                 </div>
                 <h2 className="text-2xl font-bold text-slate-800 dark:text-slate-200 mb-2 tracking-tight">
-                  欢迎来到 Ontology AI 管理看板
+                  开始一次数据分析会话
                 </h2>
                 <p className="text-xs text-slate-400 dark:text-slate-500 max-w-md mb-8">
-                  本体策略模型加载就绪，您可以选择下方推荐进行深度剖析：
+                  选择一个推荐问题，或直接输入你想查看的指标、维度和筛选条件。
                 </p>
                 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 w-full">
                   {suggestions.map((s) => (
                     <button
                       key={s.id}
                       onClick={() => sendMessage(s.question)}
-                      className="p-3.5 text-left bg-slate-50 dark:bg-slate-800/50 hover:bg-indigo-50/50 dark:hover:bg-indigo-950/30 border border-slate-200/80 dark:border-slate-800 rounded-2xl text-xs transition-all duration-200 hover:border-indigo-300 dark:hover:border-indigo-800 cursor-pointer group shadow-sm"
+                      className="p-3 text-left bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 border border-slate-200/80 dark:border-slate-800 rounded-lg text-xs transition-all duration-200 hover:border-indigo-300 dark:hover:border-indigo-800 cursor-pointer group shadow-sm"
                     >
-                      <span className="mr-2 group-hover:scale-125 inline-block transition-transform">{s.icon || "💡"}</span> 
                       <span className="font-medium text-slate-700 dark:text-slate-300 group-hover:text-indigo-600 dark:group-hover:text-indigo-400">
                         {s.question}
                       </span>
@@ -600,88 +663,28 @@ function AppContent() {
           </div>
         </div>
 
-        {/* 输入组件控制面板：保持 max-w-4xl mx-auto */}
-        <div className="p-4 border-t border-slate-100 dark:border-slate-800 bg-white/90 dark:bg-slate-900/90 backdrop-blur-md">
+        {/* 输入组件控制面板 */}
+        <div className="p-4 border-t border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md">
           <div className="max-w-4xl mx-auto flex gap-3 w-full">
             <input
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder={isTyping ? "AI 智能体正调用多维本体模型进行多步规划..." : "请向智能体提问..."}
+              placeholder={isTyping ? "正在处理当前问题..." : "输入指标、维度或业务问题..."}
               disabled={isTyping}
               onKeyDown={(e) => e.key === "Enter" && sendMessage(input)}
-              className="flex-1 px-4 py-3 rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 disabled:opacity-60 transition-all shadow-inner"
+              className="flex-1 px-4 py-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 disabled:opacity-60 transition-all shadow-inner"
             />
             <button
               onClick={() => sendMessage(input)}
               disabled={isTyping || !input.trim()}
-              className="px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-medium text-sm rounded-2xl transition-all disabled:opacity-40 cursor-pointer shadow-md shadow-indigo-600/10 hover:shadow-indigo-600/20 active:scale-95 shrink-0"
+              className="px-5 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-medium text-sm rounded-lg transition-all disabled:opacity-40 cursor-pointer shadow-sm active:scale-95 shrink-0"
             >
               发送
             </button>
           </div>
         </div>
       </main>
-    </div>
-  );
-}
-
-// ================= ⚡️ 新增：支持独立折叠/展开的算子组件 =================
-function StepItem({ step }: { step: ToolStep }) {
-  const [isOpen, setIsOpen] = useState(false);
-
-  return (
-    <div
-      className="p-3 rounded-lg border transition-all duration-200"
-      style={{
-        borderColor: "var(--border)",
-        background: "var(--sidebar-bg)",
-      }}
-    >
-      {/* 头部点击区域 */}
-      <div 
-        className="flex flex-wrap items-center justify-between gap-2 font-semibold text-xs cursor-pointer select-none"
-        onClick={() => setIsOpen(!isOpen)}
-      >
-        <span style={{ color: "var(--accent-light)" }} className="whitespace-normal flex items-center gap-1.5">
-          <span>{isOpen ? "🔽" : "▶️"}</span>
-          🛠️ 算子调度: { step.name }
-        </span>
-        <span
-          className={`px-2 py-0.5 rounded-md text-[10px] flex items-center gap-1 shrink-0 ${
-            step.status === "running" 
-              ? "bg-amber-500/10 text-amber-500 animate-pulse" 
-              : "bg-emerald-500/10 text-emerald-500"
-          }`}
-        >
-          {step.status === "running" ? (
-            <>
-              <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 animate-ping"></span>
-              执行中...
-            </>
-          ) : (
-            "✓ 已完成"
-          )}
-        </span>
-      </div>
-
-      {/* 折叠展开的内容区域 */}
-      {isOpen && step.args && Object.keys(step.args).length > 0 && (
-        <div className="mt-2 text-[11px] text-slate-500 dark:text-slate-400 border-t border-slate-200/40 dark:border-slate-800/40 pt-2 animate-fadeIn">
-          <span className="font-bold block mb-1 text-slate-600 dark:text-slate-400">约束条件与入参:</span>
-          <pre className="p-2 bg-slate-100/80 dark:bg-slate-950/50 rounded overflow-x-auto whitespace-pre-wrap break-all font-mono text-[10px] border border-slate-200/50 dark:border-slate-800/50 leading-relaxed">
-            {JSON.stringify(step.args, null, 2)}
-          </pre>
-          {step.result && (
-            <div className="mt-2">
-              <span className="font-bold block mb-1 text-slate-600 dark:text-slate-400">算子输出预览:</span>
-              <div className="p-2 bg-emerald-50/40 dark:bg-emerald-950/10 rounded border border-emerald-500/10 text-emerald-800 dark:text-emerald-400 max-h-32 overflow-y-auto">
-                {typeof step.result === "string" ? step.result : JSON.stringify(step.result)}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
     </div>
   );
 }

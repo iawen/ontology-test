@@ -67,6 +67,16 @@ def _reviewed_value(value) -> bool:
     return bool(value)
 
 
+def _relationship_exists(conn, scenario_id: str, source: str, target: str, rel_type: str, join_key: str, exclude_id: int | None = None) -> bool:
+    sql = """SELECT id FROM schema_relationships
+              WHERE scenario_id=? AND source=? AND target=? AND type=? AND COALESCE(join_key, '')=?"""
+    params: list = [scenario_id, source, target, rel_type, join_key or ""]
+    if exclude_id is not None:
+        sql += " AND id<>?"
+        params.append(exclude_id)
+    return conn.execute(sql, params).fetchone() is not None
+
+
 # ============================================================
 # Schema CRUD API — 前端管理面板路径
 # ============================================================
@@ -177,6 +187,9 @@ async def admin_list_relationships(scenario_id: str):
 async def admin_create_relationship(scenario_id: str, req: SchemaRelationEdit):
     """管理面板：新增 Schema 关系"""
     conn = get_db()
+    if _relationship_exists(conn, scenario_id, req.source, req.target, req.type, req.join_key):
+        conn.close()
+        raise HTTPException(400, "关系已存在，请勿重复添加")
     try:
         conn.execute(
             """INSERT INTO schema_relationships
@@ -198,6 +211,9 @@ async def admin_create_relationship(scenario_id: str, req: SchemaRelationEdit):
 async def admin_update_relationship(scenario_id: str, rel_id: int, req: SchemaRelationEdit):
     """管理面板：更新 Schema 关系"""
     conn = get_db()
+    if _relationship_exists(conn, scenario_id, req.source, req.target, req.type, req.join_key, exclude_id=rel_id):
+        conn.close()
+        raise HTTPException(400, "关系已存在，请勿重复添加")
     conn.execute(
         """UPDATE schema_relationships
               SET source=?, target=?, type=?, join_key=?, is_reviewed=?, updated_at=CURRENT_TIMESTAMP
@@ -297,8 +313,17 @@ async def update_schema_relationships(scenario_id: str, req: list[SchemaRelation
     with open(mapping_path, "r", encoding="utf-8") as f:
         mapping = json.load(f)
 
-    schema["relationships"] = [r.model_dump() for r in req]
-    mapping["relationships"] = [r.model_dump() for r in req]
+    deduped = []
+    seen = set()
+    for r in req:
+        key = (r.source, r.target, r.type, r.join_key or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+
+    schema["relationships"] = [r.model_dump() for r in deduped]
+    mapping["relationships"] = [r.model_dump() for r in deduped]
 
     with open(schema_path, "w", encoding="utf-8") as f:
         json.dump(schema, f, ensure_ascii=False, indent=2)
@@ -308,7 +333,7 @@ async def update_schema_relationships(scenario_id: str, req: list[SchemaRelation
     # 同步到数据库
     conn = get_db()
     conn.execute("DELETE FROM schema_relationships WHERE scenario_id=?", (scenario_id,))
-    for r in req:
+    for r in deduped:
         conn.execute(
             """INSERT INTO schema_relationships
                     (scenario_id, source, target, type, join_key, is_reviewed, created_at, updated_at)
@@ -357,11 +382,18 @@ def _sync_schema_files(scenario_id: str):
     rels = conn.execute(
         "SELECT * FROM schema_relationships WHERE scenario_id=?", (scenario_id,)
     ).fetchall()
+    metrics = conn.execute(
+        "SELECT * FROM metrics WHERE scenario_id=?", (scenario_id,)
+    ).fetchall()
+    concepts = conn.execute(
+        "SELECT * FROM concepts WHERE scenario_id=?", (scenario_id,)
+    ).fetchall()
     conn.close()
 
     parsed_classes = []
     mapping_classes = {}
-    for c in classes:
+    for row in classes:
+        c = dict(row)
         properties = _json_list(c["properties"])
         fields = _normalize_fields(_json_list(c["fields"]))
         if not properties:
@@ -387,15 +419,69 @@ def _sync_schema_files(scenario_id: str):
             "is_reviewed": _reviewed_value(c.get("is_reviewed", 0)),
         }
 
+    parsed_rels = []
+    mapping_rels = []
+    for row in rels:
+        r = dict(row)
+        join_key = r["join_key"] or (r["source_key"] if r["source_key"] == r["target_key"] else "")
+        rel_item = {
+            "source": r["source"],
+            "target": r["target"],
+            "type": r["type"],
+            "source_key": r["source_key"] or join_key,
+            "target_key": r["target_key"] or join_key,
+            "join_key": join_key,
+            "description": r["description"],
+            "is_reviewed": _reviewed_value(r.get("is_reviewed", 0)),
+        }
+        parsed_rels.append(rel_item)
+        mapping_rels.append(rel_item)
+
+    parsed_metrics = []
+    for row in metrics:
+        m = dict(row)
+        parsed_metrics.append({
+            "id": m["id"],
+            "name": m["name"],
+            "name_cn": m["name"],
+            "description": m["description"],
+            "category": m["category"],
+            "target_class": m["target_class"],
+            "calculation": m["calculation"],
+            "formula": m["formula"],
+            "dimensions": _json_list(m["dimensions"]),
+            "required_dimensions": _json_list(m["required_dimensions"]),
+            "filters_hint": m["filters_hint"],
+            "chart_type": m["chart_type"],
+            "sort_order": m["sort_order"],
+            "is_reviewed": _reviewed_value(m.get("is_reviewed", 0)),
+        })
+
+    parsed_concepts = []
+    for row in concepts:
+        c = dict(row)
+        parsed_concepts.append({
+            "id": c["id"],
+            "name": c["name"],
+            "description": c["description"],
+            "parent_id": c["parent_id"],
+            "level": c["level"],
+            "concept_type": c["concept_type"],
+            "related_class": c["related_class"],
+            "sort_order": c["sort_order"],
+            "is_reviewed": _reviewed_value(c.get("is_reviewed", 0)),
+        })
+
     schema = {
         "business_name": scenario_id,
         "classes": parsed_classes,
-        "relationships": [{"source": r["source"], "target": r["target"], "type": r["type"], "join_key": r["join_key"], "is_reviewed": _reviewed_value(r.get("is_reviewed", 0))} for r in rels],
-        "metrics": [],
+        "relationships": parsed_rels,
+        "concepts": parsed_concepts,
+        "metrics": parsed_metrics,
     }
     mapping = {
         "classes": mapping_classes,
-        "relationships": [{"source": r["source"], "target": r["target"], "join_key": r["join_key"], "is_reviewed": _reviewed_value(r.get("is_reviewed", 0))} for r in rels],
+        "relationships": mapping_rels,
     }
 
     os.makedirs(ontology_dir, exist_ok=True)

@@ -8,6 +8,7 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
 from core.models.models import ChatRequest
+from tools.logger import logger
 from .engine import ChatEngineV3
 
 
@@ -26,6 +27,12 @@ async def chat_v3(req: ChatRequest):
       4. 无状态子智能体（严格输入输出契约）
       5. 死循环防线（retry_count 限制）
     """
+    logger.info(
+        "Chat API request received: scenario_id=%s conversation_id=%s messages=%d",
+        req.scenario_id,
+        req.conversation_id,
+        len(req.messages or []),
+    )
     engine = ChatEngineV3()
     return StreamingResponse(
         engine.stream_chat(req),

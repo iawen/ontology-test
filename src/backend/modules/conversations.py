@@ -112,34 +112,6 @@ async def get_messages(conv_id: str, request: Request):
     return result
 
 
-@router.post("/api/conversations/{conv_id}/messages")
-async def save_message(conv_id: str, request: Request):
-    """保存一条消息"""
-    verify_token(request, Cfg.jwt_secret)
-    body = await request.json()
-    conn = get_db()
-    conn.executemany(
-        "INSERT INTO messages (id, conversation_id, role, content, visualization, steps, action_confirm) VALUES (?,?,?,?,?,?,?)",
-        [
-            (
-                msg.get("id") or str(uuid.uuid4())[:8], 
-                conv_id, 
-                msg.get("role", "user"), 
-                msg.get("content", ""), 
-                json.dumps(msg.get("visualization"), ensure_ascii=False, default=str) if msg.get("visualization") else "", 
-                json.dumps(msg.get("steps"), ensure_ascii=False, default=str) if msg.get("steps") else "",
-                json.dumps(msg.get("action_confirm"), ensure_ascii=False, default=str) if msg.get("action_confirm") else ""
-            ) 
-            for msg in body.get("messages", [{}])
-        ]
-    )
-    # 更新会话时间
-    conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (datetime.now(timezone.utc), conv_id))
-    conn.commit()
-    conn.close()
-    return {"status": "ok"}
-
-
 # ============================================================
 # 推荐问题
 # ============================================================

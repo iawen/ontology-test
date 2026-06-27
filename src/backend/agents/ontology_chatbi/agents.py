@@ -20,6 +20,8 @@ import json
 from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass
 
+from tools.logger import logger
+
 
 # ============================================================
 # Schema 检索 Agent
@@ -155,13 +157,13 @@ class SkillRouterAgent:
                 try:
                     res = json.loads(res)
                 except json.JSONDecodeError:
-                    print(f"[SkillRouter] 警告: 底层返回了非法的 JSON 字符串: {res}")
+                    logger.warning("Skill route returned invalid JSON: %s", res)
                     return []
                     
             return res if isinstance(res, list) else []
         except Exception as e:
             # 容错降级：记录日志，返回空列表，确保主流程不中断
-            print(f"[SkillRouter] 严重警告: 技能路由解析失败: {str(e)}")
+            logger.exception("Skill route failed: scenario_id=%s error=%s", scenario_id, str(e))
             return []
 
 # ============================================================
@@ -329,14 +331,21 @@ class ToolExecutor:
         try:
             result = self._dispatch_tool(tool_name, arguments, query_engine, engine)
 
-            # 后置自动校正：query_data 失败时尝试修正参数
+            # 后置自动校正：query_ontology_data 失败时尝试修正参数
             if (
-                tool_name == "query_data"
+                tool_name == "query_ontology_data"
                 and result.get("error")
                 and retry_count < self.MAX_RETRY
             ):
                 corrected_args = await self._auto_correct_args(arguments, query_engine)
                 if corrected_args != arguments:
+                    logger.info(
+                        "Tool args auto-corrected: scenario_id=%s tool=%s original=%s corrected=%s",
+                        self.scenario_id,
+                        tool_name,
+                        json.dumps(arguments, ensure_ascii=False, default=str)[:1000],
+                        json.dumps(corrected_args, ensure_ascii=False, default=str)[:1000],
+                    )
                     return await self.execute(
                         tool_name, corrected_args, query_engine, engine, retry_count + 1
                     )
@@ -345,13 +354,26 @@ class ToolExecutor:
 
         except Exception as e:
             if retry_count < self.MAX_RETRY:
+                logger.warning(
+                    "Tool execution failed, retrying: scenario_id=%s tool=%s retry=%d error=%s",
+                    self.scenario_id,
+                    tool_name,
+                    retry_count + 1,
+                    str(e),
+                )
                 return await self.execute(
                     tool_name, arguments, query_engine, engine, retry_count + 1
                 )
+            logger.exception(
+                "Tool execution failed after retries: scenario_id=%s tool=%s error=%s",
+                self.scenario_id,
+                tool_name,
+                str(e),
+            )
             return {"error": f"工具执行失败（已重试{retry_count}次）: {str(e)}"}
 
     async def _auto_correct_args(self, arguments: dict, query_engine) -> dict:
-        """后置自动校正：修正 query_data 的 filter 参数"""
+        """后置自动校正：修正 query_ontology_data 的 filter 参数"""
         corrected = dict(arguments)
         filters = corrected.get("filters", [])
         target_class = corrected.get("target_class", "")
@@ -385,7 +407,18 @@ class ToolExecutor:
         if name == "get_ontology_schema":
             class_id = args.get("class_id", "")
             if class_id:
-                return query_engine.get_class_sample(class_id)
+                info = engine.get_class_info(class_id)
+                if not info:
+                    return {"error": f"未找到 class: {class_id}"}
+                return {
+                    "class_id": class_id,
+                    "name_cn": info.get("name_cn", ""),
+                    "table_name": info.get("table_name", ""),
+                    "field_map": engine.get_field_map(class_id),
+                    "field_types": engine.get_field_types(class_id),
+                    "primary_key": info.get("primary_key", ""),
+                    "related_classes": engine.get_related_classes(class_id),
+                }
             else:
                 classes_str = "\n".join([
                     f"  {c['id']}（{c['name_cn']}）→ {engine.classes.get(c['id'], {}).get('csv_file', '')}"
@@ -408,7 +441,7 @@ class ToolExecutor:
                 metrics=args.get("metrics", []),
                 dimensions=args.get("dimensions", []),
                 filters=args.get("filters", []),
-                join_class=args.get("join_class", ""),
+                join_classes=args.get("join_classes", []),
                 order_by=args.get("order_by", ""),
                 limit=args.get("limit", 100),
                 having=args.get("having", []),
@@ -440,8 +473,17 @@ class ToolExecutor:
         #     return lookup_metric(self.scenario_id, args.get("metric_name", ""))
 
         elif name == "python_analyze":
-            from tools.python_analyize import python_analyze
-            return python_analyze(args.get("code", ""), args.get("df_data", []))
+            from agents.tools.python_analyize import python_analyze
+            query_history = args.get("query_history", [])
+            all_query_data = json.dumps(query_history, ensure_ascii=False, default=str)
+            last_result = query_history[-1].get("result", []) if query_history else []
+            data_json = json.dumps(last_result, ensure_ascii=False, default=str)
+            logger.info("Python analyze started: scenario_id=%s query_history=%d", self.scenario_id, len(query_history))
+            return python_analyze(
+                code=args.get("code", ""),
+                data_json=data_json,
+                all_query_data=all_query_data,
+            )
 
         # elif name == "list_available_actions":
         #     from modules.actions import get_available_actions

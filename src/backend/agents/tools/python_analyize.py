@@ -19,6 +19,28 @@ import pandas as pd
 import numpy as np
 
 
+def _to_jsonable(value: Any) -> Any:
+    """Convert pandas/numpy objects produced by analysis code into JSON-safe values."""
+    if isinstance(value, pd.DataFrame):
+        return _df_to_preview(value)
+    if isinstance(value, pd.Series):
+        return {
+            "name": value.name,
+            "index": [str(item) for item in value.head(50).index.tolist()],
+            "values": [_to_jsonable(item) for item in value.head(50).tolist()],
+            "total": int(len(value)),
+        }
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return [_to_jsonable(item) for item in value.tolist()]
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_jsonable(item) for item in value]
+    return value
+
+
 class SafeCodeExecutor:
     """安全的 Python 代码执行器，支持 AST 变换与错误自愈"""
 
@@ -163,6 +185,7 @@ class SafeCodeExecutor:
             'isinstance': isinstance, 'issubclass': issubclass,
             'hasattr': hasattr, 'getattr': getattr, 'setattr': setattr,
             'callable': callable, 'type': type, 'repr': repr, 'format': format,
+            'dir': dir,
             'any': any, 'all': all, 'chr': chr, 'ord': ord,
             'True': True, 'False': False, 'None': None,
             'Exception': Exception, 'ValueError': ValueError,
@@ -307,7 +330,7 @@ def python_analyze(code: str, data_json: str = "", all_query_data: str = "") -> 
         "result": final_result[:50000],
         "context": f"Python 分析成功完成。\n可用数据状态:\n{data_snapshot}",
         "error": False,
-        "data_preview": {k: (_df_to_preview(v) if isinstance(v, pd.DataFrame) else v) for k, v in result_vars.items()}
+        "data_preview": {k: _to_jsonable(v) for k, v in result_vars.items()}
     }
 
 

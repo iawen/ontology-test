@@ -7,10 +7,9 @@
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Query
 
 from core.db.db import get_db
-from core.models.models import ExtractionLogCreate
 
 router = APIRouter()
 
@@ -49,77 +48,20 @@ async def list_extraction_logs(
     return [dict(r) for r in rows]
 
 
-@router.post("/api/admin/extraction_logs")
-async def create_extraction_log(req: ExtractionLogCreate):
-    """创建提取日志记录（开始提取时调用）"""
-    log_id = str(uuid.uuid4())[:8]
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn = get_db()
-    try:
-        conn.execute(
-            """INSERT INTO extraction_logs
-               (id, scenario_id, type, status, started_at, trigger)
-               VALUES (?,?,?,?,?,?)""",
-            (log_id, req.scenario_id, req.type, "running", now, req.trigger),
-        )
-        conn.commit()
-    except Exception as e:
-        conn.close()
-        raise HTTPException(400, f"创建失败: {e}")
-    conn.close()
-    return {"id": log_id, "status": "ok"}
-
-
-@router.put("/api/admin/extraction_logs/{log_id}")
-async def update_extraction_log(log_id: str, body: dict):
-    """更新提取日志（提取完成/失败时调用）"""
-    conn = get_db()
-    sets, vals = [], []
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    status = body.get("status")
-    if status:
-        sets.append("status=?")
-        vals.append(status)
-        if status in ("success", "failed"):
-            sets.append("finished_at=?")
-            vals.append(now)
-
-    message = body.get("message")
-    if message is not None:
-        sets.append("message=?")
-        vals.append(message)
-
-    duration = body.get("duration")
-    if duration is not None:
-        sets.append("duration=?")
-        vals.append(duration)
-
-    if not sets:
-        conn.close()
-        return {"status": "ok"}
-
-    vals.append(log_id)
-    conn.execute(f"UPDATE extraction_logs SET {','.join(sets)} WHERE id=?", vals)
-    conn.commit()
-    conn.close()
-    return {"status": "ok"}
-
-
 # ============================================================
 # 内部工具：供其他模块调用记录提取日志
 # ============================================================
 
-def start_extraction_log(scenario_id: str, ext_type: str, trigger: str = "manual") -> str:
+def start_extraction_log(scenario_id: str, ext_type: str, trigger: str = "manual", message: str = "") -> str:
     """开始一条提取日志，返回 log_id"""
     log_id = str(uuid.uuid4())[:8]
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = get_db()
     conn.execute(
         """INSERT INTO extraction_logs
-           (id, scenario_id, type, status, started_at, trigger)
-           VALUES (?,?,?,?,?,?)""",
-        (log_id, scenario_id, ext_type, "running", now, trigger),
+           (id, scenario_id, type, status, started_at, trigger, message)
+           VALUES (?,?,?,?,?,?,?)""",
+        (log_id, scenario_id, ext_type, "running", now, trigger, message),
     )
     conn.commit()
     conn.close()
@@ -135,4 +77,5 @@ def finish_extraction_log(log_id: str, status: str, message: str = "", duration:
         (status, now, message, duration, log_id),
     )
     conn.commit()
+    conn.close()
     conn.close()

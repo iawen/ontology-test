@@ -1,13 +1,21 @@
 
 import os
 from pathlib import Path
-from dotenv import load_dotenv  
 from dotenv import load_dotenv
 
 
 load_dotenv()
 
 class Cfg:
+    project_name = os.getenv("PROJECT_NAME", "ontology-v2")
+
+    log_name = os.getenv("LOG_NAME", "app")
+    log_level = os.getenv("LOG_LEVEL", "INFO")
+    log_format = os.getenv(
+        "LOG_FORMAT",
+        "%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+
     base_dir = os.path.join(str(Path(__file__).resolve().parent.parent), "data")
     
     db_type = os.getenv("DB_TYPE", "sqlite3")

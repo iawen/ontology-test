@@ -67,6 +67,11 @@ class AgentState:
     pending_tool_calls: List[dict] = field(default_factory=list)  # LLM 返回的 tool_calls
     tool_call_records: List[ToolCallRecord] = field(default_factory=list)
     all_tool_results: List[dict] = field(default_factory=list)
+    tool_timings: Dict[str, dict] = field(default_factory=dict)
+
+    # 持久化输出
+    assistant_content: str = ""
+    action_confirm: Optional[dict] = None
 
     # 流式事件
     sse_events: List[dict] = field(default_factory=list)

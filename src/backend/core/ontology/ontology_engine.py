@@ -70,7 +70,10 @@ class OntologyEngine:
     def get_table_name(self, class_id: str) -> str:
         """获取 class 对应的物理表名"""
         info = self.classes.get(class_id, {})
-        return info.get("table_name", class_id)
+        table_name = info.get("table_name") or info.get("csv_file") or ""
+        if not table_name:
+            raise ValueError(f"class {class_id} 未配置固定物理表映射，请检查 schema_mapping.json")
+        return table_name.replace(".csv", "") if table_name.endswith(".csv") else table_name
 
     def get_field_map(self, class_id: str) -> dict:
         """获取 class 的字段映射（逻辑名 -> 物理列名）"""
@@ -121,7 +124,11 @@ class OntologyEngine:
     def get_metric_info(self, metric_id_or_name: str) -> Optional[dict]:
         """根据指标 ID 或中文名查找 schema.json 中定义的完整指标元数据"""
         for m in self.metrics:
-            if m.get("id") == metric_id_or_name or m.get("name_cn") == metric_id_or_name:
+            if (
+                m.get("id") == metric_id_or_name
+                or m.get("name") == metric_id_or_name
+                or m.get("name_cn") == metric_id_or_name
+            ):
                 return m
         return None
 

@@ -27,6 +27,7 @@ class DataQueryEngine:
         self._registered_tables: set = set()
         self.db_connection_url = db_connection_url
         self._db_engine = None
+        self._resolved_table_names: dict[str, str] = {}
 
         if self.db_connection_url:
             try:
@@ -35,12 +36,65 @@ class DataQueryEngine:
                 print("[Warning] sqlalchemy not installed, falling back to SQLite")
 
     def _quote_ident(self, identifier: str) -> str:
+        if identifier is None or str(identifier).strip() == "":
+            raise ValueError("SQL 标识符为空：请检查指标 formula/field、字段映射或表名配置")
+        identifier = str(identifier)
         if self._db_engine:
             return self._db_engine.dialect.identifier_preparer.quote(identifier)
         return f'"{identifier.replace(chr(34), chr(34) + chr(34))}"'
 
     def _quote_table(self, table_name: str) -> str:
+        if table_name is None or str(table_name).strip() == "":
+            raise ValueError("SQL 表名为空：请检查 class 的 table_name/csv_file 配置")
+        table_name = str(table_name)
         return ".".join(self._quote_ident(part) for part in table_name.split("."))
+
+    def _table_exists(self, table_name: str) -> bool:
+        if not self._db_engine:
+            return True
+        try:
+            from sqlalchemy import inspect
+            inspector = inspect(self._db_engine)
+            if "." in table_name:
+                schema, table = table_name.rsplit(".", 1)
+                return inspector.has_table(table, schema=schema)
+            return inspector.has_table(table_name)
+        except Exception:
+            return False
+
+    def _table_name_candidates(self, table_name: str) -> list[str]:
+        base = str(table_name or "").strip()
+        candidates = []
+        for candidate in [base, re.sub(r"\.csv$", "", base, flags=re.IGNORECASE)]:
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+
+        expanded = list(candidates)
+        for candidate in expanded:
+            normalized = re.sub(r"_\d{8,14}$", "", candidate)
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+        return candidates
+
+    def _resolve_table_name(self, class_id: str) -> str:
+        if class_id in self._resolved_table_names:
+            return self._resolved_table_names[class_id]
+
+        mapped_table = self.oe.get_table_name(class_id)
+        if not self._db_engine:
+            self._resolved_table_names[class_id] = mapped_table
+            return mapped_table
+
+        candidates = self._table_name_candidates(mapped_table)
+        for candidate in candidates:
+            if self._table_exists(candidate):
+                self._resolved_table_names[class_id] = candidate
+                return candidate
+
+        raise ValueError(
+            f"class {class_id} 映射的物理表不存在: {mapped_table}；已尝试: {', '.join(candidates)}。"
+            "请检查 schema_mapping.json 或当前场景的数据连接。"
+        )
 
     def _col_ref(self, alias: str, physical_col: str) -> str:
         col = self._quote_ident(physical_col)
@@ -82,7 +136,7 @@ class DataQueryEngine:
         csv_path = self.oe.data_dir / csv_file
         if not csv_path.exists():
             return
-        table_name = self.oe.get_table_name(class_id)
+        table_name = self._resolve_table_name(class_id)
         df = pd.read_csv(str(csv_path), encoding="utf-8-sig")
         conn = self._get_connection()
         if not self._db_engine:
@@ -90,7 +144,89 @@ class DataQueryEngine:
         self._registered_tables.add(class_id)
 
     def _map_field(self, class_id: str, field_name: str) -> str:
+        if field_name is None or str(field_name).strip() == "":
+            raise ValueError(f"字段名为空：class={class_id}")
         return self.oe.map_field(class_id, field_name)
+
+    def _class_physical_fields(self, class_id: str) -> set[str]:
+        field_map = self.oe.get_field_map(class_id)
+        fields = set(field_map.values()) | set(field_map.keys())
+        return {str(field) for field in fields if field}
+
+    def _valid_mapped_keys(self, class_id: str, keys: list[str]) -> list[str]:
+        physical_fields = self._class_physical_fields(class_id)
+        mapped = []
+        for key in keys:
+            physical = self.oe.map_field(class_id, key)
+            if physical in physical_fields:
+                mapped.append(physical)
+        return mapped
+
+    def _build_join_condition(self, s_class: str, s_alias: str, t_class: str, t_alias: str, rel: dict) -> str:
+        source_keys = [k.strip() for k in rel.get("source_key", "").split(",") if k.strip()]
+        target_keys = [k.strip() for k in rel.get("target_key", "").split(",") if k.strip()]
+        mapped_source_keys = self._valid_mapped_keys(s_class, source_keys)
+        mapped_target_keys = self._valid_mapped_keys(t_class, target_keys)
+
+        if not mapped_source_keys or not mapped_target_keys:
+            return "1=1"
+
+        if len(mapped_source_keys) == len(mapped_target_keys):
+            parts = [
+                f'{self._col_ref(s_alias, sk)} = {self._col_ref(t_alias, tk)}'
+                for sk, tk in zip(mapped_source_keys, mapped_target_keys)
+            ]
+            return " AND ".join(parts)
+
+        if len(mapped_source_keys) == 1:
+            source_col = self._col_ref(s_alias, mapped_source_keys[0])
+            return " OR ".join(f'{source_col} = {self._col_ref(t_alias, tk)}' for tk in mapped_target_keys)
+
+        if len(mapped_target_keys) == 1:
+            target_col = self._col_ref(t_alias, mapped_target_keys[0])
+            return " OR ".join(f'{self._col_ref(s_alias, sk)} = {target_col}' for sk in mapped_source_keys)
+
+        parts = [
+            f'{self._col_ref(s_alias, sk)} = {self._col_ref(t_alias, tk)}'
+            for sk, tk in zip(mapped_source_keys, mapped_target_keys)
+        ]
+        return " AND ".join(parts) if parts else "1=1"
+
+    def _metric_class(self, metric_info: dict, default_class: str) -> str:
+        return metric_info.get("class_id") or metric_info.get("target_class") or default_class
+
+    def _extract_formula_field(self, formula: str) -> Optional[str]:
+        if not formula:
+            return None
+        match = re.search(r"\b(?:SUM|AVG|MIN|MAX|COUNT)\s*\(\s*(?:DISTINCT\s+)?([A-Za-z_][\w]*)\s*\)", formula, re.IGNORECASE)
+        return match.group(1) if match else None
+
+    def _extract_formula_aggregation(self, formula: str) -> Optional[str]:
+        if not formula:
+            return None
+        match = re.search(r"\b(SUM|AVG|MIN|MAX|COUNT)\s*\(", formula, re.IGNORECASE)
+        return match.group(1).upper() if match else None
+
+    def _metric_expr(self, metric_info: dict, metric_name: str, default_class: str, alias_map: dict) -> str:
+        cls = self._metric_class(metric_info, default_class)
+        alias = alias_map.get(cls, "t0")
+        formula = str(metric_info.get("formula") or "").strip()
+        logical_field = metric_info.get("field") or self._extract_formula_field(formula)
+
+        if logical_field:
+            p_col = self.oe.map_field(cls, logical_field)
+            agg_func = (metric_info.get("aggregation") or self._extract_formula_aggregation(formula) or "SUM").upper()
+            return f'{agg_func}({self._col_ref(alias, p_col)})'
+
+        if formula:
+            return formula
+
+        cls = self.oe.find_class_by_field(metric_name) or default_class
+        alias = alias_map.get(cls, "t0")
+        p_col = self.oe.map_field(cls, metric_name)
+        f_type = self.oe.get_field_type(cls, metric_name)
+        agg_func = "SUM" if f_type == "numeric" else "COUNT"
+        return f'{agg_func}({self._col_ref(alias, p_col)})'
 
     ALLOWED_OPERATORS = {
         "=", "!=", "<>", ">", "<", ">=", "<=",
@@ -181,7 +317,9 @@ class DataQueryEngine:
         for m in metrics:
             m_info = self.oe.get_metric_info(m)
             if m_info:
-                discovered_classes.add(m_info.get("class_id"))
+                metric_class = self._metric_class(m_info, target_class)
+                if metric_class:
+                    discovered_classes.add(metric_class)
             else:
                 cls = self.oe.find_class_by_field(m)
                 if cls: discovered_classes.add(cls)
@@ -217,6 +355,8 @@ class DataQueryEngine:
                 for rel in path:
                     s_class = rel["source"]
                     t_class = rel["target"]
+                    self._register_csv(s_class)
+                    self._register_csv(t_class)
                     
                     if t_class in alias_map:
                         continue  # 共享节点，跳过防止重复 JOIN
@@ -226,17 +366,9 @@ class DataQueryEngine:
                     alias_map[t_class] = t_alias
                     alias_counter += 1
                     
-                    t_table = self.oe.get_table_name(t_class)
-                    source_keys = [k.strip() for k in rel.get("source_key", "").split(",") if k.strip()]
-                    target_keys = [k.strip() for k in rel.get("target_key", "").split(",") if k.strip()]
-                    
-                    if source_keys and target_keys:
-                        mapped_source_keys = [self.oe.map_field(s_class, k) for k in source_keys]
-                        mapped_target_keys = [self.oe.map_field(t_class, k) for k in target_keys]
-                        on_parts = [f'{self._col_ref(s_alias, sk)} = {self._col_ref(t_alias, tk)}' for sk, tk in zip(mapped_source_keys, mapped_target_keys)]
-                        join_sql = f'LEFT JOIN {self._quote_table(t_table)} AS {t_alias} ON {" AND ".join(on_parts)}'
-                    else:
-                        join_sql = f'LEFT JOIN {self._quote_table(t_table)} AS {t_alias} ON 1=1'
+                    t_table = self._resolve_table_name(t_class)
+                    on_clause = self._build_join_condition(s_class, s_alias, t_class, t_alias, rel)
+                    join_sql = f'LEFT JOIN {self._quote_table(t_table)} AS {t_alias} ON {on_clause}'
                     join_parts.append(join_sql)
 
         # ── 3. 构建多表解耦的 SELECT 与 GROUP BY ──
@@ -256,12 +388,7 @@ class DataQueryEngine:
         for metric in metrics:
             m_info = self.oe.get_metric_info(metric)
             if m_info:
-                cls = m_info.get("class_id", target_class)
-                alias = alias_map.get(cls, "t0")
-                logical_field = m_info.get("field")
-                p_col = self.oe.map_field(cls, logical_field)
-                agg_func = m_info.get("aggregation", "SUM").upper()
-                select_parts.append(f'{agg_func}({self._col_ref(alias, p_col)}) AS {self._alias_ref(metric)}')
+                select_parts.append(f'{self._metric_expr(m_info, metric, target_class, alias_map)} AS {self._alias_ref(metric)}')
             else:
                 # 兼容降级逻辑
                 cls = self.oe.find_class_by_field(metric) or target_class
@@ -297,11 +424,7 @@ class DataQueryEngine:
             
             m_info = self.oe.get_metric_info(h_field)
             if m_info:
-                cls = m_info.get("class_id", target_class)
-                alias = alias_map.get(cls, "t0")
-                p_col = self.oe.map_field(cls, m_info.get("field"))
-                agg = m_info.get("aggregation", "SUM").upper()
-                having_parts.append(f'{agg}({self._col_ref(alias, p_col)}) {op} {val}')
+                having_parts.append(f'{self._metric_expr(m_info, h_field, target_class, alias_map)} {op} {val}')
             else:
                 cls = self.oe.find_class_by_field(h_field) or target_class
                 alias = alias_map.get(cls, "t0")
@@ -321,11 +444,7 @@ class DataQueryEngine:
 
                 m_info = self.oe.get_metric_info(ob_clean)
                 if m_info:
-                    cls = m_info.get("class_id", target_class)
-                    alias = alias_map.get(cls, "t0")
-                    p_col = self.oe.map_field(cls, m_info.get("field"))
-                    agg = m_info.get("aggregation", "SUM").upper()
-                    order_parts.append(f'{agg}({self._col_ref(alias, p_col)}) {ob_dir}')
+                    order_parts.append(f'{self._metric_expr(m_info, ob_clean, target_class, alias_map)} {ob_dir}')
                 else:
                     cls = self.oe.find_class_by_field(ob_clean) or target_class
                     alias = alias_map.get(cls, "t0")
@@ -339,7 +458,7 @@ class DataQueryEngine:
             order_clause = ", ".join(order_parts)
 
         # ── 7. 拼装大一统 SQL ──
-        sql = f"SELECT {', '.join(select_parts)}\nFROM {self._quote_table(self.oe.get_table_name(target_class))} AS t0"
+        sql = f"SELECT {', '.join(select_parts)}\nFROM {self._quote_table(self._resolve_table_name(target_class))} AS t0"
         if join_parts:
             sql += "\n" + "\n".join(join_parts)
         if where_parts:
@@ -376,7 +495,7 @@ class DataQueryEngine:
         """模糊搜索字段值，用于实体消歧"""
         self._register_csv(class_id)
 
-        table_name = self.oe.get_table_name(class_id)
+        table_name = self._resolve_table_name(class_id)
         physical_col = self._map_field(class_id, field_name)
 
         # 防注入：转义 keyword
@@ -413,7 +532,7 @@ class DataQueryEngine:
         """获取 class 的样本数据"""
         self._register_csv(class_id)
 
-        table_name = self.oe.get_table_name(class_id)
+        table_name = self._resolve_table_name(class_id)
         sql = f'SELECT * FROM {self._quote_table(table_name)} LIMIT {limit}'
 
         try:

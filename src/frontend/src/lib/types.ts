@@ -120,7 +120,7 @@ export interface PlanStep {
 /** Plan 数据 */
 export interface PlanData {
   title: string;
-  // plan_description: string;
+  plan_description?: string;
   steps: PlanStep[];
   current_step?: number;
   total_steps?: number;
@@ -139,9 +139,17 @@ export interface ChartConfigData {
 
 export interface ToolStep {
   name: string;
+  description?: string;
   args?: any;
   result?: any;
   status: "running" | "completed" | "failed";
+  startedAt?: number;
+  planningFinishedAt?: number;
+  planningDurationMs?: number;
+  executionStartedAt?: number;
+  executionDurationMs?: number;
+  finishedAt?: number;
+  durationMs?: number;
 }
 
 export interface ToolStepsPanelProps {
