@@ -46,14 +46,6 @@ def _build_ontology_context(engine: OntologyEngine, scenario_id: str) -> str:
 
     # ── 2. Logic：指标 + 概念 + 术语 + 技能 ──
     metrics_str = _build_metrics_summary(scenario_id)
-    concepts_str = _build_concepts_summary(scenario_id)
-    glossary_str = _build_glossary_summary(scenario_id)
-    skills_str = _build_skills_summary(scenario_id)
-    chart_rules_str = _build_chart_rules_summary(scenario_id)
-
-    # ── 3. Action：可用行动 ──
-    actions_str = _build_actions_summary(scenario_id)
-    alert_rules_str = _build_alert_rules_summary(scenario_id)
 
     return f"""
 # 本体知识库（Ontology）
@@ -70,26 +62,6 @@ def _build_ontology_context(engine: OntologyEngine, scenario_id: str) -> str:
 
 ### 指标（Metrics）
 {metrics_str}
-
-### 概念层级（Concepts）
-{concepts_str}
-
-### 专用术语（Glossary）
-{glossary_str}
-
-### 技能包（Skills）
-{skills_str}
-
-### 图表推荐规则（Chart Rules）
-{chart_rules_str}
-
-## 三、Action（行动层）— 可执行操作
-
-### 可用行动（Actions）
-{actions_str}
-
-### 告警规则（Alert Rules）
-{alert_rules_str}
 """
 
 
@@ -300,22 +272,22 @@ def _build_system_prompt(engine: OntologyEngine, scenario_id: str) -> str:
 
 def _build_tools() -> list[dict]:
     return [
-        # {
-        #     "type": "function",
-        #     "function": {
-        #         "name": "get_ontology_schema",
-        #         "description": "获取本体 Schema 信息。不传 class_id 返回所有 class 概览；传入 class_id 返回该 class 的详细字段映射、字段类型和关联关系。",
-        #         "parameters": {
-        #             "type": "object",
-        #             "properties": {
-        #                 "class_id": {
-        #                     "type": "string",
-        #                     "description": "实体类 ID（可选，不传则返回全部概览）"
-        #                 }
-        #             }
-        #         }
-        #     }
-        # },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_ontology_schema",
+                "description": "获取本体 Schema 信息。不传 class_id 返回所有 class 概览；传入 class_id 返回该 class 的详细字段映射、字段类型和关联关系。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "class_id": {
+                            "type": "string",
+                            "description": "实体类 ID（可选，不传则返回全部概览）"
+                        }
+                    }
+                }
+            }
+        },
         {
             "type": "function",
             "function": {
@@ -351,10 +323,6 @@ def _build_tools() -> list[dict]:
                             },
                             "description": "过滤条件列表，每项必须包含 field 和 operator"
                         },
-                        # "join_class": {
-                        #     "type": "string",
-                        #     "description": "关联的单个 class ID（向后兼容）"
-                        # },
                         "join_classes": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -382,44 +350,44 @@ def _build_tools() -> list[dict]:
                 }
             }
         },
-        # {
-        #     "type": "function",
-        #     "function": {
-        #         "name": "get_field_types",
-        #         "description": "获取指定 class 的字段类型声明。用于确认字段是 text 还是 numeric，确保过滤条件的类型安全。",
-        #         "parameters": {
-        #             "type": "object",
-        #             "properties": {
-        #                 "class_id": {
-        #                     "type": "string",
-        #                     "description": "实体类 ID"
-        #                 }
-        #             },
-        #             "required": ["class_id"]
-        #         }
-        #     }
-        # },
-        # {
-        #     "type": "function",
-        #     "function": {
-        #         "name": "get_join_path",
-        #         "description": "获取两个 class 之间的 JOIN 路径。如果两个 class 没有直接关系，系统会尝试多跳路径推导。",
-        #         "parameters": {
-        #             "type": "object",
-        #             "properties": {
-        #                 "source": {
-        #                     "type": "string",
-        #                     "description": "起始 class ID"
-        #                 },
-        #                 "target": {
-        #                     "type": "string",
-        #                     "description": "目标 class ID"
-        #                 }
-        #             },
-        #             "required": ["source", "target"]
-        #         }
-        #     }
-        # },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_field_types",
+                "description": "获取指定 class 的字段类型声明。用于确认字段是 text 还是 numeric，确保过滤条件的类型安全。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "class_id": {
+                            "type": "string",
+                            "description": "实体类 ID"
+                        }
+                    },
+                    "required": ["class_id"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_join_path",
+                "description": "获取两个 class 之间的 JOIN 路径。如果两个 class 没有直接关系，系统会尝试多跳路径推导。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "起始 class ID"
+                        },
+                        "target": {
+                            "type": "string",
+                            "description": "目标 class ID"
+                        }
+                    },
+                    "required": ["source", "target"]
+                }
+            }
+        },
         {
             "type": "function",
             "function": {

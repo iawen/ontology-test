@@ -197,7 +197,7 @@ class ContextCompressorAgent:
 class EntityDisambiguatorAgent:
     """
     实体消歧：在 SQL 生成前预查标准值。
-    解决问题2：SQL 参数不对齐（如"江苏省"vs"江苏"）。
+    解决问题2：SQL 参数不对齐
 
     契约：
       输入: user_message, relevant_classes, query_engine
