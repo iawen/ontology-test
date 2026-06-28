@@ -19,6 +19,8 @@ from datetime import datetime
 from core.llm.chat_model import get_async_client, get_model_name
 from core.db.db import get_db
 from pydantic import ValidationError
+from core.ontology.ontology_asset_validator import validate_schema_assets
+from core.ontology.schema_context import load_schema_reference_context
 
 from core.models.schema_model import (
     OptimizationBatchResult,
@@ -121,6 +123,7 @@ class SchemaOptimizer:
     def __init__(self, scenario_id: str):
         self.scenario_id = scenario_id
         self.doc_index = DocumentIndex()  # 不再需要 embedding 初始化
+        self.schema_reference_context = {}
 
     # --------------------------------------------------------
     # 主入口
@@ -146,6 +149,7 @@ class SchemaOptimizer:
 
             await _emit_progress(progress_callback, phase="loading", progress=20, total=100, message="加载当前 Schema 资产")
             classes, relationships, metrics, concepts = self._load_schema_assets(incremental, target_class_ids)
+            self.schema_reference_context = load_schema_reference_context(self.scenario_id)
 
             if not classes and not metrics:
                 await _emit_progress(progress_callback, running=False, phase="done", progress=100, total=100, message="无可优化资产")
@@ -160,6 +164,7 @@ class SchemaOptimizer:
             global_result = await self._run_global_correction(batch_results, progress_callback)
 
             merged = self._merge_results(batch_results, global_result)
+            merged = self._validate_optimization_assets(merged)
 
             await _emit_progress(progress_callback, phase="diffing", progress=78, total=100, message="生成差异报告")
             diff = self._generate_diff(classes, metrics, relationships, concepts, merged)
@@ -437,10 +442,16 @@ class SchemaOptimizer:
 
     def _build_batch_prompt(self, batch: Dict, doc_context: str) -> str:
         """构建批次优化提示词"""
+        schema_reference = json.dumps(self.schema_reference_context, ensure_ascii=False, indent=2) if self.schema_reference_context else "{}"
         return f"""你是数据仓库建模与本体论专家。请根据以下业务文档和当前 Schema 资产，优化实体类、指标、关系和概念。
 
 ## 业务文档片段（RAG 检索）
 {doc_context}
+
+## 已有本体资产参考（已压缩）
+reviewed 中的资产是人工审核确认过的高可信业务口径，只能学习和参考，不得改写、覆盖或生成与其冲突的 Class、Metric、Relationship、Concept。
+existing_unreviewed 中的资产是此前提取或优化得到的已有上下文，后续优化应增量更新或合并，不要因为当前批次未覆盖就删除、重建或改名。
+{schema_reference}
 
 ## 当前批次 Schema 资产
 {json.dumps(batch, ensure_ascii=False, indent=2)}
@@ -450,6 +461,7 @@ class SchemaOptimizer:
 2. **Metric 优化**：根据文档修正 name、description、formula、dimensions、required_dimensions
 3. **Relationship 优化**：根据文档补充或修正 source_key/target_key
 4. **Concept 优化**：根据文档补充概念层级
+5. **已有资产保护**：如果优化建议与 reviewed 冲突，必须以 reviewed 为准；如果与 existing_unreviewed 重复，应增量修正原 ID，不要新建近似重复资产。
 
 ## 输出要求
 输出标准 JSON，结构如下：
@@ -670,6 +682,92 @@ class SchemaOptimizer:
             "concepts": list(all_concepts.values()),
         }
 
+    def _validate_optimization_assets(self, merged: Dict) -> Dict:
+        """使用与提取阶段一致的物理字段/引用校验规则过滤优化结果。"""
+        current_classes, _, _, current_concepts = self._load_schema_assets(incremental=False, target_class_ids=None)
+        class_context = {item.get("id", ""): self._normalize_class_for_validation(item) for item in current_classes if item.get("id")}
+        summaries = self._build_validation_summaries(list(class_context.values()))
+        for item in merged.get("classes", []):
+            cid = item.get("id", "")
+            if not cid:
+                continue
+            base = class_context.get(cid, {})
+            merged_item = {**base, **item}
+            if not item.get("fields") and base.get("fields"):
+                merged_item["fields"] = base.get("fields")
+            if not item.get("properties") and base.get("properties"):
+                merged_item["properties"] = base.get("properties")
+            if not item.get("csv_file") and base.get("csv_file"):
+                merged_item["csv_file"] = base.get("csv_file")
+            if not item.get("table_name") and base.get("table_name"):
+                merged_item["table_name"] = base.get("table_name")
+            class_context[cid] = self._normalize_class_for_validation(merged_item)
+
+        concept_context = {item.get("id", ""): item for item in current_concepts if item.get("id")}
+        for item in merged.get("concepts", []):
+            cid = item.get("id", "")
+            if cid:
+                concept_context[cid] = {**concept_context.get(cid, {}), **item}
+
+        validation_schema = {
+            "business_name": self.scenario_id,
+            "classes": list(class_context.values()),
+            "relationships": merged.get("relationships", []),
+            "metrics": merged.get("metrics", []),
+            "concepts": list(concept_context.values()),
+        }
+        cleaned = validate_schema_assets(validation_schema, summaries)
+
+        merged_class_ids = {item.get("id") for item in merged.get("classes", []) if item.get("id")}
+        merged_concept_ids = {item.get("id") for item in merged.get("concepts", []) if item.get("id")}
+        cleaned_metrics = cleaned.get("metrics", [])
+        for metric in cleaned_metrics:
+            metric["dimensions"] = _json_list(metric.get("dimensions"))
+            metric["required_dimensions"] = _json_list(metric.get("required_dimensions"))
+        return {
+            "classes": [item for item in cleaned.get("classes", []) if item.get("id") in merged_class_ids],
+            "relationships": cleaned.get("relationships", []),
+            "metrics": cleaned_metrics,
+            "concepts": [item for item in cleaned.get("concepts", []) if item.get("id") in merged_concept_ids],
+        }
+
+    def _normalize_class_for_validation(self, item: dict) -> dict:
+        fields = _json_list(item.get("fields"))
+        properties = _json_list(item.get("properties"))
+        if not fields and properties:
+            fields = [{"name": field, "physical_name": field, "type": "text"} for field in properties]
+        csv_file = item.get("csv_file", "")
+        return {
+            **item,
+            "csv_file": csv_file,
+            "table_name": item.get("table_name", "") or (csv_file.replace(".csv", "") if csv_file else item.get("id", "")),
+            "fields": fields,
+            "properties": properties or [field.get("name") or field.get("physical_name") for field in fields if isinstance(field, dict)],
+            "primary_key": item.get("primary_key", ""),
+        }
+
+    def _build_validation_summaries(self, classes: list[dict]) -> list[dict]:
+        summaries = []
+        for item in classes:
+            cid = item.get("id", "")
+            csv_file = item.get("csv_file", "")
+            table_name = item.get("table_name", "") or (csv_file.replace(".csv", "") if csv_file else cid)
+            source = csv_file or table_name
+            fields = [field for field in item.get("fields", []) if isinstance(field, dict)]
+            columns = [str(field.get("physical_name") or field.get("name") or "").strip() for field in fields]
+            columns = [column for column in columns if column]
+            summaries.append({
+                "file": source,
+                "columns": columns,
+                "column_types": {
+                    str(field.get("physical_name") or field.get("name") or "").strip(): field.get("type", "text")
+                    for field in fields
+                    if str(field.get("physical_name") or field.get("name") or "").strip()
+                },
+                "total_rows": -1,
+            })
+        return summaries
+
     # --------------------------------------------------------
     # Diff 报告
     # --------------------------------------------------------
@@ -756,7 +854,9 @@ class SchemaOptimizer:
         if not cid:
             return False
         sid = self.scenario_id
-        exists = conn.execute("SELECT id FROM schema_classes WHERE id=? AND scenario_id=?", (cid, sid)).fetchone()
+        exists = conn.execute("SELECT id, is_reviewed FROM schema_classes WHERE id=? AND scenario_id=?", (cid, sid)).fetchone()
+        if exists and bool(exists["is_reviewed"]):
+            return False
         values = (
             item.get("name_cn", ""), item.get("description", ""),
             item.get("primary_key", ""), item.get("csv_file", ""),
@@ -780,9 +880,11 @@ class SchemaOptimizer:
             return False
         sid = self.scenario_id
         exists = conn.execute(
-            "SELECT id FROM schema_relationships WHERE source=? AND target=? AND scenario_id=?",
+            "SELECT id, is_reviewed FROM schema_relationships WHERE source=? AND target=? AND scenario_id=?",
             (source, target, sid),
         ).fetchone()
+        if exists and bool(exists["is_reviewed"]):
+            return False
         values = (
             item.get("type", ""), item.get("join_key", ""),
             item.get("source_key", ""), item.get("target_key", ""),
@@ -804,7 +906,9 @@ class SchemaOptimizer:
         if not mid:
             return False
         sid = self.scenario_id
-        exists = conn.execute("SELECT id FROM metrics WHERE id=? AND scenario_id=?", (mid, sid)).fetchone()
+        exists = conn.execute("SELECT id, is_reviewed FROM metrics WHERE id=? AND scenario_id=?", (mid, sid)).fetchone()
+        if exists and bool(exists["is_reviewed"]):
+            return False
         dims = json.dumps(item.get("dimensions", []), ensure_ascii=False)
         req_dims = json.dumps(item.get("required_dimensions", []), ensure_ascii=False)
         values = (
@@ -831,7 +935,9 @@ class SchemaOptimizer:
         if not cid:
             return False
         sid = self.scenario_id
-        exists = conn.execute("SELECT id FROM concepts WHERE id=? AND scenario_id=?", (cid, sid)).fetchone()
+        exists = conn.execute("SELECT id, is_reviewed FROM concepts WHERE id=? AND scenario_id=?", (cid, sid)).fetchone()
+        if exists and bool(exists["is_reviewed"]):
+            return False
         values = (
             item.get("name", ""), item.get("description", ""), item.get("parent_id", ""),
             int(item.get("level", 0) or 0), item.get("concept_type", "entity"),

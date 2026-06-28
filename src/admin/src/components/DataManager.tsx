@@ -40,6 +40,8 @@ export default function DataManager() {
   const [loadingTablesConnId, setLoadingTablesConnId] = useState<string | null>(null);
   const [loadingDbPreview, setLoadingDbPreview] = useState(false);
   const [extractDataSource, setExtractDataSource] = useState<"auto" | "csv" | "database">("auto");
+  const [selectedCsvFiles, setSelectedCsvFiles] = useState<string[]>([]);
+  const [selectedDbTables, setSelectedDbTables] = useState<string[]>([]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const extractEventSourceRef = useRef<EventSource | null>(null);
@@ -91,6 +93,7 @@ export default function DataManager() {
     try {
       await api(`/api/scenarios/${activeScenario}/files/${name}`, { method: "DELETE" });
       addToast("success", "文件已删除");
+      setSelectedCsvFiles(prev => prev.filter(item => item !== name));
       invalidateCache(cacheKey);
       loadFiles(true);
     } catch (e: any) { addToast("error", e.message || "删除失败"); }
@@ -121,11 +124,29 @@ export default function DataManager() {
   // ── 提取本体 ──
   const startExtract = async () => {
     try {
-      const body: Record<string, any> = { batch_size: batchSize, data_source: extractDataSource };
+      let effectiveDataSource = extractDataSource;
+      if (extractDataSource === "auto") {
+        if (selectedDbTables.length > 0) effectiveDataSource = "database";
+        else if (selectedCsvFiles.length > 0) effectiveDataSource = "csv";
+        else effectiveDataSource = activeTab;
+      }
+
+      if (effectiveDataSource === "csv" && selectedCsvFiles.length === 0) {
+        addToast("warning", "请先选择要提取的 CSV 文件");
+        return;
+      }
+      if (effectiveDataSource === "database" && selectedDbTables.length === 0) {
+        addToast("warning", "请先选择要提取的数据库表");
+        return;
+      }
+
+      const body: Record<string, any> = { batch_size: batchSize, data_source: effectiveDataSource };
+      if (effectiveDataSource === "csv") body.selected_files = selectedCsvFiles;
+      if (effectiveDataSource === "database") body.selected_tables = selectedDbTables;
       // 如果选择数据库模式，传入活跃连接
-      if (extractDataSource === "database" || extractDataSource === "auto") {
-        const activeConn = connections.find(c => c.is_active === 1);
-        if (activeConn) body.db_connection_id = activeConn.id;
+      if (effectiveDataSource === "database") {
+        const selectedConn = connections.find(c => c.id === dbTablesConnId) || connections.find(c => c.is_active === 1) || connections[0];
+        if (selectedConn) body.db_connection_id = selectedConn.id;
       }
       await api(`/api/scenarios/${activeScenario}/extract`, { method: "POST", body: JSON.stringify(body) });
       addToast("success", "提取已启动");
@@ -227,7 +248,7 @@ export default function DataManager() {
       addToast("success", "连接已删除");
       invalidateCache(connCacheKey);
       loadConnections(true);
-      setDbTables([]); setDbTablesConnId(null); setDbPreview(null); setDbPreviewTable(null);
+      setDbTables([]); setSelectedDbTables([]); setDbTablesConnId(null); setDbPreview(null); setDbPreviewTable(null);
     } catch (e: any) { addToast("error", e.message || "删除失败"); }
   };
 
@@ -238,6 +259,7 @@ export default function DataManager() {
     setLoadingTables(true);
     setLoadingTablesConnId(connId);
     setDbTables([]);
+    setSelectedDbTables([]);
     setDbTablesConnId(connId);
     setDbPreview(null); setDbPreviewTable(null);
     try {
@@ -291,6 +313,8 @@ export default function DataManager() {
     setDbPreviewTable(null);
     setLoadingDbPreview(false);
     setShowConnForm(false);
+    setSelectedCsvFiles([]);
+    setSelectedDbTables([]);
     setSearch("");
     if (activeScenario) {
       loadFiles(false, activeScenario);
@@ -312,6 +336,14 @@ export default function DataManager() {
   const getDbTableName = (table: DBTable) => table.table_name || table.name || "";
   const getDbTableKey = (table: DBTable, index: number) => `${table.schema || "default"}:${getDbTableName(table) || "unnamed"}:${index}`;
   const getDbPreviewColumns = () => (dbPreview?.columns || []).map((column) => typeof column === "string" ? column : column.name);
+  const visibleFileNames = filteredFiles.map(f => f.name);
+  const visibleDbTableNames = dbTables.map(getDbTableName).filter(Boolean);
+  const allVisibleCsvSelected = visibleFileNames.length > 0 && visibleFileNames.every(name => selectedCsvFiles.includes(name));
+  const allVisibleDbSelected = visibleDbTableNames.length > 0 && visibleDbTableNames.every(name => selectedDbTables.includes(name));
+  const toggleCsvFile = (name: string) => setSelectedCsvFiles(prev => prev.includes(name) ? prev.filter(item => item !== name) : [...prev, name]);
+  const toggleDbTable = (name: string) => setSelectedDbTables(prev => prev.includes(name) ? prev.filter(item => item !== name) : [...prev, name]);
+  const toggleVisibleCsvFiles = () => setSelectedCsvFiles(prev => allVisibleCsvSelected ? prev.filter(name => !visibleFileNames.includes(name)) : Array.from(new Set([...prev, ...visibleFileNames])));
+  const toggleVisibleDbTables = () => setSelectedDbTables(prev => allVisibleDbSelected ? prev.filter(name => !visibleDbTableNames.includes(name)) : Array.from(new Set([...prev, ...visibleDbTableNames])));
 
   return (
     <div className="space-y-6">
@@ -350,7 +382,11 @@ export default function DataManager() {
           {/* 文件列表 */}
           <div className="bg-white rounded-xl border border-slate-200">
             <div className="flex items-center justify-between p-4 border-b border-slate-100">
-              <h3 className="text-sm font-semibold text-slate-700">已上传文件 ({files.length})</h3>
+              <div className="flex items-center gap-3">
+                <input type="checkbox" checked={allVisibleCsvSelected} disabled={visibleFileNames.length === 0} onChange={toggleVisibleCsvFiles} className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" aria-label="选择当前文件列表" />
+                <h3 className="text-sm font-semibold text-slate-700">已上传文件 ({files.length})</h3>
+                <span className="text-xs text-slate-400">已选 {selectedCsvFiles.length}</span>
+              </div>
               <div className="flex items-center gap-2">
                 <SearchInput value={search} onChange={setSearch} placeholder="搜索文件..." />
                 <button onClick={() => loadFiles(true)} className="p-1.5 text-slate-400 hover:text-slate-600"><svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg></button>
@@ -361,6 +397,7 @@ export default function DataManager() {
                 {filteredFiles.map(f => (
                   <div key={f.name} className="flex items-center justify-between px-4 py-3 hover:bg-slate-50">
                     <div className="flex items-center gap-3 min-w-0">
+                      <input type="checkbox" checked={selectedCsvFiles.includes(f.name)} onChange={() => toggleCsvFile(f.name)} className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" aria-label={`选择 ${f.name}`} />
                       <span className="text-lg">📄</span>
                       <div className="min-w-0">
                         <button onClick={() => previewCsv(f.name)} className="text-sm text-blue-600 hover:underline truncate block">{f.name}</button>
@@ -461,7 +498,11 @@ export default function DataManager() {
           {(loadingTables || dbTables.length > 0) && (
             <div className="bg-white rounded-xl border border-slate-200">
               <div className="p-4 border-b border-slate-100">
-                <h3 className="text-sm font-semibold text-slate-700">数据库表 ({dbTables.length})</h3>
+                <div className="flex items-center gap-3">
+                  <input type="checkbox" checked={allVisibleDbSelected} disabled={visibleDbTableNames.length === 0} onChange={toggleVisibleDbTables} className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" aria-label="选择当前数据库表列表" />
+                  <h3 className="text-sm font-semibold text-slate-700">数据库表 ({dbTables.length})</h3>
+                  <span className="text-xs text-slate-400">已选 {selectedDbTables.length}</span>
+                </div>
               </div>
               {loadingTables ? <LoadingSpinner text="正在加载数据库表..." /> : (
                 <div className="divide-y divide-slate-50">
@@ -470,6 +511,7 @@ export default function DataManager() {
                     return (
                     <div key={getDbTableKey(t, index)} className="flex items-center justify-between px-4 py-3 hover:bg-slate-50">
                       <div className="flex items-center gap-3">
+                        <input type="checkbox" checked={selectedDbTables.includes(tableName)} onChange={() => tableName && toggleDbTable(tableName)} className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" aria-label={`选择 ${tableName || "未命名表"}`} />
                         <span className="text-lg">🗃️</span>
                         <div>
                           <button onClick={() => { const connId = dbTablesConnId || connections.find(c => c.is_active === 1)?.id || connections[0]?.id; if (connId && tableName) previewDbTable(connId, tableName); }} className="text-sm text-blue-600 hover:underline">{tableName || "未命名表"}</button>
@@ -492,6 +534,9 @@ export default function DataManager() {
       {/* ══════════════════════════════════════════════ */}
       <div className="bg-white rounded-xl border border-slate-200 p-6">
         <h3 className="text-sm font-semibold text-slate-700 mb-4">提取本体</h3>
+        <div className="mb-4 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
+          仅会抽取已勾选的数据源：CSV {selectedCsvFiles.length} 个，数据库表 {selectedDbTables.length} 个。抽取时会在选中集合范围内统一推导 Class 关系、Concept 层级和 Metric 关联。
+        </div>
         <div className="flex items-center gap-4 mb-4">
           <div className="flex items-center gap-2">
             <label className="text-xs text-slate-500">数据源:</label>

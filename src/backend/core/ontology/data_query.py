@@ -31,6 +31,7 @@ class DataQueryEngine:
         self.db_connection_url = db_connection_url
         self._db_engine = None
         self._resolved_table_names: dict[str, str] = {}
+        self._actual_table_columns_cache: dict[str, set[str]] = {}
 
         if self.db_connection_url:
             try:
@@ -161,6 +162,11 @@ class DataQueryEngine:
         if class_id in self._registered_tables:
             logger.debug("DataQuery CSV already registered: class=%s", class_id)
             return
+        if self._db_engine:
+            self._resolve_table_name(class_id)
+            self._registered_tables.add(class_id)
+            logger.debug("DataQuery CSV registration skipped for external db: class=%s", class_id)
+            return
         info = self.oe.get_class_info(class_id)
         csv_file = info.get("csv_file", "")
         if not csv_file:
@@ -178,8 +184,7 @@ class DataQueryEngine:
         table_name = self._resolve_table_name(class_id)
         df = pd.read_csv(str(csv_path), encoding="utf-8-sig")
         conn = self._get_connection()
-        if not self._db_engine:
-            df.to_sql(table_name, conn, if_exists="replace", index=False)
+        df.to_sql(table_name, conn, if_exists="replace", index=False)
         self._registered_tables.add(class_id)
         logger.info(
             "DataQuery CSV registered: class=%s table=%s rows=%d columns=%d",
@@ -199,6 +204,82 @@ class DataQueryEngine:
         fields = set(field_map.values()) | set(field_map.keys())
         return {str(field) for field in fields if field}
 
+    def _ensure_query_field(self, class_id: str, field_name: str, usage: str = "field") -> str:
+        physical_col = self._map_field(class_id, field_name)
+        configured_fields = self._class_physical_fields(class_id)
+        actual_fields = self._actual_table_columns(class_id)
+        if actual_fields:
+            if physical_col not in actual_fields:
+                raise ValueError(
+                    f"{usage} 字段 {field_name} 映射到 {physical_col}，但不存在于 class {class_id} 的物理表 "
+                    f"{self._resolve_table_name(class_id)}。请检查 schema_mapping.json 的 field_map 或查询参数。"
+                )
+            return physical_col
+
+        if configured_fields and physical_col not in configured_fields:
+            raise ValueError(
+                f"{usage} 字段 {field_name} 未配置在 class {class_id} 的 field_map 中。"
+                "请检查 schema_mapping.json 或查询参数。"
+            )
+        return physical_col
+
+    def _actual_table_columns(self, class_id: str) -> set[str]:
+        if class_id in self._actual_table_columns_cache:
+            return self._actual_table_columns_cache[class_id]
+
+        columns = set()
+        try:
+            table_name = self._resolve_table_name(class_id)
+            if self._db_engine:
+                from sqlalchemy import inspect
+                inspector = inspect(self._db_engine)
+                schema = None
+                table = table_name
+                if "." in table_name:
+                    schema, table = table_name.rsplit(".", 1)
+                columns = {str(col["name"]) for col in inspector.get_columns(table, schema=schema)}
+            else:
+                self._register_csv(class_id)
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                cursor.execute(f"PRAGMA table_info({self._quote_ident(table_name)})")
+                columns = {str(row[1]) for row in cursor.fetchall()}
+        except Exception as exc:
+            logger.warning(
+                "DataQuery actual table columns unavailable: class=%s error=%s",
+                class_id,
+                str(exc),
+            )
+
+        self._actual_table_columns_cache[class_id] = columns
+        return columns
+
+    def _resolve_formula_class(self, preferred_class: str, physical_field: str, alias_map: dict) -> str:
+        actual_fields = self._actual_table_columns(preferred_class)
+        if not actual_fields or physical_field in actual_fields:
+            return preferred_class
+
+        candidates = []
+        for class_id in alias_map.keys():
+            if class_id == preferred_class:
+                continue
+            if physical_field in self._actual_table_columns(class_id):
+                candidates.append(class_id)
+
+        if len(candidates) == 1:
+            logger.warning(
+                "DataQuery metric field class corrected: preferred_class=%s physical_field=%s corrected_class=%s",
+                preferred_class,
+                physical_field,
+                candidates[0],
+            )
+            return candidates[0]
+
+        raise ValueError(
+            f"指标字段 {physical_field} 不存在于 class {preferred_class} 对应物理表 {self._resolve_table_name(preferred_class)}。"
+            f"请检查 schema.json 中 metric.target_class/formula 与 schema_mapping.json 的 class.table_name/field_map 是否一致。"
+        )
+
     def _valid_mapped_keys(self, class_id: str, keys: list[str]) -> list[str]:
         physical_fields = self._class_physical_fields(class_id)
         mapped = []
@@ -208,11 +289,45 @@ class DataQueryEngine:
                 mapped.append(physical)
         return mapped
 
+    def _relationship_key_pairs(self, rel: dict) -> list[tuple[str, str]]:
+        for key in ("key_pairs", "join_keys", "keys"):
+            pairs = rel.get(key)
+            if isinstance(pairs, list):
+                normalized = []
+                for item in pairs:
+                    if not isinstance(item, dict):
+                        continue
+                    source = item.get("source") or item.get("source_key")
+                    target = item.get("target") or item.get("target_key")
+                    if source and target:
+                        normalized.append((str(source).strip(), str(target).strip()))
+                if normalized:
+                    return normalized
+
+        source_keys = [k.strip() for k in str(rel.get("source_key", "")).split(",") if k.strip()]
+        target_keys = [k.strip() for k in str(rel.get("target_key", "")).split(",") if k.strip()]
+        if len(source_keys) == len(target_keys):
+            return list(zip(source_keys, target_keys))
+        if len(source_keys) == 1:
+            return [(source_keys[0], target_key) for target_key in target_keys]
+        if len(target_keys) == 1:
+            return [(source_key, target_keys[0]) for source_key in source_keys]
+        return list(zip(source_keys, target_keys))
+
     def _build_join_condition(self, s_class: str, s_alias: str, t_class: str, t_alias: str, rel: dict) -> str:
-        source_keys = [k.strip() for k in rel.get("source_key", "").split(",") if k.strip()]
-        target_keys = [k.strip() for k in rel.get("target_key", "").split(",") if k.strip()]
-        mapped_source_keys = self._valid_mapped_keys(s_class, source_keys)
-        mapped_target_keys = self._valid_mapped_keys(t_class, target_keys)
+        key_pairs = self._relationship_key_pairs(rel)
+        source_keys = [source for source, _ in key_pairs]
+        target_keys = [target for _, target in key_pairs]
+        physical_source_fields = self._class_physical_fields(s_class)
+        physical_target_fields = self._class_physical_fields(t_class)
+        mapped_pairs = []
+        for source_key, target_key in key_pairs:
+            source_physical = self.oe.map_field(s_class, source_key)
+            target_physical = self.oe.map_field(t_class, target_key)
+            if source_physical in physical_source_fields and target_physical in physical_target_fields:
+                mapped_pairs.append((source_physical, target_physical))
+        mapped_source_keys = [source for source, _ in mapped_pairs]
+        mapped_target_keys = [target for _, target in mapped_pairs]
 
         if not mapped_source_keys or not mapped_target_keys:
             logger.warning(
@@ -226,20 +341,20 @@ class DataQueryEngine:
             )
             return "1=1"
 
-        if len(mapped_source_keys) == len(mapped_target_keys):
-            parts = [
-                f'{self._col_ref(s_alias, sk)} = {self._col_ref(t_alias, tk)}'
-                for sk, tk in zip(mapped_source_keys, mapped_target_keys)
-            ]
-            return " AND ".join(parts)
-
-        if len(mapped_source_keys) == 1:
+        if len(mapped_pairs) > 1 and len(set(mapped_source_keys)) == 1:
             source_col = self._col_ref(s_alias, mapped_source_keys[0])
             return " OR ".join(f'{source_col} = {self._col_ref(t_alias, tk)}' for tk in mapped_target_keys)
 
-        if len(mapped_target_keys) == 1:
+        if len(mapped_pairs) > 1 and len(set(mapped_target_keys)) == 1:
             target_col = self._col_ref(t_alias, mapped_target_keys[0])
             return " OR ".join(f'{self._col_ref(s_alias, sk)} = {target_col}' for sk in mapped_source_keys)
+
+        if len(mapped_source_keys) == len(mapped_target_keys):
+            parts = [
+                f'{self._col_ref(s_alias, sk)} = {self._col_ref(t_alias, tk)}'
+                for sk, tk in mapped_pairs
+            ]
+            return " AND ".join(parts)
 
         parts = [
             f'{self._col_ref(s_alias, sk)} = {self._col_ref(t_alias, tk)}'
@@ -270,6 +385,8 @@ class DataQueryEngine:
 
         if logical_field:
             p_col = self.oe.map_field(cls, logical_field)
+            cls = self._resolve_formula_class(cls, p_col, alias_map)
+            alias = alias_map.get(cls, "t0")
             agg_func = (metric_info.get("aggregation") or self._extract_formula_aggregation(formula) or "SUM").upper()
             return f'{agg_func}({self._col_ref(alias, p_col)})'
 
@@ -306,7 +423,10 @@ class DataQueryEngine:
         operator = f.get("operator", "=")
         value = f.get("value")
 
-        physical_col = self._map_field(class_id, field)
+        if self.oe.get_metric_info(field):
+            raise ValueError(f"过滤字段 {field} 是指标，应放入 having，而不是 filters")
+
+        physical_col = self._ensure_query_field(class_id, field, "过滤")
         col_expr = self._col_ref(alias, physical_col)
         op = self._validate_operator(operator)
 
@@ -340,6 +460,23 @@ class DataQueryEngine:
         if field_type == "numeric":
             return f"{col_expr} {op} {self._escape_value(value)}"
         return f"{col_expr} {op} '{self._escape_value(value)}'"
+
+    def _normalize_metric_filters(self, query_id: str, filters: list, having: list) -> tuple[list, list]:
+        normalized_filters = []
+        normalized_having = list(having or [])
+        for item in filters or []:
+            field = str(item.get("field", "")).strip() if isinstance(item, dict) else ""
+            if field and self.oe.get_metric_info(field):
+                normalized_having.append(dict(item))
+                logger.warning(
+                    "DataQuery metric filter moved to HAVING: query_id=%s field=%s filter=%s",
+                    query_id,
+                    field,
+                    self._log_json(item),
+                )
+            else:
+                normalized_filters.append(item)
+        return normalized_filters, normalized_having
 
     # ──────────────────────────────────────────────────────────
     # 核心优化方法：智能化执行本体论 SQL 查询
@@ -385,6 +522,8 @@ class DataQueryEngine:
             )
             limit = None
 
+        filters, having = self._normalize_metric_filters(query_id, filters, having)
+
         # ── 1. 自动化依赖推导（核心优化） ──
         # 扫描所有输入的字段，自动判定其归属的语义实体类，免除 LLM 强行指定
         discovered_classes = set(join_classes)
@@ -415,18 +554,33 @@ class DataQueryEngine:
                 logger.debug("DataQuery dependency discovered: query_id=%s source=filter field=%s class=%s", query_id, f.get("field", ""), cls)
 
         for h in having:
-            cls = self.oe.find_class_by_field(h.get("field", ""))
-            if cls:
-                discovered_classes.add(cls)
-                logger.debug("DataQuery dependency discovered: query_id=%s source=having field=%s class=%s", query_id, h.get("field", ""), cls)
+            h_field = h.get("field", "")
+            m_info = self.oe.get_metric_info(h_field)
+            if m_info:
+                metric_class = self._metric_class(m_info, target_class)
+                if metric_class:
+                    discovered_classes.add(metric_class)
+                    logger.debug("DataQuery dependency discovered: query_id=%s source=having_metric metric=%s class=%s", query_id, h_field, metric_class)
+            else:
+                cls = self.oe.find_class_by_field(h_field)
+                if cls:
+                    discovered_classes.add(cls)
+                    logger.debug("DataQuery dependency discovered: query_id=%s source=having field=%s class=%s", query_id, h_field, cls)
 
         if order_by:
             for ob in order_by.split(","):
                 ob_clean = ob.strip().split(" ")[0]
-                cls = self.oe.find_class_by_field(ob_clean)
-                if cls:
-                    discovered_classes.add(cls)
-                    logger.debug("DataQuery dependency discovered: query_id=%s source=order_by field=%s class=%s", query_id, ob_clean, cls)
+                m_info = self.oe.get_metric_info(ob_clean)
+                if m_info:
+                    metric_class = self._metric_class(m_info, target_class)
+                    if metric_class:
+                        discovered_classes.add(metric_class)
+                        logger.debug("DataQuery dependency discovered: query_id=%s source=order_by_metric metric=%s class=%s", query_id, ob_clean, metric_class)
+                else:
+                    cls = self.oe.find_class_by_field(ob_clean)
+                    if cls:
+                        discovered_classes.add(cls)
+                        logger.debug("DataQuery dependency discovered: query_id=%s source=order_by field=%s class=%s", query_id, ob_clean, cls)
 
         # 移去自身
         discovered_classes.discard(target_class)
@@ -514,7 +668,16 @@ class DataQueryEngine:
         for dim in dimensions:
             cls = self.oe.find_class_by_field(dim) or target_class
             alias = alias_map.get(cls, "t0")
-            p_col = self.oe.map_field(cls, dim)
+            try:
+                p_col = self._ensure_query_field(cls, dim, "维度")
+            except ValueError as e:
+                logger.warning(
+                    "DataQuery dimension build failed: query_id=%s dimension=%s error=%s",
+                    query_id,
+                    dim,
+                    str(e),
+                )
+                return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
             col_str = self._col_ref(alias, p_col)
             select_parts.append(f'{col_str} AS {self._alias_ref(dim)}')
             group_parts.append(col_str)
@@ -531,7 +694,16 @@ class DataQueryEngine:
         for metric in metrics:
             m_info = self.oe.get_metric_info(metric)
             if m_info:
-                metric_expr = self._metric_expr(m_info, metric, target_class, alias_map)
+                try:
+                    metric_expr = self._metric_expr(m_info, metric, target_class, alias_map)
+                except ValueError as e:
+                    logger.warning(
+                        "DataQuery metric build failed: query_id=%s metric=%s error=%s",
+                        query_id,
+                        metric,
+                        str(e),
+                    )
+                    return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
                 select_parts.append(f'{metric_expr} AS {self._alias_ref(metric)}')
                 logger.debug(
                     "DataQuery metric mapped: query_id=%s metric=%s class=%s expression=%s",
@@ -545,6 +717,17 @@ class DataQueryEngine:
                 cls = self.oe.find_class_by_field(metric) or target_class
                 alias = alias_map.get(cls, "t0")
                 p_col = self.oe.map_field(cls, metric)
+                try:
+                    cls = self._resolve_formula_class(cls, p_col, alias_map)
+                except ValueError as e:
+                    logger.warning(
+                        "DataQuery fallback metric build failed: query_id=%s metric=%s error=%s",
+                        query_id,
+                        metric,
+                        str(e),
+                    )
+                    return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
+                alias = alias_map.get(cls, "t0")
                 f_type = self.oe.get_field_type(cls, metric)
                 agg_func = "SUM" if f_type == "numeric" else "COUNT"
                 select_parts.append(f'{agg_func}({self._col_ref(alias, p_col)}) AS {self._alias_ref(metric)}')
@@ -599,12 +782,30 @@ class DataQueryEngine:
             
             m_info = self.oe.get_metric_info(h_field)
             if m_info:
-                having_clause = f'{self._metric_expr(m_info, h_field, target_class, alias_map)} {op} {val}'
+                try:
+                    having_clause = f'{self._metric_expr(m_info, h_field, target_class, alias_map)} {op} {val}'
+                except ValueError as e:
+                    logger.warning(
+                        "DataQuery having build failed: query_id=%s having=%s error=%s",
+                        query_id,
+                        self._log_json(h),
+                        str(e),
+                    )
+                    return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
                 having_parts.append(having_clause)
             else:
                 cls = self.oe.find_class_by_field(h_field) or target_class
                 alias = alias_map.get(cls, "t0")
-                p_col = self.oe.map_field(cls, h_field)
+                try:
+                    p_col = self._ensure_query_field(cls, h_field, "HAVING")
+                except ValueError as e:
+                    logger.warning(
+                        "DataQuery having build failed: query_id=%s having=%s error=%s",
+                        query_id,
+                        self._log_json(h),
+                        str(e),
+                    )
+                    return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
                 f_type = self.oe.get_field_type(cls, h_field)
                 agg = "SUM" if f_type == "numeric" else "COUNT"
                 having_clause = f'{agg}({self._col_ref(alias, p_col)}) {op} {val}'
@@ -627,12 +828,30 @@ class DataQueryEngine:
 
                 m_info = self.oe.get_metric_info(ob_clean)
                 if m_info:
-                    order_part = f'{self._metric_expr(m_info, ob_clean, target_class, alias_map)} {ob_dir}'
+                    try:
+                        order_part = f'{self._metric_expr(m_info, ob_clean, target_class, alias_map)} {ob_dir}'
+                    except ValueError as e:
+                        logger.warning(
+                            "DataQuery order build failed: query_id=%s order_by=%s error=%s",
+                            query_id,
+                            ob,
+                            str(e),
+                        )
+                        return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
                     order_parts.append(order_part)
                 else:
                     cls = self.oe.find_class_by_field(ob_clean) or target_class
                     alias = alias_map.get(cls, "t0")
-                    p_col = self.oe.map_field(cls, ob_clean)
+                    try:
+                        p_col = self._ensure_query_field(cls, ob_clean, "排序")
+                    except ValueError as e:
+                        logger.warning(
+                            "DataQuery order build failed: query_id=%s order_by=%s error=%s",
+                            query_id,
+                            ob,
+                            str(e),
+                        )
+                        return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
                     if ob_clean in metrics:
                         f_type = self.oe.get_field_type(cls, ob_clean)
                         agg = "SUM" if f_type == "numeric" else "COUNT"
@@ -726,6 +945,7 @@ class DataQueryEngine:
                 "field_name": field_name,
                 "keyword": keyword,
                 "values": values,
+                "matched_values": values,
                 "count": len(values),
             }
         except Exception as e:

@@ -41,13 +41,9 @@ from .agents import (
 
 
 TOOL_PURPOSES = {
-    "get_ontology_schema": "查看可用的数据实体、字段和关联关系。",
     "query_ontology_data": "按指标、维度和筛选条件查询业务数据。",
-    "fuzzy_search_values": "查找字段里的相近取值，修正用户输入的实体名称。",
-    "get_class_sample": "抽取样本行，确认字段内容和数据格式。",
     "python_analyze": "基于查询结果做进一步统计、计算或归纳分析。",
     "execute_action": "根据分析结果触发需要确认的业务动作。",
-    "list_available_actions": "筛选当前场景下可执行的业务动作。",
 }
 
 
@@ -104,6 +100,8 @@ class ChatEngineV3:
 
         current_state = State.INIT
         start_time = time.time()
+        transition_count = 0
+        max_transitions = 50
 
         logger.info(
             "Chat stream started: scenario_id=%s conversation_id=%s messages=%d user_message_len=%d",
@@ -115,6 +113,11 @@ class ChatEngineV3:
 
         try:
             while current_state != State.DONE:
+                transition_count += 1
+                if transition_count > max_transitions:
+                    state.error = f"状态机跳转超过上限 {max_transitions}，已熔断以避免死循环。"
+                    current_state = State.ERROR
+
                 handler = handlers.get(current_state)
                 if not handler:
                     current_state = State.ERROR
@@ -128,6 +131,7 @@ class ChatEngineV3:
                     state.current_round,
                 )
                 next_state = await handler(state)
+                state.record_transition(current_state, next_state)
 
                 # 发送待处理的 SSE 事件
                 for event in state.sse_events:

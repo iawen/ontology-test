@@ -12,6 +12,7 @@ from configs.global_config import Cfg
 from prompts.prompt import reset_engine
 from core.db.db import get_db
 from core.ontology.extract_ontology import OntologyExtractor
+from core.ontology.schema_context import load_schema_reference_context
 from modules.extraction_logs import finish_extraction_log, start_extraction_log
 
 
@@ -123,6 +124,8 @@ async def start_extraction(scenario_id: str, background_tasks: BackgroundTasks, 
     data_source = (body or {}).get("data_source", "auto")  # auto / csv / database
     db_connection_url = (body or {}).get("db_connection_url", "")
     db_connection_id = (body or {}).get("db_connection_id", "")
+    selected_files = (body or {}).get("selected_files") or []
+    selected_tables = (body or {}).get("selected_tables") or []
 
     if db_connection_id and not db_connection_url:
         conn = get_db()
@@ -150,12 +153,18 @@ async def start_extraction(scenario_id: str, background_tasks: BackgroundTasks, 
     if data_source == "database" and not db_connection_url:
         raise HTTPException(400, "未找到可用的数据库连接")
 
+    if data_source == "csv" and not selected_files:
+        raise HTTPException(400, "请先选择要提取的 CSV 文件")
+    if data_source == "database" and not selected_tables:
+        raise HTTPException(400, "请先选择要提取的数据库表")
+
     # 如果明确指定 csv 或没有数据库连接，使用 CSV 模式
     if data_source == "csv":
         db_connection_url = ""
 
     source_label = "数据库" if db_connection_url else "CSV文件"
-    start_message = f"启动中... (数据源: {source_label})"
+    selected_count = len(selected_tables) if db_connection_url else len(selected_files)
+    start_message = f"启动中... (数据源: {source_label}，选中 {selected_count} 项)"
     log_id = start_extraction_log(scenario_id, "ontology", trigger="manual", message=start_message)
     extract_status = {"running": True, "phase": "starting", "progress": 0, "total": 0,
                       "message": start_message, "result": None}
@@ -163,7 +172,16 @@ async def start_extraction(scenario_id: str, background_tasks: BackgroundTasks, 
     # 在后台运行
     # asyncio.create_task(_run_extraction(scenario_id, business_name, batch_size,
     #                                      db_connection_url=db_connection_url))
-    background_tasks.add_task(_run_extraction, scenario_id, business_name, batch_size, db_connection_url, log_id)
+    background_tasks.add_task(
+        _run_extraction,
+        scenario_id,
+        business_name,
+        batch_size,
+        db_connection_url,
+        log_id,
+        selected_files,
+        selected_tables,
+    )
     return {"status": "started", "data_source": "database" if db_connection_url else "csv"}
 
 
@@ -260,7 +278,6 @@ def _format_sync_summary(stats: dict) -> str:
     skipped_duplicates = stats["skipped_duplicates"]
     preserved_reviewed = stats["preserved_reviewed"]
     final_total = stats["final_total"]
-    removed_unreviewed = stats["removed_unreviewed"]
     return (
         "提取完成，Schema 已增量同步到数据库。"
         f"更新：Class {inserted['classes']} 个、关系 {inserted['relationships']} 个、"
@@ -271,8 +288,6 @@ def _format_sync_summary(stats: dict) -> str:
         f"概念 {skipped_reviewed['concepts']} 个、指标 {skipped_reviewed['metrics']} 个；"
         f"跳过重复：Class {skipped_duplicates['classes']} 个、关系 {skipped_duplicates['relationships']} 个、"
         f"概念 {skipped_duplicates['concepts']} 个、指标 {skipped_duplicates['metrics']} 个；"
-        f"清理未审核旧数据：Class {removed_unreviewed['classes']} 个、关系 {removed_unreviewed['relationships']} 个、"
-        f"概念 {removed_unreviewed['concepts']} 个、指标 {removed_unreviewed['metrics']} 个；"
         f"当前总量：Class {final_total['classes']} 个、关系 {final_total['relationships']} 个、"
         f"概念 {final_total['concepts']} 个、指标 {final_total['metrics']} 个。"
     )
@@ -313,18 +328,25 @@ def _sync_schema_db(scenario_id: str):
             (scenario_id,),
         ).fetchall()
     }
-
-    # 增量刷新：仅清理未人工审核的自动提取结果，人工审核过的数据保留。
-    removed_unreviewed = {
-        "classes": _safe_rowcount(conn.execute("DELETE FROM schema_classes WHERE scenario_id=? AND is_reviewed IS NOT TRUE", (scenario_id,))),
-        "relationships": _safe_rowcount(conn.execute("DELETE FROM schema_relationships WHERE scenario_id=? AND is_reviewed IS NOT TRUE", (scenario_id,))),
-        "concepts": _safe_rowcount(conn.execute("DELETE FROM concepts WHERE scenario_id=? AND is_reviewed IS NOT TRUE", (scenario_id,))),
-        "metrics": _safe_rowcount(conn.execute("DELETE FROM metrics WHERE scenario_id=? AND is_reviewed IS NOT TRUE", (scenario_id,))),
+    reviewed_rel_pairs = {
+        (row["source"], row["target"]) for row in conn.execute(
+            "SELECT source, target FROM schema_relationships WHERE scenario_id=? AND is_reviewed IS TRUE",
+            (scenario_id,),
+        ).fetchall()
     }
+
+    # 增量刷新：不删除已有资产；未审核资产允许更新，人工审核过的数据只作为参考并被保护。
+    removed_unreviewed = {"classes": 0, "relationships": 0, "concepts": 0, "metrics": 0}
 
     skipped_reviewed = {"classes": 0, "relationships": 0, "concepts": 0, "metrics": 0}
     skipped_duplicates = {"classes": 0, "relationships": 0, "concepts": 0, "metrics": 0}
 
+    existing_classes = {
+        row["id"] for row in conn.execute(
+            "SELECT id FROM schema_classes WHERE scenario_id=?",
+            (scenario_id,),
+        ).fetchall()
+    }
     classes = []
     seen_class_ids = set()
     for c in raw_classes:
@@ -348,6 +370,18 @@ def _sync_schema_db(scenario_id: str):
             _json_text(fields), _reviewed_value(c.get("is_reviewed", False)),
         ))
 
+    existing_rels = {
+        _relationship_key(dict(row)) for row in conn.execute(
+            "SELECT source, target, type, source_key, target_key, join_key FROM schema_relationships WHERE scenario_id=?",
+            (scenario_id,),
+        ).fetchall()
+    }
+    existing_rel_pairs = {
+        (row["source"], row["target"]) for row in conn.execute(
+            "SELECT source, target FROM schema_relationships WHERE scenario_id=?",
+            (scenario_id,),
+        ).fetchall()
+    }
     rels = []
     seen_rels = set(reviewed_rels)
     seen_extracted_rels = set()
@@ -360,16 +394,25 @@ def _sync_schema_db(scenario_id: str):
         if key in reviewed_rels:
             skipped_reviewed["relationships"] += 1
             continue
+        source, target, rel_type, source_key, target_key, join_key = key
+        if (source, target) in reviewed_rel_pairs:
+            skipped_reviewed["relationships"] += 1
+            continue
         if key in seen_rels:
             skipped_duplicates["relationships"] += 1
             continue
         seen_rels.add(key)
-        source, target, rel_type, source_key, target_key, join_key = key
         rels.append((
             scenario_id, source, target, rel_type, source_key, target_key, join_key,
             r.get("description", ""), _reviewed_value(r.get("is_reviewed", False)),
         ))
 
+    existing_concepts = {
+        row["id"] for row in conn.execute(
+            "SELECT id FROM concepts WHERE scenario_id=?",
+            (scenario_id,),
+        ).fetchall()
+    }
     concepts = []
     seen_concept_ids = set()
     for c in raw_concepts:
@@ -389,6 +432,12 @@ def _sync_schema_db(scenario_id: str):
             c.get("related_class", ""), _reviewed_value(c.get("is_reviewed", False)),
         ))
 
+    existing_metrics = {
+        row["id"] for row in conn.execute(
+            "SELECT id FROM metrics WHERE scenario_id=?",
+            (scenario_id,),
+        ).fetchall()
+    }
     metrics = []
     seen_metric_ids = set()
     for c in raw_metrics:
@@ -410,28 +459,65 @@ def _sync_schema_db(scenario_id: str):
             _reviewed_value(c.get("is_reviewed", False)),
         ))
 
-    if classes:
-        conn.executemany(
-            "INSERT INTO schema_classes (id, scenario_id, name_cn, description, properties, primary_key, csv_file, fields, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-            classes,
-        )
+    for item in classes:
+        class_id = item[0]
+        if class_id in existing_classes:
+            conn.execute(
+                """UPDATE schema_classes
+                   SET name_cn=?, description=?, properties=?, primary_key=?, csv_file=?, fields=?, is_reviewed=?, updated_at=CURRENT_TIMESTAMP
+                   WHERE id=? AND scenario_id=? AND is_reviewed IS NOT TRUE""",
+                (item[2], item[3], item[4], item[5], item[6], item[7], item[8], class_id, scenario_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO schema_classes (id, scenario_id, name_cn, description, properties, primary_key, csv_file, fields, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                item,
+            )
 
-    if rels:
-        conn.executemany(
-            "INSERT INTO schema_relationships (scenario_id, source, target, type, source_key, target_key, join_key, description, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-            rels,
-        )
+    for item in rels:
+        source_target = (item[1], item[2])
+        if source_target in existing_rel_pairs:
+            conn.execute(
+                """UPDATE schema_relationships
+                   SET type=?, source_key=?, target_key=?, join_key=?, description=?, is_reviewed=?, updated_at=CURRENT_TIMESTAMP
+                   WHERE scenario_id=? AND source=? AND target=? AND is_reviewed IS NOT TRUE""",
+                (item[3], item[4], item[5], item[6], item[7], item[8], scenario_id, item[1], item[2]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO schema_relationships (scenario_id, source, target, type, source_key, target_key, join_key, description, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                item,
+            )
 
-    if metrics and len(metrics) > 0:
-        conn.executemany(
-            "INSERT INTO metrics (id, scenario_id, name, description, category, target_class, calculation, formula, dimensions, required_dimensions, filters_hint, chart_type, sort_order, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-            metrics,
-        )
-    if concepts and len(concepts) > 0:
-        conn.executemany(
-            "INSERT INTO concepts (id, scenario_id, name, description, parent_id, level, concept_type, related_class, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-            concepts,
-        )
+    for item in metrics:
+        metric_id = item[0]
+        if metric_id in existing_metrics:
+            conn.execute(
+                """UPDATE metrics
+                   SET name=?, description=?, category=?, target_class=?, calculation=?, formula=?, dimensions=?, required_dimensions=?, filters_hint=?, chart_type=?, sort_order=?, is_reviewed=?, updated_at=CURRENT_TIMESTAMP
+                   WHERE id=? AND scenario_id=? AND is_reviewed IS NOT TRUE""",
+                (item[2], item[3], item[4], item[5], item[6], item[7], item[8], item[9], item[10], item[11], item[12], item[13], metric_id, scenario_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO metrics (id, scenario_id, name, description, category, target_class, calculation, formula, dimensions, required_dimensions, filters_hint, chart_type, sort_order, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                item,
+            )
+
+    for item in concepts:
+        concept_id = item[0]
+        if concept_id in existing_concepts:
+            conn.execute(
+                """UPDATE concepts
+                   SET name=?, description=?, parent_id=?, level=?, concept_type=?, related_class=?, is_reviewed=?, updated_at=CURRENT_TIMESTAMP
+                   WHERE id=? AND scenario_id=? AND is_reviewed IS NOT TRUE""",
+                (item[2], item[3], item[4], item[5], item[6], item[7], item[8], concept_id, scenario_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO concepts (id, scenario_id, name, description, parent_id, level, concept_type, related_class, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                item,
+            )
 
     conn.commit()
     final_total = {
@@ -472,7 +558,8 @@ def _sync_schema_db(scenario_id: str):
 
 
 def _run_extraction(scenario_id:str, business_name: str, batch_size: int,
-                         db_connection_url: str = "", log_id: str = ""):
+                         db_connection_url: str = "", log_id: str = "",
+                         selected_files: list[str] = None, selected_tables: list[str] = None):
     """后台执行分批提取，支持 CSV 和数据库直连两种数据源"""
     global extract_status
     started_at = time.time()
@@ -497,6 +584,9 @@ def _run_extraction(scenario_id:str, business_name: str, batch_size: int,
             # batch_size=batch_size,
             on_progress=on_progress,
             db_connection_url=db_connection_url,
+            selected_files=selected_files or [],
+            selected_tables=selected_tables or [],
+            reviewed_schema_context=load_schema_reference_context(scenario_id),
         )
 
         extract_status["running"] = False

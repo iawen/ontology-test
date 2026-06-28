@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException
 
 from core.db.db import get_db
 from configs.global_config import Cfg
-from core.models.models import MetricCreate, MetricUpdate, ConceptCreate, ConceptUpdate
+from core.models.models import MetricBatchDelete, MetricCreate, MetricUpdate, ConceptCreate, ConceptUpdate
 
 router = APIRouter()
 
@@ -19,6 +19,15 @@ def _reviewed_value(value) -> bool:
     if isinstance(value, str):
         return value.lower() in {"1", "true", "yes", "y"}
     return bool(value)
+
+
+def _sync_ontology_files(scenario_id: str):
+    from modules.schema import _sync_schema_files
+
+    try:
+        _sync_schema_files(scenario_id)
+    except Exception as e:
+        raise HTTPException(500, f"数据已保存，但同步 schema 文件失败: {e}")
 
 
 # ============================================================
@@ -66,6 +75,7 @@ async def create_metric(scenario_id: str, req: MetricCreate):
         conn.close()
         raise HTTPException(400, f"创建失败: {e}")
     conn.close()
+    _sync_ontology_files(scenario_id)
     return {"status": "ok"}
 
 
@@ -98,6 +108,7 @@ async def update_metric(scenario_id: str, metric_id: str, req: MetricUpdate):
     conn.execute(f"UPDATE metrics SET {','.join(sets)} WHERE id=? AND scenario_id=?", vals)
     conn.commit()
     conn.close()
+    _sync_ontology_files(scenario_id)
     return {"status": "ok"}
 
 
@@ -107,7 +118,26 @@ async def delete_metric(scenario_id: str, metric_id: str):
     conn.execute("DELETE FROM metrics WHERE id=? AND scenario_id=?", (metric_id, scenario_id))
     conn.commit()
     conn.close()
+    _sync_ontology_files(scenario_id)
     return {"status": "ok"}
+
+
+@router.post("/api/admin/scenarios/{scenario_id}/metrics/batch-delete")
+async def batch_delete_metrics(scenario_id: str, req: MetricBatchDelete):
+    ids = [metric_id for metric_id in req.ids if metric_id]
+    if not ids:
+        return {"status": "ok", "deleted": 0}
+
+    conn = get_db()
+    conn.executemany(
+        "DELETE FROM metrics WHERE id=? AND scenario_id=?",
+        [(metric_id, scenario_id) for metric_id in ids],
+    )
+    deleted = conn.total_changes
+    conn.commit()
+    conn.close()
+    _sync_ontology_files(scenario_id)
+    return {"status": "ok", "deleted": deleted}
 
 
 # ============================================================
@@ -173,6 +203,7 @@ async def create_concept(scenario_id: str, req: ConceptCreate):
         conn.close()
         raise HTTPException(400, f"创建失败: {e}")
     conn.close()
+    _sync_ontology_files(scenario_id)
     return {"status": "ok"}
 
 
@@ -195,6 +226,7 @@ async def update_concept(scenario_id: str, concept_id: str, req: ConceptUpdate):
     conn.execute(f"UPDATE concepts SET {','.join(sets)} WHERE id=? AND scenario_id=?", vals)
     conn.commit()
     conn.close()
+    _sync_ontology_files(scenario_id)
     return {"status": "ok"}
 
 
@@ -204,4 +236,5 @@ async def delete_concept(scenario_id: str, concept_id: str):
     conn.execute("DELETE FROM concepts WHERE id=? AND scenario_id=?", (concept_id, scenario_id))
     conn.commit()
     conn.close()
+    _sync_ontology_files(scenario_id)
     return {"status": "ok"}

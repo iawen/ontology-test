@@ -79,6 +79,9 @@ class AgentState:
     # 错误
     error: Optional[str] = None
 
+    # 调试与请求重放
+    transition_log: List[dict] = field(default_factory=list)
+
     def to_dict(self) -> dict:
         """可序列化，支持请求重放和调试"""
         return {
@@ -89,8 +92,19 @@ class AgentState:
             "tool_calls_count": len(self.pending_tool_calls),
             "tool_results_count": len(self.all_tool_results),
             "entity_hints_count": len(self.entity_hints),
+            "transition_log": self.transition_log,
             "error": self.error,
         }
+
+    def record_transition(self, from_state: State, to_state: State):
+        """记录状态跳变，便于事后分析和请求重放"""
+        self.transition_log.append({
+            "from": from_state.value if isinstance(from_state, State) else str(from_state),
+            "to": to_state.value if isinstance(to_state, State) else str(to_state),
+            "round": self.current_round,
+            "pending_tools": len(self.pending_tool_calls),
+            "tool_results": len(self.all_tool_results),
+        })
 
     def inject_entity_hints(self, hints: List[dict]):
         """主控专用：注入实体消歧结果"""

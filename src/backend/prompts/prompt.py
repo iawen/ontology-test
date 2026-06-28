@@ -14,6 +14,7 @@ Prompt 模板 v3 — 基于本体论的 ChatBI
 
 import os
 import json
+import threading
 from datetime import datetime, timezone
 
 from configs.global_config import Cfg
@@ -220,23 +221,23 @@ def _build_system_prompt(engine: OntologyEngine, scenario_id: str) -> str:
 ### 字段映射（Field Map）
 - 每个字段有「逻辑名」（业务术语）和「物理列名」（数据库列名），它们可能不同。
 - 你在构建查询时，必须使用**逻辑字段名**，系统会自动映射为物理列名。
-- 如果用户说的术语不在 field_map 中，使用 fuzzy_search_values 工具进行模糊匹配。
+- 如果用户说的术语不在上下文中，仍按最可能的逻辑字段构造查询；系统会在执行前自动做实体值对齐。
 
 ### 类型安全（Type Safety）
 - 每个字段都有类型声明（text / numeric / date / boolean）。
 - **numeric 类型字段**：过滤值不能加引号，例如 `{{"field": "销售金额", "operator": ">", "value": 1000}}`
 - **text 类型字段**：过滤值必须加引号，例如 `{{"field": "品类名称", "operator": "=", "value": "坚果"}}`
 - 你必须在 filter 中明确指定 operator，不要省略。
-- 如果不确定字段类型，先调用 get_field_types 工具查询。
+- 字段类型、日期/数字/布尔基础转换由系统拦截器自动校验。
 
 ### 多表关联（JOIN）
 - 当查询涉及多个 class 的字段时，需要指定 join_class。
 - 系统会自动根据 source_key / target_key 推导 JOIN 条件。
 - 如果两个 class 没有直接关系，系统会尝试多跳路径推导。
-- 你可以使用 get_join_path 工具查看两个 class 之间的 JOIN 路径。
+- 关联路径由查询引擎内部推导，不需要额外工具探测。
 
 ### 过滤条件格式
-每个 filter 必须是如下格式：
+filters 只用于明细字段/维度字段的行级过滤，不能放指标名或聚合结果。每个 filter 必须是如下格式：
 ```json
 {{
   "field": "字段逻辑名",
@@ -247,7 +248,7 @@ def _build_system_prompt(engine: OntologyEngine, scenario_id: str) -> str:
 支持的操作符：=, !=, <>, >, <, >=, <=, IN, NOT IN, LIKE, NOT LIKE, IS NULL, IS NOT NULL, BETWEEN
 
 ### 聚合后过滤（HAVING）
-如果需要对聚合结果进行过滤（如"销售额超过10万的门店"），使用 having 参数：
+如果需要对聚合结果/指标进行过滤（如"销售额超过10万的门店"、"达成率低于100%"），必须使用 having 参数，不要放入 filters：
 ```json
 {{
   "field": "销售金额",
@@ -258,15 +259,12 @@ def _build_system_prompt(engine: OntologyEngine, scenario_id: str) -> str:
 
 ### 查询完整性
 - 调用 query_ontology_data 时不要传 limit，不要为了展示方便截断业务查询结果，避免遗漏月份、区域、人员或明细分组。
-- 只有需要查看少量样例行时，才调用 get_class_sample，并在该工具中使用 limit。
+- 不要调用样本、字段类型或模糊搜索类工具；这些能力已内化为系统确定性拦截器。
 
 ## 工作流程建议
-1. 先调用 get_ontology_schema 了解数据结构
-2. 如果不确定字段类型，调用 get_field_types
-3. 如果需要多表关联，调用 get_join_path 查看 JOIN 路径
-4. 如果不确定字段值，调用 fuzzy_search_values 搜索
-5. 调用 query_ontology_data 执行查询
-6. 如果需要复杂分析，调用 python_analyze
+1. 根据系统上下文识别 target_class、指标、维度、过滤条件和关联 class。
+2. 调用 query_ontology_data 执行完整查询。
+3. 如果需要复杂分析，调用 python_analyze。
 """
 
 
@@ -275,24 +273,8 @@ def _build_tools() -> list[dict]:
         {
             "type": "function",
             "function": {
-                "name": "get_ontology_schema",
-                "description": "获取本体 Schema 信息。不传 class_id 返回所有 class 概览；传入 class_id 返回该 class 的详细字段映射、字段类型和关联关系。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "class_id": {
-                            "type": "string",
-                            "description": "实体类 ID（可选，不传则返回全部概览）"
-                        }
-                    }
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
                 "name": "query_ontology_data",
-                "description": "基于本体论执行完整数据查询。系统会自动将逻辑字段名映射为物理列名，并根据 field_types 确保过滤条件的类型安全。支持多表 JOIN 和聚合后过滤（HAVING）。不要传 limit，避免遗漏数据；需要样本行时使用 get_class_sample。",
+                "description": "基于本体论执行完整数据查询。系统会自动将逻辑字段名映射为物理列名，并根据 field_types 确保过滤条件的类型安全。filters 只用于行级字段过滤；指标/聚合结果条件必须放入 having。支持多表 JOIN 和聚合后过滤（HAVING）。不要传 limit，避免遗漏数据。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -321,7 +303,7 @@ def _build_tools() -> list[dict]:
                                 },
                                 "required": ["field", "operator"]
                             },
-                            "description": "过滤条件列表，每项必须包含 field 和 operator"
+                            "description": "行级过滤条件列表，每项必须包含 field 和 operator。field 必须是 class 的明细字段/维度字段，不能是 metric 指标名；指标条件请使用 having。"
                         },
                         "join_classes": {
                             "type": "array",
@@ -339,7 +321,7 @@ def _build_tools() -> list[dict]:
                                 },
                                 "required": ["field", "operator", "value"]
                             },
-                            "description": "聚合后过滤条件（HAVING），如 [{'field': '销售金额', 'operator': '>', 'value': 100000}]"
+                            "description": "聚合后过滤条件（HAVING），用于 metric/聚合结果过滤，如 [{'field': '销售金额', 'operator': '>', 'value': 100000}]"
                         },
                         "order_by": {
                             "type": "string",
@@ -347,96 +329,6 @@ def _build_tools() -> list[dict]:
                         }
                     },
                     "required": ["target_class"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_field_types",
-                "description": "获取指定 class 的字段类型声明。用于确认字段是 text 还是 numeric，确保过滤条件的类型安全。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "class_id": {
-                            "type": "string",
-                            "description": "实体类 ID"
-                        }
-                    },
-                    "required": ["class_id"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_join_path",
-                "description": "获取两个 class 之间的 JOIN 路径。如果两个 class 没有直接关系，系统会尝试多跳路径推导。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "source": {
-                            "type": "string",
-                            "description": "起始 class ID"
-                        },
-                        "target": {
-                            "type": "string",
-                            "description": "目标 class ID"
-                        }
-                    },
-                    "required": ["source", "target"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "fuzzy_search_values",
-                "description": "模糊搜索某个字段的值，用于实体消歧。当不确定用户提到的具体值时，先用此工具搜索可能的匹配值。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "class_id": {
-                            "type": "string",
-                            "description": "实体类 ID"
-                        },
-                        "field_name": {
-                            "type": "string",
-                            "description": "要搜索的字段名（逻辑名）"
-                        },
-                        "keyword": {
-                            "type": "string",
-                            "description": "搜索关键词"
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "返回结果数量限制，默认10",
-                            "default": 10
-                        }
-                    },
-                    "required": ["class_id", "field_name", "keyword"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_class_sample",
-                "description": "获取某个实体类的样本数据，用于了解数据格式和内容。当需要查看数据样例或验证字段值时调用。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "class_id": {
-                            "type": "string",
-                            "description": "实体类 ID"
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "返回行数，默认5",
-                            "default": 5
-                        }
-                    },
-                    "required": ["class_id"]
                 }
             }
         },
@@ -467,32 +359,34 @@ _engines: dict = {}
 _query_engines: dict = {}
 _system_prompts: dict = {}
 TOOLS: list[dict] = []
+_init_lock = threading.RLock()
 
 
 def init_prompt(scenario_id: str):
     global _engines, _query_engines, _system_prompts, TOOLS
 
-    if _engines.get(scenario_id) is None:
-        ontology_dir = f"{Cfg.scenarios_root}/{scenario_id}/ontology"
-        data_dir = f"{Cfg.scenarios_root}/{scenario_id}/data"
-        _engines[scenario_id] = OntologyEngine(ontology_dir, data_dir)
+    with _init_lock:
+        if _engines.get(scenario_id) is None:
+            ontology_dir = f"{Cfg.scenarios_root}/{scenario_id}/ontology"
+            data_dir = f"{Cfg.scenarios_root}/{scenario_id}/data"
+            _engines[scenario_id] = OntologyEngine(ontology_dir, data_dir)
 
-    if _query_engines.get(scenario_id) is None:
-        db_url = ""
-        try:
-            from modules.data_connections import get_active_connection
-            active_conn = get_active_connection(scenario_id)
-            if active_conn:
-                db_url = active_conn["connection_url"]
-        except Exception:
-            pass
-        _query_engines[scenario_id] = DataQueryEngine(_engines[scenario_id], db_connection_url=db_url)
+        if _query_engines.get(scenario_id) is None:
+            db_url = ""
+            try:
+                from modules.data_connections import get_active_connection
+                active_conn = get_active_connection(scenario_id)
+                if active_conn:
+                    db_url = active_conn["connection_url"]
+            except Exception:
+                pass
+            _query_engines[scenario_id] = DataQueryEngine(_engines[scenario_id], db_connection_url=db_url)
 
-    if _system_prompts.get(scenario_id) is None:
-        _system_prompts[scenario_id] = _build_system_prompt(_engines[scenario_id], scenario_id)
+        if _system_prompts.get(scenario_id) is None:
+            _system_prompts[scenario_id] = _build_system_prompt(_engines[scenario_id], scenario_id)
 
-    TOOLS = _build_tools()
-    print(f"[Prompt] Schema loaded: {len(_engines[scenario_id].list_classes())} classes, {len(_engines[scenario_id].list_metrics())} metrics")
+        TOOLS = _build_tools()
+        print(f"[Prompt] Schema loaded: {len(_engines[scenario_id].list_classes())} classes, {len(_engines[scenario_id].list_metrics())} metrics")
 
 
 def reset_engine(scenario_id: str):

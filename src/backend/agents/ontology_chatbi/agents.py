@@ -185,8 +185,26 @@ class ContextCompressorAgent:
         limit = limit or self.HARD_LIMIT
         if len(context) <= limit:
             return context
-        head = context[:int(limit * 0.75)]
-        tail = context[-int(limit * 0.25):]
+        lines = context.splitlines()
+        head_limit = int(limit * 0.75)
+        tail_limit = int(limit * 0.25)
+        head_lines = []
+        head_size = 0
+        for line in lines:
+            if head_size + len(line) + 1 > head_limit:
+                break
+            head_lines.append(line)
+            head_size += len(line) + 1
+
+        tail_lines = []
+        tail_size = 0
+        for line in reversed(lines):
+            if tail_size + len(line) + 1 > tail_limit:
+                break
+            tail_lines.append(line)
+            tail_size += len(line) + 1
+        head = "\n".join(head_lines)
+        tail = "\n".join(reversed(tail_lines))
         return head + "\n\n[...上下文已压缩...]\n\n" + tail
 
 
@@ -208,14 +226,16 @@ class EntityDisambiguatorAgent:
         self, user_message: str, relevant_classes: List[str], query_engine
     ) -> List[dict]:
         hints = []
+        mentions = self._extract_entity_mentions(user_message)
+        if not mentions:
+            return hints
         for class_id in relevant_classes:
             text_fields = self._get_text_fields(class_id, query_engine)
             for field_name in text_fields:
-                candidates = self._get_field_values(class_id, field_name, query_engine)
-                if not candidates:
-                    continue
-                user_values = self._extract_entities(user_message, candidates)
-                for uv in user_values:
+                for uv in mentions:
+                    candidates = self._get_field_values(class_id, field_name, query_engine, uv)
+                    if not candidates:
+                        continue
                     best_match, score, all_cands = self._fuzzy_match(uv, candidates)
                     if best_match and score >= 0.75 and best_match != uv:
                         hints.append({
@@ -237,12 +257,33 @@ class EntityDisambiguatorAgent:
             if ftype == "text" and logical in field_map
         ]
 
-    def _get_field_values(self, class_id: str, field_name: str, qe) -> List[str]:
+    def _get_field_values(self, class_id: str, field_name: str, qe, keyword: str) -> List[str]:
         try:
-            result = qe.fuzzy_search_values(class_id, field_name, "", limit=200)
-            return result.get("matched_values", [])
+            result = qe.fuzzy_search_values(class_id, field_name, keyword, limit=30)
+            return result.get("matched_values") or result.get("values", [])
         except:
             return []
+
+    def _extract_entity_mentions(self, text: str) -> List[str]:
+        quoted = re.findall(r'["\']([^"\']+)["\']', text)
+        raw_terms = re.findall(r"[\u4e00-\u9fffA-Za-z0-9_]{2,}", text)
+        mentions = []
+        for item in quoted + raw_terms:
+            for mention in self._mention_variants(item.strip()):
+                if mention not in mentions:
+                    mentions.append(mention)
+        return mentions[:12]
+
+    def _mention_variants(self, value: str) -> List[str]:
+        if len(value) < 2:
+            return []
+        variants = [value]
+        if re.fullmatch(r"[\u4e00-\u9fff]{3,}", value):
+            max_window = min(6, len(value))
+            for size in range(2, max_window + 1):
+                for start in range(0, len(value) - size + 1):
+                    variants.append(value[start:start + size])
+        return variants
 
     def _extract_entities(self, text: str, candidates: List[str]) -> List[str]:
         """从文本中提取可能的实体值"""
@@ -258,11 +299,9 @@ class EntityDisambiguatorAgent:
     def _fuzzy_match(self, value: str, candidates: List[str]) -> Tuple[str, float, List[str]]:
         """4级模糊匹配"""
         value_clean = value.strip()
-        suffixes = ["省", "市", "区", "县", "镇", "乡", "村", "公司", "有限", "有限公司"]
-        value_core = value_clean
-        for suffix in suffixes:
-            if value_core.endswith(suffix):
-                value_core = value_core[:-len(suffix)]
+        value_core = self._normalize_match_core(value_clean)
+        if not value_core:
+            return "", 0.0, []
 
         best_match = ""
         best_score = 0.0
@@ -292,6 +331,12 @@ class EntityDisambiguatorAgent:
 
         scored.sort(key=lambda x: x[1], reverse=True)
         return best_match, best_score, [s[0] for s in scored]
+
+    def _normalize_match_core(self, value: str) -> str:
+        value = re.sub(r"\s+", "", value or "")
+        value = re.sub(r"(有限公司|有限责任公司|股份有限公司|集团|公司)$", "", value)
+        value = re.sub(r"(?<=[\u4e00-\u9fff])(省|市|区|县|镇|乡|村)$", "", value)
+        return value
 
 
 # ============================================================
@@ -329,6 +374,9 @@ class ToolExecutor:
             retry_count: 当前重试次数（死循环防线）
         """
         try:
+            if tool_name == "query_ontology_data":
+                arguments = await self._deterministic_pre_process(arguments, query_engine, engine)
+
             result = self._dispatch_tool(tool_name, arguments, query_engine, engine)
 
             # 后置自动校正：query_ontology_data 失败时尝试修正参数
@@ -372,6 +420,72 @@ class ToolExecutor:
             )
             return {"error": f"工具执行失败（已重试{retry_count}次）: {str(e)}"}
 
+    async def _deterministic_pre_process(self, arguments: dict, query_engine, engine) -> dict:
+        """前置确定性拦截：过滤值对齐与基础类型防御"""
+        corrected = dict(arguments or {})
+        target_class = corrected.get("target_class", "")
+        filters = corrected.get("filters") or []
+        having = list(corrected.get("having") or [])
+        corrected_filters = []
+
+        for item in filters:
+            if not isinstance(item, dict):
+                corrected_filters.append(item)
+                continue
+            field = item.get("field", "")
+            if engine.get_metric_info(field):
+                having.append(dict(item))
+                logger.warning(
+                    "Metric filter moved to HAVING before execution: scenario_id=%s field=%s filter=%s",
+                    self.scenario_id,
+                    field,
+                    json.dumps(item, ensure_ascii=False, default=str)[:500],
+                )
+                continue
+            class_id = engine.find_class_by_field(field) or target_class
+            field_type = engine.get_field_type(class_id, field)
+            value = self._coerce_filter_value(item.get("value"), field_type)
+            fixed = {**item, "value": value}
+
+            if field_type == "text" and isinstance(value, str) and value.strip():
+                aligned = await self._align_text_filter_value(query_engine, class_id, field, value)
+                if aligned and aligned != value:
+                    fixed["value"] = aligned
+                    fixed["_intercepted"] = True
+            corrected_filters.append(fixed)
+
+        corrected["filters"] = corrected_filters
+        corrected["having"] = having
+        return corrected
+
+    def _coerce_filter_value(self, value, field_type: str):
+        if isinstance(value, list):
+            return [self._coerce_filter_value(item, field_type) for item in value]
+        if value is None:
+            return value
+        if field_type == "numeric" and isinstance(value, str):
+            cleaned = value.replace(",", "").strip()
+            try:
+                return float(cleaned) if "." in cleaned else int(cleaned)
+            except ValueError:
+                return value
+        if field_type == "boolean" and isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in ("true", "1", "yes", "y", "是"):
+                return True
+            if lowered in ("false", "0", "no", "n", "否"):
+                return False
+        return value
+
+    async def _align_text_filter_value(self, query_engine, class_id: str, field: str, value: str) -> Optional[str]:
+        try:
+            result = query_engine.fuzzy_search_values(class_id, field, value, limit=20)
+            candidates = result.get("matched_values") or result.get("values", [])
+        except Exception:
+            return None
+        best_match, score, _ = self.entity_agent._fuzzy_match(value, candidates)
+        return best_match if best_match and score >= 0.75 else None
+
     async def _auto_correct_args(self, arguments: dict, query_engine) -> dict:
         """后置自动校正：修正 query_ontology_data 的 filter 参数"""
         corrected = dict(arguments)
@@ -386,7 +500,7 @@ class ToolExecutor:
             candidates = []
             try:
                 result = query_engine.fuzzy_search_values(target_class, field, str(value), limit=50)
-                candidates = result.get("matched_values", [])
+                candidates = result.get("matched_values") or result.get("values", [])
             except:
                 pass
 
@@ -404,38 +518,7 @@ class ToolExecutor:
 
     def _dispatch_tool(self, name: str, args: dict, query_engine, engine) -> dict:
         """工具分发执行"""
-        if name == "get_ontology_schema":
-            class_id = args.get("class_id", "")
-            if class_id:
-                info = engine.get_class_info(class_id)
-                if not info:
-                    return {"error": f"未找到 class: {class_id}"}
-                return {
-                    "class_id": class_id,
-                    "name_cn": info.get("name_cn", ""),
-                    "table_name": info.get("table_name", ""),
-                    "field_map": engine.get_field_map(class_id),
-                    "field_types": engine.get_field_types(class_id),
-                    "primary_key": info.get("primary_key", ""),
-                    "related_classes": engine.get_related_classes(class_id),
-                }
-            else:
-                classes_str = "\n".join([
-                    f"  {c['id']}（{c['name_cn']}）→ {engine.classes.get(c['id'], {}).get('csv_file', '')}"
-                    for c in engine.list_classes()
-                ])
-                rels_str = "\n".join([
-                    f"  {r['source']} --[{r.get('type', '')}]--> {r['target']} (JOIN: {r.get('join_key', '')})"
-                    for r in engine.relationships
-                ])
-                return {
-                    "type": "schema_overview",
-                    "classes": engine.list_classes(),
-                    "relationships": engine.relationships,
-                    "summary": f"实体类:\n{classes_str}\n\n关系:\n{rels_str}",
-                }
-
-        elif name == "query_ontology_data":
+        if name == "query_ontology_data":
             if args.get("limit") is not None:
                 logger.warning(
                     "Ignoring limit for query_ontology_data to avoid incomplete analysis: scenario_id=%s limit=%s",
@@ -452,17 +535,6 @@ class ToolExecutor:
                 limit=None,
                 having=args.get("having", []),
             )
-
-        elif name == "fuzzy_search_values":
-            return query_engine.fuzzy_search_values(
-                args.get("class_id", ""),
-                args.get("field_name", ""),
-                args.get("keyword", ""),
-                args.get("limit", 10),
-            )
-
-        elif name == "get_class_sample":
-            return query_engine.get_class_sample(args.get("class_id", ""), args.get("limit", 5))
 
         # elif name == "get_field_types":
         #     class_id = args.get("class_id", "")

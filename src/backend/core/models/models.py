@@ -87,6 +87,10 @@ class MetricUpdate(BaseModel):
     is_reviewed: bool | None = None
 
 
+class MetricBatchDelete(BaseModel):
+    ids: list[str]
+
+
 # ============================================================
 # 概念
 # ============================================================
