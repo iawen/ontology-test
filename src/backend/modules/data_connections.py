@@ -13,7 +13,6 @@ from core.db.db import get_db
 from core.db.db_connector import (
     test_connection,
     list_tables,
-    get_table_schema,
     read_table_sample,
     mask_connection_url,
 )
@@ -163,25 +162,6 @@ async def list_db_tables(scenario_id: str, conn_id: str):
         return tables
     except Exception as e:
         raise HTTPException(500, f"获取表列表失败: {str(e)}")
-
-
-@router.get("/api/admin/scenarios/{scenario_id}/data_connections/{conn_id}/tables/{table_name}")
-async def get_db_table_detail(scenario_id: str, conn_id: str, table_name: str):
-    """获取数据库表的详细结构"""
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM data_connections WHERE id=? AND scenario_id=?",
-        (conn_id, scenario_id)
-    ).fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(404, "连接不存在")
-
-    try:
-        schema_info = get_table_schema(row["connection_url"], table_name)
-        return schema_info
-    except Exception as e:
-        raise HTTPException(500, f"获取表结构失败: {str(e)}")
 
 
 @router.get("/api/admin/scenarios/{scenario_id}/data_connections/{conn_id}/tables/{table_name}/preview")

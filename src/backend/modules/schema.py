@@ -1,6 +1,5 @@
 import os
 import json
-from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 
@@ -67,6 +66,23 @@ def _reviewed_value(value) -> bool:
     return bool(value)
 
 
+REVIEW_STATUSES = {"pending", "approved", "rejected"}
+
+
+def _review_status(value, is_reviewed=False) -> str:
+    if value == "rejected":
+        return "rejected"
+    if value == "approved" or _reviewed_value(is_reviewed):
+        return "approved"
+    if isinstance(value, str) and value in REVIEW_STATUSES:
+        return value
+    return "pending"
+
+
+def _is_reviewed_status(value) -> int:
+    return int(value == "approved")
+
+
 def _relationship_exists(conn, scenario_id: str, source: str, target: str, rel_type: str, join_key: str, exclude_id: int | None = None) -> bool:
     sql = """SELECT id FROM schema_relationships
               WHERE scenario_id=? AND source=? AND target=? AND type=? AND COALESCE(join_key, '')=?"""
@@ -95,7 +111,8 @@ async def admin_list_classes(scenario_id: str):
         d = dict(r)
         d["properties"] = _json_list(d.get("properties", "[]"))
         d["fields"] = _normalize_fields(_json_list(d.get("fields", "[]")))
-        d["is_reviewed"] = _reviewed_value(d.get("is_reviewed", 0))
+        d["review_status"] = _review_status(d.get("review_status"), d.get("is_reviewed", 0))
+        d["is_reviewed"] = d["review_status"] == "approved"
         result.append(d)
     return result
 
@@ -106,15 +123,16 @@ async def admin_create_class(scenario_id: str, req: SchemaClassEdit):
     conn = get_db()
     fields = _normalize_fields(req.fields)
     properties = req.properties or _field_names(fields)
+    review_status = _review_status(req.review_status, req.is_reviewed)
     try:
         conn.execute(
             """INSERT INTO schema_classes
-                    (id, scenario_id, name_cn, description, properties, fields, csv_file, primary_key, is_reviewed, created_at, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+                    (id, scenario_id, name_cn, description, properties, fields, csv_file, primary_key, is_reviewed, review_status, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
             (req.id, scenario_id, req.name_cn, req.description,
              json.dumps(properties, ensure_ascii=False),
              json.dumps(fields, ensure_ascii=False),
-                 req.csv_file, req.primary_key, int(req.is_reviewed)),
+                 req.csv_file, req.primary_key, _is_reviewed_status(review_status), review_status),
         )
         conn.commit()
     except Exception as e:
@@ -133,14 +151,15 @@ async def admin_update_class(scenario_id: str, class_id: str, req: SchemaClassEd
     conn = get_db()
     fields = _normalize_fields(req.fields)
     properties = req.properties or _field_names(fields)
+    review_status = _review_status(req.review_status, req.is_reviewed)
     conn.execute(
         """UPDATE schema_classes
-              SET name_cn=?, description=?, properties=?, fields=?, csv_file=?, primary_key=?, is_reviewed=?, updated_at=CURRENT_TIMESTAMP
+                  SET name_cn=?, description=?, properties=?, fields=?, csv_file=?, primary_key=?, is_reviewed=?, review_status=?, updated_at=CURRENT_TIMESTAMP
            WHERE id=? AND scenario_id=?""",
         (req.name_cn, req.description,
          json.dumps(properties, ensure_ascii=False),
          json.dumps(fields, ensure_ascii=False),
-            req.csv_file, req.primary_key, int(req.is_reviewed),
+            req.csv_file, req.primary_key, _is_reviewed_status(review_status), review_status,
          class_id, scenario_id),
     )
     conn.commit()
@@ -180,7 +199,11 @@ async def admin_list_relationships(scenario_id: str):
         (scenario_id,)
     ).fetchall()
     conn.close()
-    return [dict(r) | {"is_reviewed": _reviewed_value(r.get("is_reviewed", 0))} for r in rows]
+    result = []
+    for row in rows:
+        d = dict(row)
+        result.append(d | {"is_reviewed": _reviewed_value(d.get("is_reviewed", 0))})
+    return result
 
 
 @router.post("/api/admin/scenarios/{scenario_id}/schema/relationships")
@@ -243,132 +266,6 @@ async def admin_delete_relationship(scenario_id: str, rel_id: int):
 
 
 # ============================================================
-# 旧版 API（兼容 Chat 模块调用）
-# ============================================================
-
-@router.put("/api/schema/{scenario_id}/classes/{class_id}")
-async def update_schema_class(scenario_id:str, class_id: str, req: SchemaClassEdit):
-    ontology_dir = os.path.join(Cfg.scenarios_root, scenario_id, "ontology")
-
-    schema_path = os.path.join(ontology_dir, "schema.json")
-    mapping_path = os.path.join(ontology_dir, "schema_mapping.json")
-
-    with open(schema_path, "r", encoding="utf-8") as f:
-        schema = json.load(f)
-    with open(mapping_path, "r", encoding="utf-8") as f:
-        mapping = json.load(f)
-
-    # Update class in schema
-    for cls in schema["classes"]:
-        if cls["id"] == class_id:
-            cls["name_cn"] = req.name_cn
-            cls["description"] = req.description
-            cls["properties"] = req.properties
-            cls["fields"] = _normalize_fields(req.fields)
-            cls["is_reviewed"] = req.is_reviewed
-            break
-
-    # Update class in mapping
-    if class_id in mapping["classes"]:
-        mapping["classes"][class_id]["name_cn"] = req.name_cn
-        mapping["classes"][class_id]["csv_file"] = req.csv_file
-        mapping["classes"][class_id]["primary_key"] = req.primary_key
-        fields = _normalize_fields(req.fields)
-        mapping["classes"][class_id]["field_map"] = _field_map(fields, req.properties)
-        mapping["classes"][class_id]["field_types"] = _field_types(fields)
-        mapping["classes"][class_id]["is_reviewed"] = req.is_reviewed
-
-    with open(schema_path, "w", encoding="utf-8") as f:
-        json.dump(schema, f, ensure_ascii=False, indent=2)
-    with open(mapping_path, "w", encoding="utf-8") as f:
-        json.dump(mapping, f, ensure_ascii=False, indent=2)
-
-    # 同步到数据库
-    conn = get_db()
-    conn.execute(
-        """UPDATE schema_classes
-                SET name_cn=?, description=?, properties=?, fields=?, csv_file=?, primary_key=?, is_reviewed=?, updated_at=CURRENT_TIMESTAMP
-           WHERE id=? AND scenario_id=?""",
-        (req.name_cn, req.description,
-         json.dumps(req.properties, ensure_ascii=False),
-            json.dumps(_normalize_fields(req.fields), ensure_ascii=False),
-            req.csv_file, req.primary_key, int(req.is_reviewed),
-         class_id, scenario_id),
-    )
-    conn.commit()
-    conn.close()
-
-    return {"status": "ok"}
-
-
-@router.put("/api/schema/{scenario_id}/relationships")
-async def update_schema_relationships(scenario_id: str, req: list[SchemaRelationEdit]):
-    ontology_dir = os.path.join(Cfg.scenarios_root, scenario_id, "ontology")
-
-    schema_path = os.path.join(ontology_dir, "schema.json")
-    mapping_path = os.path.join(ontology_dir, "schema_mapping.json")
-
-    with open(schema_path, "r", encoding="utf-8") as f:
-        schema = json.load(f)
-    with open(mapping_path, "r", encoding="utf-8") as f:
-        mapping = json.load(f)
-
-    deduped = []
-    seen = set()
-    for r in req:
-        key = (r.source, r.target, r.type, r.join_key or "")
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(r)
-
-    schema["relationships"] = [r.model_dump() for r in deduped]
-    mapping["relationships"] = [r.model_dump() for r in deduped]
-
-    with open(schema_path, "w", encoding="utf-8") as f:
-        json.dump(schema, f, ensure_ascii=False, indent=2)
-    with open(mapping_path, "w", encoding="utf-8") as f:
-        json.dump(mapping, f, ensure_ascii=False, indent=2)
-
-    # 同步到数据库
-    conn = get_db()
-    conn.execute("DELETE FROM schema_relationships WHERE scenario_id=?", (scenario_id,))
-    for r in deduped:
-        conn.execute(
-            """INSERT INTO schema_relationships
-                    (scenario_id, source, target, type, join_key, is_reviewed, created_at, updated_at)
-                    VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
-                (scenario_id, r.source, r.target, r.type, r.join_key, int(r.is_reviewed)),
-        )
-    conn.commit()
-    conn.close()
-
-    return {"status": "ok"}
-
-
-@router.get("/api/schema/{scenario_id}/classes")
-async def list_schema_classes(scenario_id: str):
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM schema_classes WHERE scenario_id=? ORDER BY id",
-        (scenario_id,)
-    ).fetchall()
-    conn.close()
-    return [dict(r) | {"properties": _json_list(r["properties"]), "fields": _normalize_fields(_json_list(r["fields"])), "is_reviewed": _reviewed_value(r.get("is_reviewed", 0))} for r in rows]
-
-
-@router.get("/api/schema/{scenario_id}/relationships")
-async def list_schema_relationships(scenario_id: str):
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM schema_relationships WHERE scenario_id=? ORDER BY id",
-        (scenario_id,)
-    ).fetchall()
-    conn.close()
-    return [dict(r) | {"is_reviewed": _reviewed_value(r.get("is_reviewed", 0))} for r in rows]
-
-
-# ============================================================
 # 内部工具：同步数据库 → schema.json / schema_mapping.json
 # ============================================================
 
@@ -406,7 +303,8 @@ def _sync_schema_files(scenario_id: str):
             "primary_key": c["primary_key"],
             "csv_file": c["csv_file"],
             "fields": fields,
-            "is_reviewed": _reviewed_value(c.get("is_reviewed", 0)),
+            "is_reviewed": _review_status(c.get("review_status"), c.get("is_reviewed", 0)) == "approved",
+            "review_status": _review_status(c.get("review_status"), c.get("is_reviewed", 0)),
         })
         mapping_classes[c["id"]] = {
             "csv_file": c["csv_file"],
@@ -416,7 +314,8 @@ def _sync_schema_files(scenario_id: str):
             "field_map": _field_map(fields, properties),
             "field_types": _field_types(fields),
             "data_source": "csv" if c["csv_file"].endswith(".csv") else "database",
-            "is_reviewed": _reviewed_value(c.get("is_reviewed", 0)),
+            "is_reviewed": _review_status(c.get("review_status"), c.get("is_reviewed", 0)) == "approved",
+            "review_status": _review_status(c.get("review_status"), c.get("is_reviewed", 0)),
         }
 
     parsed_rels = []
@@ -454,7 +353,8 @@ def _sync_schema_files(scenario_id: str):
             "filters_hint": m["filters_hint"],
             "chart_type": m["chart_type"],
             "sort_order": m["sort_order"],
-            "is_reviewed": _reviewed_value(m.get("is_reviewed", 0)),
+            "is_reviewed": _review_status(m.get("review_status"), m.get("is_reviewed", 0)) == "approved",
+            "review_status": _review_status(m.get("review_status"), m.get("is_reviewed", 0)),
         })
 
     parsed_concepts = []
@@ -469,7 +369,8 @@ def _sync_schema_files(scenario_id: str):
             "concept_type": c["concept_type"],
             "related_class": c["related_class"],
             "sort_order": c["sort_order"],
-            "is_reviewed": _reviewed_value(c.get("is_reviewed", 0)),
+            "is_reviewed": _review_status(c.get("review_status"), c.get("is_reviewed", 0)) == "approved",
+            "review_status": _review_status(c.get("review_status"), c.get("is_reviewed", 0)),
         })
 
     schema = {

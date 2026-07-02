@@ -12,7 +12,6 @@ from datetime import datetime
 from enum import Enum
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
 
 from core.db.db import get_db
 
@@ -91,19 +90,6 @@ def ensure_workflow_tables():
 # 工作流 API
 # ============================================================
 
-class WorkflowCreateRequest(BaseModel):
-    workflow_name: str
-    action_id: str = ""
-    steps: list[dict]  # [{name, type, config}]
-    context: dict = {}
-    triggered_by: str = "manual"
-
-
-class WorkflowStepAction(BaseModel):
-    action: str  # approve / reject / skip
-    comment: str = ""
-
-
 @router.get("/api/admin/scenarios/{scenario_id}/workflow_instances")
 async def list_workflow_instances(scenario_id: str, status: str = "", page: int = 1, page_size: int = 20):
     """列出工作流实例"""
@@ -130,43 +116,6 @@ async def list_workflow_instances(scenario_id: str, status: str = "", page: int 
     return result
 
 
-@router.post("/api/admin/scenarios/{scenario_id}/workflow_instances")
-async def create_workflow_instance(scenario_id: str, req: WorkflowCreateRequest):
-    """创建工作流实例"""
-    ensure_workflow_tables()
-    instance_id = str(uuid.uuid4())[:12]
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    steps_with_status = []
-    for i, step in enumerate(req.steps):
-        steps_with_status.append({
-            "index": i,
-            "name": step.get("name", f"步骤{i+1}"),
-            "type": step.get("type", "auto"),  # auto / approval / notification
-            "config": step.get("config", {}),
-            "status": "pending",
-        })
-
-    conn = get_db()
-    try:
-        conn.execute(
-            """INSERT INTO workflow_instances
-               (id, scenario_id, workflow_def_id, workflow_name, action_id, status,
-                current_step, total_steps, context, steps_json, triggered_by, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (instance_id, scenario_id, "", req.workflow_name, req.action_id,
-             "pending", 0, len(steps_with_status),
-             json.dumps(req.context, ensure_ascii=False),
-             json.dumps(steps_with_status, ensure_ascii=False),
-             req.triggered_by, now, now),
-        )
-        conn.commit()
-    except Exception as e:
-        conn.close()
-        raise HTTPException(400, f"创建工作流实例失败: {e}")
-    conn.close()
-    return {"id": instance_id, "status": "pending", "total_steps": len(steps_with_status)}
-
-
 @router.get("/api/admin/scenarios/{scenario_id}/workflow_instances/{instance_id}")
 async def get_workflow_instance(scenario_id: str, instance_id: str):
     """获取工作流实例详情"""
@@ -191,81 +140,6 @@ async def get_workflow_instance(scenario_id: str, instance_id: str):
     conn.close()
     d["step_logs"] = [dict(l) for l in logs]
     return d
-
-
-@router.post("/api/admin/scenarios/{scenario_id}/workflow_instances/{instance_id}/execute")
-async def execute_workflow_instance(scenario_id: str, instance_id: str):
-    """执行工作流实例（从当前步骤继续）"""
-    ensure_workflow_tables()
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM workflow_instances WHERE id=? AND scenario_id=?",
-        (instance_id, scenario_id)
-    ).fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(404, "工作流实例不存在")
-
-    instance = dict(row)
-    instance["steps_json"] = json.loads(instance.get("steps_json", "[]"))
-    instance["context"] = json.loads(instance.get("context", "{}"))
-
-    result = _execute_workflow_instance(instance)
-    return result
-
-
-@router.post("/api/admin/scenarios/{scenario_id}/workflow_instances/{instance_id}/step/{step_index}")
-async def handle_workflow_step(scenario_id: str, instance_id: str, step_index: int, req: WorkflowStepAction):
-    """处理工作流步骤（审批/跳过）"""
-    ensure_workflow_tables()
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM workflow_instances WHERE id=? AND scenario_id=?",
-        (instance_id, scenario_id)
-    ).fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(404, "工作流实例不存在")
-
-    instance = dict(row)
-    steps = json.loads(instance.get("steps_json", "[]"))
-    context = json.loads(instance.get("context", "{}"))
-
-    if step_index < 0 or step_index >= len(steps):
-        raise HTTPException(400, f"步骤索引 {step_index} 超出范围")
-
-    step = steps[step_index]
-    if step["status"] != "waiting_approval":
-        raise HTTPException(400, f"步骤 {step_index} 当前状态为 {step['status']}，无法操作")
-
-    if req.action == "approve":
-        step["status"] = "completed"
-        _log_step(instance_id, step_index, step["name"], "completed", {}, {"approved": True, "comment": req.comment})
-        # 继续执行下一步
-        instance["steps_json"] = json.dumps(steps, ensure_ascii=False)
-        instance["context"] = json.dumps(context, ensure_ascii=False)
-        instance["current_step"] = step_index + 1
-        _update_instance(instance_id, steps, context, step_index + 1, "running")
-        # 异步继续执行
-        result = _execute_workflow_from_step(instance, step_index + 1)
-        return {"status": "approved", "next_result": result}
-    elif req.action == "reject":
-        step["status"] = "failed"
-        _log_step(instance_id, step_index, step["name"], "failed", {}, {"rejected": True, "comment": req.comment})
-        steps[step_index] = step
-        _update_instance(instance_id, steps, context, step_index, "failed")
-        return {"status": "rejected", "workflow_status": "failed"}
-    elif req.action == "skip":
-        step["status"] = "skipped"
-        _log_step(instance_id, step_index, step["name"], "skipped", {}, {"skipped": True})
-        steps[step_index] = step
-        instance["steps_json"] = json.dumps(steps, ensure_ascii=False)
-        instance["context"] = json.dumps(context, ensure_ascii=False)
-        _update_instance(instance_id, steps, context, step_index + 1, "running")
-        result = _execute_workflow_from_step(instance, step_index + 1)
-        return {"status": "skipped", "next_result": result}
-
-    return {"status": "unknown_action"}
 
 
 # ============================================================

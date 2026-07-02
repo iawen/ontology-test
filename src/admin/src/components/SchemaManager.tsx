@@ -1,23 +1,29 @@
 "use client";
 
 import { useState, useEffect, useMemo, useRef } from "react";
+import type { ReactNode } from "react";
 import ReactEChartsCore from "echarts-for-react/lib/core";
 import * as echarts from "echarts/core";
 import { GraphChart } from "echarts/charts";
 import { TooltipComponent, LegendComponent } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
-import { Maximize2, RotateCcw, ZoomIn, ZoomOut } from "lucide-react";
+import {
+  ArrowDown,
+  ArrowUp,
+  ChevronsUpDown,
+  Maximize2,
+  RotateCcw,
+  ZoomIn,
+  ZoomOut,
+} from "lucide-react";
 import { useApp } from "@/contexts/AppContext";
 import { useApi } from "@/hooks/useApi";
-import {
-  getCacheData,
-  setCacheData,
-  invalidateCache,
-} from "@/lib/cache";
+import { getCacheData, setCacheData, invalidateCache } from "@/lib/cache";
 import Modal from "@/components/ui/Modal";
 import ConfirmDialog from "@/components/ui/ConfirmDialog";
 import EmptyState from "@/components/ui/EmptyState";
 import LoadingSpinner from "@/components/ui/LoadingSpinner";
+import SearchInput from "@/components/ui/SearchInput";
 import ScenarioSelector from "@/components/ScenarioSelector";
 import type { SchemaClass, SchemaField, SchemaRelationship } from "@/lib/types";
 
@@ -26,6 +32,77 @@ echarts.use([GraphChart, TooltipComponent, LegendComponent, CanvasRenderer]);
 const REVIEW_COLORS = {
   approved: { fill: "#ecfdf5", stroke: "#10b981", text: "#047857" },
   pending: { fill: "#fffbeb", stroke: "#f59e0b", text: "#b45309" },
+  rejected: { fill: "#fff1f2", stroke: "#f43f5e", text: "#be123c" },
+};
+const REVIEW_LABELS = {
+  approved: "通过",
+  pending: "待审",
+  rejected: "不通过",
+} as const;
+const REVIEW_BADGE = {
+  approved: "bg-emerald-50 text-emerald-700",
+  pending: "bg-amber-50 text-amber-700",
+  rejected: "bg-rose-50 text-rose-700",
+} as const;
+const getClassReviewStatus = (
+  item?: Partial<Pick<SchemaClass, "is_reviewed" | "review_status">> | null,
+) => item?.review_status || (item?.is_reviewed ? "approved" : "pending");
+type ReviewStatus = keyof typeof REVIEW_LABELS;
+type RelationshipReviewStatus = "approved" | "pending";
+type SortDirection = "asc" | "desc";
+type ClassSortKey =
+  | "id"
+  | "name_cn"
+  | "description"
+  | "csv_file"
+  | "primary_key"
+  | "fields"
+  | "review_status";
+type RelationshipSortKey =
+  | "source"
+  | "target"
+  | "type"
+  | "join_key"
+  | "is_reviewed";
+type NodePosition = { x: number; y: number };
+
+const RELATIONSHIP_REVIEW_LABELS: Record<RelationshipReviewStatus, string> = {
+  approved: "通过",
+  pending: "待审",
+};
+const collator = new Intl.Collator("zh-CN", {
+  numeric: true,
+  sensitivity: "base",
+});
+
+const relationshipReviewStatus = (
+  relationship: SchemaRelationship,
+): RelationshipReviewStatus =>
+  relationship.is_reviewed ? "approved" : "pending";
+
+const classSortValue = (schemaClass: SchemaClass, key: ClassSortKey) => {
+  if (key === "fields") return (schemaClass.fields || []).length;
+  if (key === "review_status")
+    return REVIEW_LABELS[getClassReviewStatus(schemaClass)];
+  return schemaClass[key] || "";
+};
+
+const relationshipSortValue = (
+  relationship: SchemaRelationship,
+  key: RelationshipSortKey,
+) => {
+  if (key === "is_reviewed")
+    return RELATIONSHIP_REVIEW_LABELS[relationshipReviewStatus(relationship)];
+  return relationship[key] || "";
+};
+
+const compareValues = (
+  leftValue: string | number,
+  rightValue: string | number,
+) => {
+  if (typeof leftValue === "number" && typeof rightValue === "number")
+    return leftValue - rightValue;
+  return collator.compare(String(leftValue), String(rightValue));
 };
 
 const escapeHtml = (value: unknown) =>
@@ -35,6 +112,19 @@ const escapeHtml = (value: unknown) =>
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+
+const getInitialNodePosition = (index: number, total: number): NodePosition => {
+  if (total <= 1) return { x: 0, y: 0 };
+  const columns = Math.ceil(Math.sqrt(total));
+  const rows = Math.ceil(total / columns);
+  const column = index % columns;
+  const row = Math.floor(index / columns);
+
+  return {
+    x: (column - (columns - 1) / 2) * 240,
+    y: (row - (rows - 1) / 2) * 150,
+  };
+};
 
 export default function SchemaManager() {
   const { token, activeScenario, addToast } = useApp();
@@ -58,9 +148,31 @@ export default function SchemaManager() {
     id: string | number;
   } | null>(null);
   const [viewMode, setViewMode] = useState<"graph" | "table">("graph");
+  const [classSearch, setClassSearch] = useState("");
+  const [classFilterCsv, setClassFilterCsv] = useState("");
+  const [classFilterReview, setClassFilterReview] = useState<"" | ReviewStatus>(
+    "",
+  );
+  const [classSort, setClassSort] = useState<{
+    key: ClassSortKey;
+    direction: SortDirection;
+  }>({ key: "id", direction: "asc" });
+  const [relationshipSearch, setRelationshipSearch] = useState("");
+  const [relationshipFilterSource, setRelationshipFilterSource] = useState("");
+  const [relationshipFilterTarget, setRelationshipFilterTarget] = useState("");
+  const [relationshipFilterType, setRelationshipFilterType] = useState("");
+  const [relationshipFilterReview, setRelationshipFilterReview] = useState<
+    "" | RelationshipReviewStatus
+  >("");
+  const [relationshipSort, setRelationshipSort] = useState<{
+    key: RelationshipSortKey;
+    direction: SortDirection;
+  }>({ key: "source", direction: "asc" });
+  const [nodePositions, setNodePositions] = useState<Record<string, NodePosition>>({});
 
   // 🛠️ 声明 ECharts 实例的 Ref
   const echartsRef = useRef<any>(null);
+  const lastNodeDragAtRef = useRef(0);
 
   const cacheKey = `schema:${activeScenario}`;
 
@@ -76,17 +188,24 @@ export default function SchemaManager() {
   const updateEditField = (index: number, patch: Partial<SchemaField>) => {
     const fields = [...(editClass?.fields || [])];
     fields[index] = { ...fields[index], ...patch } as SchemaField;
-    const properties = fields.map((field) => field.name || field.physical_name).filter(Boolean);
+    const properties = fields
+      .map((field) => field.name || field.physical_name)
+      .filter(Boolean);
     setEditClass({ ...editClass!, fields, properties });
   };
 
   const addEditField = () => {
-    setEditClass({ ...editClass!, fields: [...(editClass?.fields || []), emptyField()] });
+    setEditClass({
+      ...editClass!,
+      fields: [...(editClass?.fields || []), emptyField()],
+    });
   };
 
   const removeEditField = (index: number) => {
     const fields = (editClass?.fields || []).filter((_, i) => i !== index);
-    const properties = fields.map((field) => field.name || field.physical_name).filter(Boolean);
+    const properties = fields
+      .map((field) => field.name || field.physical_name)
+      .filter(Boolean);
     setEditClass({ ...editClass!, fields, properties });
   };
 
@@ -124,7 +243,6 @@ export default function SchemaManager() {
     if (activeScenario) load();
   }, [activeScenario]);
 
-  // 🛠️ 缩放与布局控制函数
   const handleZoomIn = () => {
     const chartInstance = echartsRef.current?.getEchartsInstance();
     if (!chartInstance) return;
@@ -132,7 +250,7 @@ export default function SchemaManager() {
     // 放大：增大 zoom 系数
     const currentZoom = option.series[0].zoom || 1;
     chartInstance.setOption({
-      series: [{ zoom: currentZoom + 0.2 }]
+      series: [{ zoom: currentZoom + 0.2 }],
     });
   };
 
@@ -143,25 +261,21 @@ export default function SchemaManager() {
     // 缩小：减小 zoom 系数，最低不小于 0.2
     const currentZoom = option.series[0].zoom || 1;
     chartInstance.setOption({
-      series: [{ zoom: Math.max(0.2, currentZoom - 0.2) }]
+      series: [{ zoom: Math.max(0.2, currentZoom - 0.2) }],
     });
   };
 
   const handleResetLayout = () => {
+    setNodePositions({});
     const chartInstance = echartsRef.current?.getEchartsInstance();
     if (!chartInstance) return;
-    // 复位：重置 zoom 级别，并清空用户的拖拽位移偏移量、平移中心点
     chartInstance.setOption({
-      series: [{
-        zoom: 1,
-        center: null
-      }]
-    });
-    // 重新触发力引导布局使其平滑重排
-    chartInstance.dispatchAction({
-      type: "graphRoam",
-      dx: 0,
-      dy: 0
+      series: [
+        {
+          zoom: 1,
+          center: null,
+        },
+      ],
     });
   };
 
@@ -179,13 +293,17 @@ export default function SchemaManager() {
       return;
     }
     const isEdit = classes.some((c) => c.id === editClass.id);
-    const fields = (editClass.fields || []).filter((field) => field.name || field.physical_name);
+    const fields = (editClass.fields || []).filter(
+      (field) => field.name || field.physical_name,
+    );
     const payload = {
       ...editClass,
       fields,
       properties: editClass.properties?.length
         ? editClass.properties
-        : fields.map((field) => field.name || field.physical_name).filter(Boolean),
+        : fields
+            .map((field) => field.name || field.physical_name)
+            .filter(Boolean),
     };
     try {
       await api(
@@ -222,13 +340,23 @@ export default function SchemaManager() {
     }
     const isEdit = typeof newRel.id === "number";
     try {
-      await api(`/api/admin/scenarios/${activeScenario}/schema/relationships${isEdit ? `/${newRel.id}` : ""}`, {
-        method: isEdit ? "PUT" : "POST",
-        body: JSON.stringify(newRel),
-      });
+      await api(
+        `/api/admin/scenarios/${activeScenario}/schema/relationships${isEdit ? `/${newRel.id}` : ""}`,
+        {
+          method: isEdit ? "PUT" : "POST",
+          body: JSON.stringify(newRel),
+        },
+      );
       addToast("success", isEdit ? "关系已更新" : "关系已创建");
       setIsRelModalOpen(false);
-      setNewRel({ id: undefined, source: "", target: "", type: "", join_key: "", is_reviewed: false });
+      setNewRel({
+        id: undefined,
+        source: "",
+        target: "",
+        type: "",
+        join_key: "",
+        is_reviewed: false,
+      });
       invalidateCache(cacheKey);
       load(true);
     } catch (e: any) {
@@ -255,133 +383,323 @@ export default function SchemaManager() {
     [classes],
   );
 
-  const reviewedClassCount = classes.filter((schemaClass) => schemaClass.is_reviewed).length;
-  const reviewedRelationshipCount = relationships.filter((relationship) => relationship.is_reviewed).length;
-  const isolatedClassCount = classes.filter(
-    (schemaClass) => !relationships.some((relationship) => relationship.source === schemaClass.id || relationship.target === schemaClass.id),
+  const reviewedClassCount = classes.filter(
+    (schemaClass) => schemaClass.is_reviewed,
   ).length;
+  const reviewedRelationshipCount = relationships.filter(
+    (relationship) => relationship.is_reviewed,
+  ).length;
+  const isolatedClassCount = classes.filter(
+    (schemaClass) =>
+      !relationships.some(
+        (relationship) =>
+          relationship.source === schemaClass.id ||
+          relationship.target === schemaClass.id,
+      ),
+  ).length;
+  const csvFiles = [
+    ...new Set(
+      classes.map((schemaClass) => schemaClass.csv_file).filter(Boolean),
+    ),
+  ].sort((a, b) => collator.compare(a, b));
+  const relationshipSources = [
+    ...new Set(
+      relationships.map((relationship) => relationship.source).filter(Boolean),
+    ),
+  ].sort((a, b) => collator.compare(a, b));
+  const relationshipTargets = [
+    ...new Set(
+      relationships.map((relationship) => relationship.target).filter(Boolean),
+    ),
+  ].sort((a, b) => collator.compare(a, b));
+  const relationshipTypes = [
+    ...new Set(
+      relationships.map((relationship) => relationship.type).filter(Boolean),
+    ),
+  ].sort((a, b) => collator.compare(a, b));
+  const filteredClasses = classes
+    .filter((schemaClass) => {
+      const keyword = classSearch.trim().toLowerCase();
+      const matchSearch =
+        !keyword ||
+        [
+          schemaClass.id,
+          schemaClass.name_cn,
+          schemaClass.description,
+          schemaClass.csv_file,
+          schemaClass.primary_key,
+        ].some((value) => (value || "").toLowerCase().includes(keyword));
+      const matchCsv =
+        !classFilterCsv || schemaClass.csv_file === classFilterCsv;
+      const matchReview =
+        !classFilterReview ||
+        getClassReviewStatus(schemaClass) === classFilterReview;
+      return matchSearch && matchCsv && matchReview;
+    })
+    .sort(
+      (left, right) =>
+        compareValues(
+          classSortValue(left, classSort.key),
+          classSortValue(right, classSort.key),
+        ) * (classSort.direction === "asc" ? 1 : -1),
+    );
+  const filteredRelationships = relationships
+    .filter((relationship) => {
+      const keyword = relationshipSearch.trim().toLowerCase();
+      const matchSearch =
+        !keyword ||
+        [
+          relationship.source,
+          relationship.target,
+          relationship.type,
+          relationship.join_key,
+        ].some((value) => (value || "").toLowerCase().includes(keyword));
+      const matchSource =
+        !relationshipFilterSource ||
+        relationship.source === relationshipFilterSource;
+      const matchTarget =
+        !relationshipFilterTarget ||
+        relationship.target === relationshipFilterTarget;
+      const matchType =
+        !relationshipFilterType || relationship.type === relationshipFilterType;
+      const matchReview =
+        !relationshipFilterReview ||
+        relationshipReviewStatus(relationship) === relationshipFilterReview;
+      return (
+        matchSearch && matchSource && matchTarget && matchType && matchReview
+      );
+    })
+    .sort(
+      (left, right) =>
+        compareValues(
+          relationshipSortValue(left, relationshipSort.key),
+          relationshipSortValue(right, relationshipSort.key),
+        ) * (relationshipSort.direction === "asc" ? 1 : -1),
+    );
 
-  const graphOption = useMemo(() => ({
-    backgroundColor: "transparent",
-    animationDurationUpdate: 450,
-    tooltip: {
-      trigger: "item",
-      appendToBody: true,
-      backgroundColor: "rgba(15, 23, 42, 0.94)",
-      borderWidth: 0,
-      padding: [10, 12],
-      textStyle: { color: "#f8fafc", fontSize: 12 },
-      formatter: (params: any) => {
-        if (params.dataType === "edge") {
-          const relationship = params.data.raw as SchemaRelationship | undefined;
-          if (!relationship) return "";
-          return `<div style="min-width:180px">
+  const toggleClassSort = (key: ClassSortKey) =>
+    setClassSort((current) =>
+      current.key === key
+        ? { key, direction: current.direction === "asc" ? "desc" : "asc" }
+        : { key, direction: "asc" },
+    );
+  const toggleRelationshipSort = (key: RelationshipSortKey) =>
+    setRelationshipSort((current) =>
+      current.key === key
+        ? { key, direction: current.direction === "asc" ? "desc" : "asc" }
+        : { key, direction: "asc" },
+    );
+  const SortIcon = ({
+    active,
+    direction,
+  }: {
+    active: boolean;
+    direction: SortDirection;
+  }) =>
+    !active ? (
+      <ChevronsUpDown className="h-3.5 w-3.5 text-slate-400" />
+    ) : direction === "asc" ? (
+      <ArrowUp className="h-3.5 w-3.5 text-indigo-500" />
+    ) : (
+      <ArrowDown className="h-3.5 w-3.5 text-indigo-500" />
+    );
+  const ClassSortHeader = ({
+    column,
+    children,
+  }: {
+    column: ClassSortKey;
+    children: ReactNode;
+  }) => (
+    <button
+      type="button"
+      onClick={() => toggleClassSort(column)}
+      className="inline-flex w-full items-center gap-1 text-xs font-semibold text-slate-600 transition-colors hover:text-indigo-600"
+    >
+      <span>{children}</span>
+      <SortIcon
+        active={classSort.key === column}
+        direction={classSort.direction}
+      />
+    </button>
+  );
+  const RelationshipSortHeader = ({
+    column,
+    children,
+  }: {
+    column: RelationshipSortKey;
+    children: ReactNode;
+  }) => (
+    <button
+      type="button"
+      onClick={() => toggleRelationshipSort(column)}
+      className="inline-flex w-full items-center gap-1 text-xs font-semibold text-slate-600 transition-colors hover:text-indigo-600"
+    >
+      <span>{children}</span>
+      <SortIcon
+        active={relationshipSort.key === column}
+        direction={relationshipSort.direction}
+      />
+    </button>
+  );
+
+  const graphOption = useMemo(
+    () => ({
+      backgroundColor: "transparent",
+      animationDurationUpdate: 450,
+      tooltip: {
+        trigger: "item",
+        appendToBody: true,
+        backgroundColor: "rgba(15, 23, 42, 0.94)",
+        borderWidth: 0,
+        padding: [10, 12],
+        textStyle: { color: "#f8fafc", fontSize: 12 },
+        formatter: (params: any) => {
+          if (params.dataType === "edge") {
+            const relationship = params.data.raw as
+              | SchemaRelationship
+              | undefined;
+            if (!relationship) return "";
+            return `<div style="min-width:180px">
             <div style="font-weight:600;margin-bottom:6px">${escapeHtml(relationship.type || "关系")}</div>
             <div>源: ${escapeHtml(relationship.source)}</div>
             <div>目标: ${escapeHtml(relationship.target)}</div>
             <div>JOIN: ${escapeHtml(relationship.join_key || "-")}</div>
             <div>审核: ${relationship.is_reviewed ? "通过" : "待审"}</div>
           </div>`;
-        }
-        const schemaClass = params.data.raw as SchemaClass | undefined;
-        if (!schemaClass) return "";
-        return `<div style="min-width:220px">
+          }
+          const schemaClass = params.data.raw as SchemaClass | undefined;
+          if (!schemaClass) return "";
+          return `<div style="min-width:220px">
           <div style="font-weight:700;margin-bottom:6px">${escapeHtml(schemaClass.name_cn || schemaClass.id)}</div>
           <div style="color:#cbd5e1;margin-bottom:6px">${escapeHtml(schemaClass.id)}</div>
           <div>字段: ${(schemaClass.fields || []).length}</div>
           <div>数据文件: ${escapeHtml(schemaClass.csv_file || "-")}</div>
           <div>主键: ${escapeHtml(schemaClass.primary_key || "-")}</div>
-          <div>审核: ${schemaClass.is_reviewed ? "通过" : "待审"}</div>
+          <div>审核: ${REVIEW_LABELS[getClassReviewStatus(schemaClass)]}</div>
         </div>`;
-      },
-    },
-    series: [
-      {
-        type: "graph",
-        layout: "force",
-        roam: true,
-        draggable: true,
-        cursor: "pointer",
-        scaleLimit: { min: 0.25, max: 3 },
-        edgeSymbol: ["none", "arrow"],
-        edgeSymbolSize: [0, 10],
-        label: {
-          show: true,
-          formatter: (params: any) => params.data.label,
-          color: "#0f172a",
-          fontSize: 12,
-          fontWeight: 600,
-          width: 120,
-          overflow: "truncate",
-        },
-        edgeLabel: {
-          show: true,
-          formatter: (params: any) => params.data.label,
-          color: "#64748b",
-          fontSize: 10,
-          backgroundColor: "rgba(255,255,255,0.86)",
-          borderColor: "#e2e8f0",
-          borderWidth: 1,
-          borderRadius: 4,
-          padding: [2, 5],
-        },
-        emphasis: {
-          focus: "adjacency",
-          lineStyle: { width: 2.5, color: "#4f46e5" },
-          label: { color: "#111827" },
-        },
-        data: classes.map((schemaClass) => {
-          const fieldCount = (schemaClass.fields || []).length;
-          const palette = schemaClass.is_reviewed ? REVIEW_COLORS.approved : REVIEW_COLORS.pending;
-          return {
-            id: schemaClass.id,
-            name: schemaClass.id,
-            label: schemaClass.name_cn || schemaClass.id,
-            symbol: "roundRect",
-            symbolSize: [Math.min(170, Math.max(106, (schemaClass.name_cn || schemaClass.id).length * 13)), 46 + Math.min(fieldCount, 18)],
-            raw: schemaClass,
-            itemStyle: {
-              color: palette.fill,
-              borderColor: palette.stroke,
-              borderWidth: 2,
-              shadowBlur: 12,
-              shadowColor: "rgba(15, 23, 42, 0.08)",
-            },
-          };
-        }),
-        links: relationships
-          .filter((relationship) => classById.has(relationship.source) && classById.has(relationship.target))
-          .map((relationship) => ({
-            source: relationship.source,
-            target: relationship.target,
-            label: relationship.type || "关联",
-            raw: relationship,
-            lineStyle: {
-              color: relationship.is_reviewed ? "#94a3b8" : "#f59e0b",
-              width: relationship.is_reviewed ? 1.4 : 1.8,
-              curveness: 0.16,
-              opacity: 0.88,
-            },
-          })),
-        force: {
-          repulsion: Math.max(420, classes.length * 34),
-          gravity: 0.055,
-          edgeLength: [150, 260],
-          friction: 0.58,
         },
       },
-    ],
-  }), [classById, classes, relationships]);
+      series: [
+        {
+          type: "graph",
+          layout: "none",
+          roam: true,
+          draggable: true,
+          cursor: "pointer",
+          scaleLimit: { min: 0.25, max: 3 },
+          edgeSymbol: ["none", "arrow"],
+          edgeSymbolSize: [0, 10],
+          label: {
+            show: true,
+            formatter: (params: any) => params.data.label,
+            color: "#0f172a",
+            fontSize: 12,
+            fontWeight: 600,
+            width: 120,
+            overflow: "truncate",
+          },
+          edgeLabel: {
+            show: true,
+            formatter: (params: any) => params.data.label,
+            color: "#64748b",
+            fontSize: 10,
+            backgroundColor: "rgba(255,255,255,0.86)",
+            borderColor: "#e2e8f0",
+            borderWidth: 1,
+            borderRadius: 4,
+            padding: [2, 5],
+          },
+          emphasis: {
+            focus: "adjacency",
+            lineStyle: { width: 2.5, color: "#4f46e5" },
+            label: { color: "#111827" },
+          },
+          data: classes.map((schemaClass, index) => {
+            const fieldCount = (schemaClass.fields || []).length;
+            const palette = REVIEW_COLORS[getClassReviewStatus(schemaClass)];
+            const position =
+              nodePositions[schemaClass.id] ||
+              getInitialNodePosition(index, classes.length);
+            return {
+              id: schemaClass.id,
+              name: schemaClass.id,
+              label: schemaClass.name_cn || schemaClass.id,
+              x: position.x,
+              y: position.y,
+              symbol: "roundRect",
+              symbolSize: [
+                Math.min(
+                  170,
+                  Math.max(
+                    106,
+                    (schemaClass.name_cn || schemaClass.id).length * 13,
+                  ),
+                ),
+                46 + Math.min(fieldCount, 18),
+              ],
+              raw: schemaClass,
+              itemStyle: {
+                color: palette.fill,
+                borderColor: palette.stroke,
+                borderWidth: 2,
+                shadowBlur: 12,
+                shadowColor: "rgba(15, 23, 42, 0.08)",
+              },
+            };
+          }),
+          links: relationships
+            .filter(
+              (relationship) =>
+                classById.has(relationship.source) &&
+                classById.has(relationship.target),
+            )
+            .map((relationship) => ({
+              source: relationship.source,
+              target: relationship.target,
+              label: relationship.type || "关联",
+              raw: relationship,
+              lineStyle: {
+                color: relationship.is_reviewed ? "#94a3b8" : "#f59e0b",
+                width: relationship.is_reviewed ? 1.4 : 1.8,
+                curveness: 0.16,
+                opacity: 0.88,
+              },
+            })),
+        },
+      ],
+    }),
+    [classById, classes, nodePositions, relationships],
+  );
 
-  const graphEvents = useMemo(() => ({
-    click: (params: any) => {
-      if (params.dataType === "node" && params.data?.raw) {
-        const schemaClass = params.data.raw as SchemaClass;
-        setEditClass({ ...schemaClass, fields: schemaClass.fields || [] });
-        setIsClassModalOpen(true);
-      }
-    },
-  }), []);
+  const graphEvents = useMemo(
+    () => ({
+      click: (params: any) => {
+        if (Date.now() - lastNodeDragAtRef.current < 250) return;
+        if (params.dataType === "node" && params.data?.raw) {
+          const schemaClass = params.data.raw as SchemaClass;
+          setEditClass({ ...schemaClass, fields: schemaClass.fields || [] });
+          setIsClassModalOpen(true);
+        }
+      },
+      dragend: (params: any) => {
+        if (params.dataType !== "node" || !params.data?.id) return;
+        const chartInstance = echartsRef.current?.getEchartsInstance();
+        const layout = chartInstance
+          ?.getModel()
+          ?.getSeriesByIndex(0)
+          ?.getData()
+          ?.getItemLayout(params.dataIndex);
+        if (!Array.isArray(layout) || layout.length < 2) return;
+        lastNodeDragAtRef.current = Date.now();
+        const [x, y] = layout;
+        setNodePositions((current) => ({
+          ...current,
+          [params.data.id]: { x, y },
+        }));
+      },
+    }),
+    [],
+  );
 
   if (!activeScenario)
     return (
@@ -422,6 +740,7 @@ export default function SchemaManager() {
                 csv_file: "",
                 primary_key: "",
                 is_reviewed: false,
+                review_status: "pending",
               });
               setIsClassModalOpen(true);
             }}
@@ -451,21 +770,29 @@ export default function SchemaManager() {
         <div className="card overflow-hidden border border-slate-200 bg-white">
           <div className="flex flex-col gap-3 border-b border-slate-100 bg-slate-50/80 px-5 py-4 lg:flex-row lg:items-center lg:justify-between">
             <div>
-              <h3 className="text-sm font-semibold text-slate-800">Schema 关系图谱</h3>
+              <h3 className="text-sm font-semibold text-slate-800">
+                Schema 关系图谱
+              </h3>
               <div className="mt-1 flex flex-wrap items-center gap-3 text-xs text-slate-500">
                 <span>类 {classes.length}</span>
                 <span>关系 {relationships.length}</span>
-                <span>已审核类 {reviewedClassCount}</span>
+                <span>已通过类 {reviewedClassCount}</span>
                 <span>已审核关系 {reviewedRelationshipCount}</span>
                 <span>孤立类 {isolatedClassCount}</span>
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-2 text-xs">
               <span className="inline-flex items-center gap-1.5 rounded-md border border-emerald-100 bg-emerald-50 px-2 py-1 text-emerald-700">
-                <span className="h-2 w-2 rounded-full bg-emerald-500" />通过
+                <span className="h-2 w-2 rounded-full bg-emerald-500" />
+                通过
               </span>
               <span className="inline-flex items-center gap-1.5 rounded-md border border-amber-100 bg-amber-50 px-2 py-1 text-amber-700">
-                <span className="h-2 w-2 rounded-full bg-amber-500" />待审
+                <span className="h-2 w-2 rounded-full bg-amber-500" />
+                待审
+              </span>
+              <span className="inline-flex items-center gap-1.5 rounded-md border border-rose-100 bg-rose-50 px-2 py-1 text-rose-700">
+                <span className="h-2 w-2 rounded-full bg-rose-500" />
+                不通过
               </span>
             </div>
           </div>
@@ -494,7 +821,7 @@ export default function SchemaManager() {
               </button>
               <button
                 onClick={handleResetLayout}
-                title="自动布局复位"
+                title="布局复位"
                 className="flex h-8 w-8 items-center justify-center rounded-md text-slate-600 transition-colors hover:bg-slate-100 active:bg-slate-200"
               >
                 <RotateCcw size={16} />
@@ -514,9 +841,49 @@ export default function SchemaManager() {
         /* 下方表格逻辑和各种 Modal 保持原样不作改动 */
         <div className="space-y-6">
           <div className="card overflow-hidden">
-            <h3 className="px-5 py-3 text-sm font-semibold text-slate-700 border-b border-slate-100">
-              类 ({classes.length})
-            </h3>
+            <div className="border-b border-slate-100 px-5 py-3">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <h3 className="text-sm font-semibold text-slate-700">
+                  类 ({filteredClasses.length}/{classes.length})
+                </h3>
+                <span className="text-xs text-slate-400">点击表头排序</span>
+              </div>
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
+                <div className="min-w-0 flex-1">
+                  <SearchInput
+                    value={classSearch}
+                    onChange={setClassSearch}
+                    placeholder="搜索 ID、中文名、描述、数据文件或主键..."
+                  />
+                </div>
+                <select
+                  value={classFilterCsv}
+                  onChange={(e) => setClassFilterCsv(e.target.value)}
+                  className="text-sm lg:w-44"
+                >
+                  <option value="">全部数据文件</option>
+                  {csvFiles.map((csvFile) => (
+                    <option key={csvFile} value={csvFile}>
+                      {csvFile}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={classFilterReview}
+                  onChange={(e) =>
+                    setClassFilterReview(e.target.value as "" | ReviewStatus)
+                  }
+                  className="text-sm lg:w-36"
+                >
+                  <option value="">全部审核</option>
+                  {Object.entries(REVIEW_LABELS).map(([key, label]) => (
+                    <option key={key} value={key}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
             <div className="overflow-x-auto">
               <table className="data-table min-w-[1060px] table-fixed">
                 <colgroup>
@@ -532,18 +899,40 @@ export default function SchemaManager() {
                 </colgroup>
                 <thead>
                   <tr>
-                    <th>ID</th>
-                    <th>中文名</th>
-                    <th>描述</th>
-                    <th>数据文件</th>
-                    <th>主键</th>
-                    <th>字段</th>
-                    <th>审核</th>
+                    <th>
+                      <ClassSortHeader column="id">ID</ClassSortHeader>
+                    </th>
+                    <th>
+                      <ClassSortHeader column="name_cn">中文名</ClassSortHeader>
+                    </th>
+                    <th>
+                      <ClassSortHeader column="description">
+                        描述
+                      </ClassSortHeader>
+                    </th>
+                    <th>
+                      <ClassSortHeader column="csv_file">
+                        数据文件
+                      </ClassSortHeader>
+                    </th>
+                    <th>
+                      <ClassSortHeader column="primary_key">
+                        主键
+                      </ClassSortHeader>
+                    </th>
+                    <th>
+                      <ClassSortHeader column="fields">字段</ClassSortHeader>
+                    </th>
+                    <th>
+                      <ClassSortHeader column="review_status">
+                        审核
+                      </ClassSortHeader>
+                    </th>
                     <th className="text-right">操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {classes.map((c) => (
+                  {filteredClasses.map((c) => (
                     <tr key={c.id}>
                       <td className="font-mono text-xs truncate" title={c.id}>
                         {c.id}
@@ -551,7 +940,10 @@ export default function SchemaManager() {
                       <td className="font-medium truncate" title={c.name_cn}>
                         {c.name_cn}
                       </td>
-                      <td className="text-slate-500 truncate" title={c.description}>
+                      <td
+                        className="text-slate-500 truncate"
+                        title={c.description}
+                      >
                         {c.description}
                       </td>
                       <td className="text-xs truncate" title={c.csv_file}>
@@ -564,8 +956,10 @@ export default function SchemaManager() {
                         {(c.fields || []).length}
                       </td>
                       <td>
-                        <span className={`inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium ${c.is_reviewed ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>
-                          {c.is_reviewed ? "通过" : "待审"}
+                        <span
+                          className={`inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium ${REVIEW_BADGE[getClassReviewStatus(c)]}`}
+                        >
+                          {REVIEW_LABELS[getClassReviewStatus(c)]}
                         </span>
                       </td>
                       <td className="text-right whitespace-nowrap">
@@ -594,62 +988,154 @@ export default function SchemaManager() {
             </div>
           </div>
           <div className="card overflow-hidden">
-            <h3 className="px-5 py-3 text-sm font-semibold text-slate-700 border-b border-slate-100">
-              关系 ({relationships.length})
-            </h3>
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>源</th>
-                  <th>目标</th>
-                  <th>类型</th>
-                  <th>JOIN字段</th>
-                  <th>审核</th>
-                  <th className="text-right">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {relationships.map((r) => (
-                  <tr key={r.id}>
-                    <td className="font-mono text-xs">{r.source}</td>
-                    <td className="font-mono text-xs">{r.target}</td>
-                    <td>{r.type}</td>
-                    <td className="text-xs">{r.join_key}</td>
-                    <td>
-                      <span className={`text-xs px-1.5 py-0.5 rounded ${r.is_reviewed ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>
-                        {r.is_reviewed ? "通过" : "待审"}
-                      </span>
-                    </td>
-                    <td className="text-right">
-                      <button
-                        onClick={() => {
-                          setNewRel({
-                            id: r.id,
-                            source: r.source,
-                            target: r.target,
-                            type: r.type,
-                            join_key: r.join_key,
-                            is_reviewed: !!r.is_reviewed,
-                          });
-                          setIsRelModalOpen(true);
-                        }}
-                        className="btn-ghost text-xs"
-                      >
-                        编辑
-                      </button>
-                      <button
-                        onClick={() =>
-                          setDeleteTarget({ type: "rel", id: r.id })
-                        }
-                        className="btn-ghost text-xs text-red-500"
-                      >
-                        删除
-                      </button>
-                    </td>
+            <div className="border-b border-slate-100 px-5 py-3">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <h3 className="text-sm font-semibold text-slate-700">
+                  关系 ({filteredRelationships.length}/{relationships.length})
+                </h3>
+                <span className="text-xs text-slate-400">点击表头排序</span>
+              </div>
+              <div className="flex flex-col gap-3 xl:flex-row xl:items-center">
+                <div className="min-w-0 flex-1">
+                  <SearchInput
+                    value={relationshipSearch}
+                    onChange={setRelationshipSearch}
+                    placeholder="搜索源、目标、类型或 JOIN 字段..."
+                  />
+                </div>
+                <select
+                  value={relationshipFilterSource}
+                  onChange={(e) => setRelationshipFilterSource(e.target.value)}
+                  className="text-sm xl:w-36"
+                >
+                  <option value="">全部源类</option>
+                  {relationshipSources.map((source) => (
+                    <option key={source} value={source}>
+                      {source}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={relationshipFilterTarget}
+                  onChange={(e) => setRelationshipFilterTarget(e.target.value)}
+                  className="text-sm xl:w-36"
+                >
+                  <option value="">全部目标类</option>
+                  {relationshipTargets.map((target) => (
+                    <option key={target} value={target}>
+                      {target}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={relationshipFilterType}
+                  onChange={(e) => setRelationshipFilterType(e.target.value)}
+                  className="text-sm xl:w-36"
+                >
+                  <option value="">全部类型</option>
+                  {relationshipTypes.map((type) => (
+                    <option key={type} value={type}>
+                      {type}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={relationshipFilterReview}
+                  onChange={(e) =>
+                    setRelationshipFilterReview(
+                      e.target.value as "" | RelationshipReviewStatus,
+                    )
+                  }
+                  className="text-sm xl:w-32"
+                >
+                  <option value="">全部审核</option>
+                  {Object.entries(RELATIONSHIP_REVIEW_LABELS).map(
+                    ([key, label]) => (
+                      <option key={key} value={key}>
+                        {label}
+                      </option>
+                    ),
+                  )}
+                </select>
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="data-table min-w-[760px]">
+                <thead>
+                  <tr>
+                    <th>
+                      <RelationshipSortHeader column="source">
+                        源
+                      </RelationshipSortHeader>
+                    </th>
+                    <th>
+                      <RelationshipSortHeader column="target">
+                        目标
+                      </RelationshipSortHeader>
+                    </th>
+                    <th>
+                      <RelationshipSortHeader column="type">
+                        类型
+                      </RelationshipSortHeader>
+                    </th>
+                    <th>
+                      <RelationshipSortHeader column="join_key">
+                        JOIN字段
+                      </RelationshipSortHeader>
+                    </th>
+                    <th>
+                      <RelationshipSortHeader column="is_reviewed">
+                        审核
+                      </RelationshipSortHeader>
+                    </th>
+                    <th className="text-right">操作</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {filteredRelationships.map((r) => (
+                    <tr key={r.id}>
+                      <td className="font-mono text-xs">{r.source}</td>
+                      <td className="font-mono text-xs">{r.target}</td>
+                      <td>{r.type}</td>
+                      <td className="text-xs">{r.join_key}</td>
+                      <td>
+                        <span
+                          className={`text-xs px-1.5 py-0.5 rounded ${r.is_reviewed ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}
+                        >
+                          {r.is_reviewed ? "通过" : "待审"}
+                        </span>
+                      </td>
+                      <td className="text-right">
+                        <button
+                          onClick={() => {
+                            setNewRel({
+                              id: r.id,
+                              source: r.source,
+                              target: r.target,
+                              type: r.type,
+                              join_key: r.join_key,
+                              is_reviewed: !!r.is_reviewed,
+                            });
+                            setIsRelModalOpen(true);
+                          }}
+                          className="btn-ghost text-xs"
+                        >
+                          编辑
+                        </button>
+                        <button
+                          onClick={() =>
+                            setDeleteTarget({ type: "rel", id: r.id })
+                          }
+                          className="btn-ghost text-xs text-red-500"
+                        >
+                          删除
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}
@@ -661,42 +1147,117 @@ export default function SchemaManager() {
           setIsClassModalOpen(false);
           setEditClass(null);
         }}
-        title={editClass?.id && classes.some((c) => c.id === editClass.id) ? "编辑类" : "新增类"}
+        title={
+          editClass?.id && classes.some((c) => c.id === editClass.id)
+            ? "编辑类"
+            : "新增类"
+        }
         width="max-w-6xl"
         footer={
           <>
-            <button onClick={() => { setIsClassModalOpen(false); setEditClass(null); }} className="btn-outline">取消</button>
-            <button onClick={saveClass} className="btn-primary">保存</button>
+            <button
+              onClick={() => {
+                setIsClassModalOpen(false);
+                setEditClass(null);
+              }}
+              className="btn-outline"
+            >
+              取消
+            </button>
+            <button onClick={saveClass} className="btn-primary">
+              保存
+            </button>
           </>
         }
       >
         <div className="space-y-4">
           <div>
-            <label className="text-xs text-slate-500 font-medium block mb-1.5">类 ID</label>
-            <input value={editClass?.id || ""} onChange={(e) => setEditClass({ ...editClass!, id: e.target.value })} className="w-full" placeholder="Sale" />
+            <label className="text-xs text-slate-500 font-medium block mb-1.5">
+              类 ID
+            </label>
+            <input
+              value={editClass?.id || ""}
+              onChange={(e) =>
+                setEditClass({ ...editClass!, id: e.target.value })
+              }
+              className="w-full"
+              placeholder="Sale"
+            />
           </div>
           <div>
-            <label className="text-xs text-slate-500 font-medium block mb-1.5">中文名</label>
-            <input value={editClass?.name_cn || ""} onChange={(e) => setEditClass({ ...editClass!, name_cn: e.target.value })} className="w-full" placeholder="销售记录" />
+            <label className="text-xs text-slate-500 font-medium block mb-1.5">
+              中文名
+            </label>
+            <input
+              value={editClass?.name_cn || ""}
+              onChange={(e) =>
+                setEditClass({ ...editClass!, name_cn: e.target.value })
+              }
+              className="w-full"
+              placeholder="销售记录"
+            />
           </div>
           <div>
-            <label className="text-xs text-slate-500 font-medium block mb-1.5">描述</label>
-            <textarea value={editClass?.description || ""} onChange={(e) => setEditClass({ ...editClass!, description: e.target.value })} className="w-full" rows={2} />
+            <label className="text-xs text-slate-500 font-medium block mb-1.5">
+              描述
+            </label>
+            <textarea
+              value={editClass?.description || ""}
+              onChange={(e) =>
+                setEditClass({ ...editClass!, description: e.target.value })
+              }
+              className="w-full"
+              rows={2}
+            />
           </div>
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="text-xs text-slate-500 font-medium block mb-1.5">数据文件</label>
-              <input value={editClass?.csv_file || ""} onChange={(e) => setEditClass({ ...editClass!, csv_file: e.target.value })} className="w-full" placeholder="sale.csv" />
+              <label className="text-xs text-slate-500 font-medium block mb-1.5">
+                数据文件
+              </label>
+              <input
+                value={editClass?.csv_file || ""}
+                onChange={(e) =>
+                  setEditClass({ ...editClass!, csv_file: e.target.value })
+                }
+                className="w-full"
+                placeholder="sale.csv"
+              />
             </div>
             <div>
-              <label className="text-xs text-slate-500 font-medium block mb-1.5">主键</label>
-              <input value={editClass?.primary_key || ""} onChange={(e) => setEditClass({ ...editClass!, primary_key: e.target.value })} className="w-full" placeholder="sale_id" />
+              <label className="text-xs text-slate-500 font-medium block mb-1.5">
+                主键
+              </label>
+              <input
+                value={editClass?.primary_key || ""}
+                onChange={(e) =>
+                  setEditClass({ ...editClass!, primary_key: e.target.value })
+                }
+                className="w-full"
+                placeholder="sale_id"
+              />
             </div>
           </div>
-          <label className="inline-flex items-center gap-2 text-sm text-slate-700">
-            <input type="checkbox" checked={!!editClass?.is_reviewed} onChange={(e) => setEditClass({ ...editClass!, is_reviewed: e.target.checked })} />
-            用户审核通过
-          </label>
+          <div>
+            <label className="text-xs text-slate-500 font-medium block mb-1.5">
+              人工审核
+            </label>
+            <select
+              value={getClassReviewStatus(editClass)}
+              onChange={(e) =>
+                setEditClass({
+                  ...editClass!,
+                  review_status: e.target.value as SchemaClass["review_status"],
+                  is_reviewed: e.target.value === "approved",
+                })
+              }
+              className="w-40"
+            >
+              <option value="pending">待审</option>
+              <option value="approved">通过</option>
+              <option value="rejected">不通过</option>
+            </select>
+          </div>
           {/* <div>
             <label className="text-xs text-slate-500 font-medium block mb-1.5">属性 (逗号分隔)</label>
             <input value={(editClass?.properties || []).join(", ")} onChange={(e) => setEditClass({ ...editClass!, properties: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })} className="w-full" />
@@ -704,10 +1265,18 @@ export default function SchemaManager() {
           <div className="border border-slate-200 rounded-lg overflow-hidden">
             <div className="flex items-center justify-between px-4 py-3 bg-slate-50 border-b border-slate-200">
               <div>
-                <div className="text-sm font-semibold text-slate-700">字段明细</div>
-                <div className="text-xs text-slate-500 mt-0.5">维护 schema_classes.fields 中的列信息</div>
+                <div className="text-sm font-semibold text-slate-700">
+                  字段明细
+                </div>
+                <div className="text-xs text-slate-500 mt-0.5">
+                  维护 schema_classes.fields 中的列信息
+                </div>
               </div>
-              <button type="button" onClick={addEditField} className="btn-outline text-xs">
+              <button
+                type="button"
+                onClick={addEditField}
+                className="btn-outline text-xs"
+              >
                 + 添加字段
               </button>
             </div>
@@ -744,7 +1313,9 @@ export default function SchemaManager() {
                         <td>
                           <input
                             value={field.name || ""}
-                            onChange={(e) => updateEditField(index, { name: e.target.value })}
+                            onChange={(e) =>
+                              updateEditField(index, { name: e.target.value })
+                            }
                             className="w-full text-xs"
                             placeholder="销售金额"
                           />
@@ -752,7 +1323,11 @@ export default function SchemaManager() {
                         <td>
                           <input
                             value={field.physical_name || ""}
-                            onChange={(e) => updateEditField(index, { physical_name: e.target.value })}
+                            onChange={(e) =>
+                              updateEditField(index, {
+                                physical_name: e.target.value,
+                              })
+                            }
                             className="w-full text-xs font-mono"
                             placeholder="sales_amount"
                           />
@@ -760,7 +1335,11 @@ export default function SchemaManager() {
                         <td>
                           <select
                             value={field.type || "text"}
-                            onChange={(e) => updateEditField(index, { type: e.target.value as SchemaField["type"] })}
+                            onChange={(e) =>
+                              updateEditField(index, {
+                                type: e.target.value as SchemaField["type"],
+                              })
+                            }
                             className="w-full text-xs"
                           >
                             <option value="text">text</option>
@@ -772,7 +1351,11 @@ export default function SchemaManager() {
                         <td>
                           <input
                             value={field.description || ""}
-                            onChange={(e) => updateEditField(index, { description: e.target.value })}
+                            onChange={(e) =>
+                              updateEditField(index, {
+                                description: e.target.value,
+                              })
+                            }
                             className="w-full text-xs"
                             placeholder="字段描述及业务含义"
                           />
@@ -781,18 +1364,30 @@ export default function SchemaManager() {
                           <input
                             type="checkbox"
                             checked={!!field.is_primary_key}
-                            onChange={(e) => updateEditField(index, { is_primary_key: e.target.checked })}
+                            onChange={(e) =>
+                              updateEditField(index, {
+                                is_primary_key: e.target.checked,
+                              })
+                            }
                           />
                         </td>
                         <td className="text-center">
                           <input
                             type="checkbox"
                             checked={!!field.is_foreign_key}
-                            onChange={(e) => updateEditField(index, { is_foreign_key: e.target.checked })}
+                            onChange={(e) =>
+                              updateEditField(index, {
+                                is_foreign_key: e.target.checked,
+                              })
+                            }
                           />
                         </td>
                         <td className="text-right">
-                          <button type="button" onClick={() => removeEditField(index)} className="btn-ghost text-xs text-red-500">
+                          <button
+                            type="button"
+                            onClick={() => removeEditField(index)}
+                            className="btn-ghost text-xs text-red-500"
+                          >
                             删除
                           </button>
                         </td>
@@ -810,45 +1405,115 @@ export default function SchemaManager() {
         isOpen={isRelModalOpen}
         onClose={() => {
           setIsRelModalOpen(false);
-          setNewRel({ id: undefined, source: "", target: "", type: "", join_key: "", is_reviewed: false });
+          setNewRel({
+            id: undefined,
+            source: "",
+            target: "",
+            type: "",
+            join_key: "",
+            is_reviewed: false,
+          });
         }}
         title={newRel.id ? "编辑关系" : "新增关系"}
         footer={
           <>
-            <button onClick={() => { setIsRelModalOpen(false); setNewRel({ id: undefined, source: "", target: "", type: "", join_key: "", is_reviewed: false }); }} className="btn-outline">取消</button>
-            <button onClick={saveRelationship} className="btn-primary">保存</button>
+            <button
+              onClick={() => {
+                setIsRelModalOpen(false);
+                setNewRel({
+                  id: undefined,
+                  source: "",
+                  target: "",
+                  type: "",
+                  join_key: "",
+                  is_reviewed: false,
+                });
+              }}
+              className="btn-outline"
+            >
+              取消
+            </button>
+            <button onClick={saveRelationship} className="btn-primary">
+              保存
+            </button>
           </>
         }
       >
         <div className="space-y-4">
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="text-xs text-slate-500 font-medium block mb-1.5">源类</label>
-              <select value={newRel.source} onChange={(e) => setNewRel({ ...newRel, source: e.target.value })} className="w-full">
+              <label className="text-xs text-slate-500 font-medium block mb-1.5">
+                源类
+              </label>
+              <select
+                value={newRel.source}
+                onChange={(e) =>
+                  setNewRel({ ...newRel, source: e.target.value })
+                }
+                className="w-full"
+              >
                 <option value="">选择...</option>
-                {classes.map((c) => <option key={c.id} value={c.id}>{c.id}</option>)}
+                {classes.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.id}
+                  </option>
+                ))}
               </select>
             </div>
             <div>
-              <label className="text-xs text-slate-500 font-medium block mb-1.5">目标类</label>
-              <select value={newRel.target} onChange={(e) => setNewRel({ ...newRel, target: e.target.value })} className="w-full">
+              <label className="text-xs text-slate-500 font-medium block mb-1.5">
+                目标类
+              </label>
+              <select
+                value={newRel.target}
+                onChange={(e) =>
+                  setNewRel({ ...newRel, target: e.target.value })
+                }
+                className="w-full"
+              >
                 <option value="">选择...</option>
-                {classes.map((c) => <option key={c.id} value={c.id}>{c.id}</option>)}
+                {classes.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.id}
+                  </option>
+                ))}
               </select>
             </div>
           </div>
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="text-xs text-slate-500 font-medium block mb-1.5">关系类型</label>
-              <input value={newRel.type} onChange={(e) => setNewRel({ ...newRel, type: e.target.value })} className="w-full" placeholder="has_detail" />
+              <label className="text-xs text-slate-500 font-medium block mb-1.5">
+                关系类型
+              </label>
+              <input
+                value={newRel.type}
+                onChange={(e) => setNewRel({ ...newRel, type: e.target.value })}
+                className="w-full"
+                placeholder="has_detail"
+              />
             </div>
             <div>
-              <label className="text-xs text-slate-500 font-medium block mb-1.5">JOIN字段</label>
-              <input value={newRel.join_key} onChange={(e) => setNewRel({ ...newRel, join_key: e.target.value })} className="w-full" placeholder="sale_id" />
+              <label className="text-xs text-slate-500 font-medium block mb-1.5">
+                JOIN字段
+              </label>
+              <input
+                value={newRel.join_key}
+                onChange={(e) =>
+                  setNewRel({ ...newRel, join_key: e.target.value })
+                }
+                className="w-full"
+                placeholder="sale_id"
+              />
             </div>
           </div>
           <label className="inline-flex items-center gap-2 text-sm text-slate-700">
-            <input type="checkbox" checked={newRel.is_reviewed} onChange={(e) => setNewRel({ ...newRel, is_reviewed: e.target.checked })} />
+            <input
+              type="checkbox"
+              checked={newRel.is_reviewed}
+              onChange={(e) =>
+                setNewRel({ ...newRel, is_reviewed: e.target.checked })
+              }
+            />
             人工审核通过
           </label>
         </div>
@@ -857,10 +1522,16 @@ export default function SchemaManager() {
       <ConfirmDialog
         isOpen={!!deleteTarget}
         title={deleteTarget?.type === "class" ? "删除类" : "删除关系"}
-        message={deleteTarget?.type === "class" ? "确定要删除此类吗？关联的关系也将被删除。" : "确定要删除此关系吗？"}
+        message={
+          deleteTarget?.type === "class"
+            ? "确定要删除此类吗？关联的关系也将被删除。"
+            : "确定要删除此关系吗？"
+        }
         onConfirm={() => {
-          if (deleteTarget?.type === "class") deleteClass(deleteTarget.id as string);
-          else if (deleteTarget?.type === "rel") deleteRelationship(deleteTarget.id as number);
+          if (deleteTarget?.type === "class")
+            deleteClass(deleteTarget.id as string);
+          else if (deleteTarget?.type === "rel")
+            deleteRelationship(deleteTarget.id as number);
           setDeleteTarget(null);
         }}
         onCancel={() => setDeleteTarget(null)}

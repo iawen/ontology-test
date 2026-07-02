@@ -86,7 +86,7 @@ export default function SkillsManager() {
   };
 
   const toggleSkill = async (s: Skill) => {
-    await api(`/api/admin/scenarios/${activeScenario}/swicth/${s.id}`, {
+    await api(`/api/admin/scenarios/${activeScenario}/skills/${s.id}/switch`, {
       method: "PUT",
       body: JSON.stringify({ is_active: !s.is_active }),
     });

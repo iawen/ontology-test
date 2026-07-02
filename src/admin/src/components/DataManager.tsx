@@ -164,7 +164,7 @@ export default function DataManager() {
     }
 
     // 使用相对路径，通过 next.config.ts 的 rewrite 代理到后端
-    const eventSource = new EventSource("http://localhost:8000/api/extract/stream");
+    const eventSource = new EventSource("/api/extract/stream");
     extractEventSourceRef.current = eventSource;
 
     eventSource.onmessage = (event) => {
@@ -192,20 +192,8 @@ export default function DataManager() {
       console.error("SSE 连接错误:", error);
       eventSource.close();
       extractEventSourceRef.current = null;
-
-      // 降级为轮询模式
-      if (extractStatus.running) {
-        pollExtractStatus();
-      }
+      if (extractStatus.running) addToast("error", "提取进度连接已断开，请稍后重试");
     };
-  };
-
-  const pollExtractStatus = async () => {
-    try {
-      const d = await api("/api/extract/status");
-      setExtractStatus(d);
-      if (d.running) setTimeout(pollExtractStatus, 2000);
-    } catch { /* 静默 */ }
   };
 
   // ── 测试数据库连接 ──
@@ -319,7 +307,7 @@ export default function DataManager() {
     if (activeScenario) {
       loadFiles(false, activeScenario);
       loadConnections(false, activeScenario);
-      pollExtractStatus();
+      startExtractStream();
     }
     // 清理 SSE 连接
     return () => {

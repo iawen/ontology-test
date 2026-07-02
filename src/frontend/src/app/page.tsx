@@ -240,9 +240,9 @@ function AppContent() {
     let convId = activeConvId;
     if (!convId) {
       try {
-        const d = await api("/api/conversations", {
+        const d = await api(`/api/conversations/${currentScenario}`, {
           method: "POST",
-          body: JSON.stringify({ scenario_id: currentScenario, title: text.slice(0, 20) }),
+          body: JSON.stringify({ title: text.slice(0, 20) }),
         });
         if (!d?.id) return;
         convId = d.id;

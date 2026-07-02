@@ -84,13 +84,15 @@ async def update_skill(scenario_id: str, skill_id: str, req: SkillUpdate):
     return {"status": "ok"}
 
 
-@router.put("/api/admin/scenarios/{scenario_id}/swicth/{skill_id}")
-async def swicth_skill(scenario_id: str, skill_id: str, request: Request):
+@router.put("/api/admin/scenarios/{scenario_id}/skills/{skill_id}/switch")
+async def switch_skill(scenario_id: str, skill_id: str, request: Request):
     body = await request.json()
     is_active = body.get("is_active")
-    print(f"UPDATE skills SET is_active = {1 if is_active else 0} WHERE scenario_id='{scenario_id}' AND id='{skill_id}'")
     conn = get_db()
-    conn.execute(f"UPDATE skills SET is_active = {1 if is_active else 0} WHERE scenario_id='{scenario_id}' AND id='{skill_id}'")
+    conn.execute(
+        "UPDATE skills SET is_active=? WHERE scenario_id=? AND id=?",
+        (1 if is_active else 0, scenario_id, skill_id),
+    )
     conn.commit()
     conn.close()
     return {"status": "ok"}

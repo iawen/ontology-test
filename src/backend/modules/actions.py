@@ -144,31 +144,11 @@ async def execute_action(scenario_id: str, action_id: str, req: ActionExecuteReq
     return result
 
 
-@router.post("/api/admin/actions/execute")
-async def execute_action_direct(req: ActionExecuteRequest):
-    """直接执行 Action（Chat 模块调用）"""
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM actions WHERE id=? AND scenario_id=?",
-        (req.action_id, req.scenario_id)
-    ).fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(404, "Action 不存在")
-
-    action = dict(row)
-    action["parameters"] = json.loads(action.get("parameters", "{}"))
-
-    # Chat 调用时默认已确认
-    result = _execute_action(action, req.context)
-    return result
-
-
 # ============================================================
 # Action 执行日志
 # ============================================================
 
-@router.get("/api/admin/scenarios/{scenario_id}/action_logs")
+@router.get("/api/admin/scenarios/{scenario_id}/actions/logs")
 async def list_action_logs(scenario_id: str, page: int = 1, page_size: int = 20):
     """查询 Action 执行日志"""
     conn = get_db()

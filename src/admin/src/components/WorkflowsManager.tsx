@@ -72,7 +72,7 @@ export default function WorkflowsManager() {
     setLoadingLogs(true);
     try {
       const res = await api(`/api/admin/scenarios/${activeScenario}/workflow_instances/${instance.id}`, { method: "GET" });
-      setStepLogs(res || []);
+      setStepLogs(res?.step_logs || []);
     } catch (error: any) {
       addToast(error.message || "获取步骤日志失败", "error");
     } finally {

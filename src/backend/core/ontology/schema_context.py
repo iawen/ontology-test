@@ -57,7 +57,9 @@ def _split_reviewed(rows: list[dict]) -> tuple[list[dict], list[dict]]:
     reviewed = []
     existing = []
     for row in rows:
-        if bool(row.get("is_reviewed")):
+        if row.get("review_status") == "rejected":
+            continue
+        if row.get("review_status") == "approved" or bool(row.get("is_reviewed")):
             reviewed.append(row)
         else:
             existing.append(row)
@@ -77,13 +79,13 @@ def load_schema_reference_context(
     conn = get_db()
     try:
         class_rows = [_row_to_dict(row) for row in conn.execute(
-            """SELECT id, name_cn, description, primary_key, csv_file, fields, is_reviewed
+                """SELECT id, name_cn, description, primary_key, csv_file, fields, is_reviewed, review_status
                FROM schema_classes WHERE scenario_id=?
                ORDER BY is_reviewed DESC, updated_at DESC, id""",
             (scenario_id,),
         ).fetchall()]
         metric_rows = [_row_to_dict(row) for row in conn.execute(
-            """SELECT id, name, description, category, target_class, formula, dimensions, required_dimensions, is_reviewed
+                """SELECT id, name, description, category, target_class, formula, dimensions, required_dimensions, is_reviewed, review_status
                FROM metrics WHERE scenario_id=?
                ORDER BY is_reviewed DESC, updated_at DESC, id""",
             (scenario_id,),
@@ -95,7 +97,7 @@ def load_schema_reference_context(
             (scenario_id,),
         ).fetchall()]
         concept_rows = [_row_to_dict(row) for row in conn.execute(
-            """SELECT id, name, description, parent_id, level, concept_type, related_class, is_reviewed
+                """SELECT id, name, description, parent_id, level, concept_type, related_class, is_reviewed, review_status
                FROM concepts WHERE scenario_id=?
                ORDER BY is_reviewed DESC, level, id""",
             (scenario_id,),

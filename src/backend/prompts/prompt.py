@@ -25,6 +25,7 @@ from core.ontology.data_query import DataQueryEngine
 
 def _build_ontology_context(engine: OntologyEngine, scenario_id: str) -> str:
     """构建本体上下文：Data + Logic + Action 三要素"""
+    metrics_by_class = _load_metrics_by_class(scenario_id)
 
     # ── 1. Data：实体类 + 关系 ──
     classes_lines = []
@@ -32,9 +33,12 @@ def _build_ontology_context(engine: OntologyEngine, scenario_id: str) -> str:
         cls_info = engine.classes.get(c["id"], {})
         csv_file = cls_info.get("csv_file", "")
         props = c.get("properties", [])
+        metric_lines = metrics_by_class.get(c["id"], [])
+        metrics_text = "\n".join(metric_lines) if metric_lines else "    关联指标: （暂无）"
         classes_lines.append(
             f"  - **{c['id']}**（{c.get('name_cn', '')}）→ {csv_file}\n"
-            f"    字段: {', '.join(props[:15])}"
+            f"    字段: {', '.join(props[:15])}\n"
+            f"{metrics_text}"
         )
     classes_str = "\n".join(classes_lines) if classes_lines else "（暂无）"
 
@@ -45,54 +49,43 @@ def _build_ontology_context(engine: OntologyEngine, scenario_id: str) -> str:
         )
     rels_str = "\n".join(rels_lines) if rels_lines else "（暂无）"
 
-    # ── 2. Logic：指标 + 概念 + 术语 + 技能 ──
-    metrics_str = _build_metrics_summary(scenario_id)
-
     return f"""
 # 本体知识库（Ontology）
 
-## 一、Data（数据层）— 实体与关系
+## 一、Data + Logic — 实体、字段与关联指标
 
 ### 实体类（Classes）
 {classes_str}
 
 ### 关系（Relationships）
 {rels_str}
-
-## 二、Logic（逻辑层）— 指标、概念、术语、技能
-
-### 指标（Metrics）
-{metrics_str}
 """
 
 
-def _build_metrics_summary(scenario_id: str) -> str:
-    """从数据库加载指标定义，生成给 LLM 看的摘要"""
+def _load_metrics_by_class(scenario_id: str) -> dict[str, list[str]]:
+    """从数据库加载指标定义，并按实体类分组。"""
     conn = get_db()
     rows = conn.execute(
-        "SELECT * FROM metrics WHERE scenario_id=? ORDER BY sort_order",
+        "SELECT * FROM metrics WHERE scenario_id=? ORDER BY target_class, sort_order",
         (scenario_id,)
     ).fetchall()
     conn.close()
-    if not rows:
-        return "（暂无指标定义）"
-    lines = []
-    current_category = ""
+
+    grouped: dict[str, list[str]] = {}
     for r in rows:
-        if r["category"] != current_category:
-            current_category = r["category"]
-            lines.append(f"\n### {current_category}")
         dims = json.loads(r["dimensions"]) if r["dimensions"] else []
         req_dims = json.loads(r["required_dimensions"]) if r["required_dimensions"] else []
         chart = r["chart_type"] if r["chart_type"] else "bar"
-        lines.append(
-            f"  **{r['name']}** (`{r['id']}`)\n"
-            f"    说明: {r['description']}\n"
-            f"    数据源: {r['target_class']} | 计算方式: {r['calculation']}\n"
-            f"    可选维度: {', '.join(dims)} | 必选维度: {', '.join(req_dims)}\n"
-            f"    推荐图表: {chart}"
+        target_class = r["target_class"] or "__unbound__"
+        grouped.setdefault(target_class, []).append(
+            f"    关联指标: **{r['name']}** (`{r['id']}`)"
+            f" | 说明: {r['description']}"
+            f" | 计算: {r['calculation']}"
+            f" | 可选维度: {', '.join(dims) or '-'}"
+            f" | 必选维度: {', '.join(req_dims) or '-'}"
+            f" | 推荐图表: {chart}"
         )
-    return "\n".join(lines)
+    return grouped
 
 
 def _build_concepts_summary(scenario_id: str) -> str:
@@ -201,13 +194,10 @@ def _build_alert_rules_summary(scenario_id: str) -> str:
 
 def _build_system_prompt(engine: OntologyEngine, scenario_id: str) -> str:
     today = datetime.now().strftime("%Y年%m月%d日")
-    ontology_context = _build_ontology_context(engine, scenario_id)
 
     return f"""你是一个专业的数据分析助手（ChatBI），基于本体论（Ontology）驱动的语义层来回答用户的数据查询需求。
 
 今天是{today}。
-
-{ontology_context}
 
 ## 你的核心工作流程
 

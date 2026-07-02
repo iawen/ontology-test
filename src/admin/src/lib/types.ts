@@ -1,5 +1,7 @@
 /* ─────────────── 类型定义 ─────────────── */
 
+export type ReviewStatus = "pending" | "approved" | "rejected";
+
 export interface Scenario {
   id: string;
   name: string;
@@ -21,6 +23,7 @@ export interface SchemaClass {
   csv_file: string;
   primary_key: string;
   is_reviewed: boolean;
+  review_status?: ReviewStatus;
 }
 
 export interface SchemaField {
@@ -57,6 +60,7 @@ export interface Metric {
   chart_type: string;
   sort_order: number;
   is_reviewed: boolean;
+  review_status?: ReviewStatus;
 }
 
 export interface Concept {
@@ -70,6 +74,7 @@ export interface Concept {
   related_class: string;
   sort_order: number;
   is_reviewed: boolean;
+  review_status?: ReviewStatus;
 }
 
 export interface ChartRule {

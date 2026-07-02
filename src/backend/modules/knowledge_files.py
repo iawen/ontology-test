@@ -21,7 +21,7 @@ router = APIRouter()
 extract_status: dict = {"running": False, "phase": "", "progress": 0, "total": 0, "message": "", "result": None}
 
 
-@router.post("/api/upload/{scenario_id}")
+@router.post("/api/scenarios/{scenario_id}/upload")
 def upload_file(scenario_id: str, files: List[UploadFile] = File(...)):
     """上传 CSV 文件到 data 目录"""
     data_dir = os.path.join(Cfg.scenarios_root, scenario_id, "data")
@@ -34,13 +34,6 @@ def upload_file(scenario_id: str, files: List[UploadFile] = File(...)):
             shutil.copyfileobj(file.file, f)
         uploaded_files.append(file.filename)
     return {"status": "ok", "filenames": uploaded_files}
-
-
-# 前端兼容路径：/api/scenarios/{id}/upload → 复用 upload_file
-@router.post("/api/scenarios/{scenario_id}/upload")
-def upload_file_alias(scenario_id: str, files: List[UploadFile] = File(...)):
-    """上传 CSV 文件到 data 目录（前端兼容路径）"""
-    return upload_file(scenario_id, files)
 
 
 @router.get("/api/scenarios/{scenario_id}/files")
@@ -306,19 +299,19 @@ def _sync_schema_db(scenario_id: str):
     conn = get_db()
     reviewed_classes = {
         row["id"] for row in conn.execute(
-            "SELECT id FROM schema_classes WHERE scenario_id=? AND is_reviewed IS TRUE",
+            "SELECT id FROM schema_classes WHERE scenario_id=? AND (is_reviewed IS TRUE OR review_status IN ('approved','rejected'))",
             (scenario_id,),
         ).fetchall()
     }
     reviewed_metrics = {
         row["id"] for row in conn.execute(
-            "SELECT id FROM metrics WHERE scenario_id=? AND is_reviewed IS TRUE",
+            "SELECT id FROM metrics WHERE scenario_id=? AND (is_reviewed IS TRUE OR review_status IN ('approved','rejected'))",
             (scenario_id,),
         ).fetchall()
     }
     reviewed_concepts = {
         row["id"] for row in conn.execute(
-            "SELECT id FROM concepts WHERE scenario_id=? AND is_reviewed IS TRUE",
+            "SELECT id FROM concepts WHERE scenario_id=? AND (is_reviewed IS TRUE OR review_status IN ('approved','rejected'))",
             (scenario_id,),
         ).fetchall()
     }
@@ -464,13 +457,13 @@ def _sync_schema_db(scenario_id: str):
         if class_id in existing_classes:
             conn.execute(
                 """UPDATE schema_classes
-                   SET name_cn=?, description=?, properties=?, primary_key=?, csv_file=?, fields=?, is_reviewed=?, updated_at=CURRENT_TIMESTAMP
-                   WHERE id=? AND scenario_id=? AND is_reviewed IS NOT TRUE""",
+                   SET name_cn=?, description=?, properties=?, primary_key=?, csv_file=?, fields=?, is_reviewed=?, review_status='pending', updated_at=CURRENT_TIMESTAMP
+                   WHERE id=? AND scenario_id=? AND is_reviewed IS NOT TRUE AND COALESCE(review_status, 'pending') NOT IN ('approved','rejected')""",
                 (item[2], item[3], item[4], item[5], item[6], item[7], item[8], class_id, scenario_id),
             )
         else:
             conn.execute(
-                "INSERT INTO schema_classes (id, scenario_id, name_cn, description, properties, primary_key, csv_file, fields, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO schema_classes (id, scenario_id, name_cn, description, properties, primary_key, csv_file, fields, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 item,
             )
 
@@ -494,13 +487,13 @@ def _sync_schema_db(scenario_id: str):
         if metric_id in existing_metrics:
             conn.execute(
                 """UPDATE metrics
-                   SET name=?, description=?, category=?, target_class=?, calculation=?, formula=?, dimensions=?, required_dimensions=?, filters_hint=?, chart_type=?, sort_order=?, is_reviewed=?, updated_at=CURRENT_TIMESTAMP
-                   WHERE id=? AND scenario_id=? AND is_reviewed IS NOT TRUE""",
+                   SET name=?, description=?, category=?, target_class=?, calculation=?, formula=?, dimensions=?, required_dimensions=?, filters_hint=?, chart_type=?, sort_order=?, is_reviewed=?, review_status='pending', updated_at=CURRENT_TIMESTAMP
+                   WHERE id=? AND scenario_id=? AND is_reviewed IS NOT TRUE AND COALESCE(review_status, 'pending') NOT IN ('approved','rejected')""",
                 (item[2], item[3], item[4], item[5], item[6], item[7], item[8], item[9], item[10], item[11], item[12], item[13], metric_id, scenario_id),
             )
         else:
             conn.execute(
-                "INSERT INTO metrics (id, scenario_id, name, description, category, target_class, calculation, formula, dimensions, required_dimensions, filters_hint, chart_type, sort_order, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO metrics (id, scenario_id, name, description, category, target_class, calculation, formula, dimensions, required_dimensions, filters_hint, chart_type, sort_order, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 item,
             )
 
@@ -509,13 +502,13 @@ def _sync_schema_db(scenario_id: str):
         if concept_id in existing_concepts:
             conn.execute(
                 """UPDATE concepts
-                   SET name=?, description=?, parent_id=?, level=?, concept_type=?, related_class=?, is_reviewed=?, updated_at=CURRENT_TIMESTAMP
-                   WHERE id=? AND scenario_id=? AND is_reviewed IS NOT TRUE""",
+                   SET name=?, description=?, parent_id=?, level=?, concept_type=?, related_class=?, is_reviewed=?, review_status='pending', updated_at=CURRENT_TIMESTAMP
+                   WHERE id=? AND scenario_id=? AND is_reviewed IS NOT TRUE AND COALESCE(review_status, 'pending') NOT IN ('approved','rejected')""",
                 (item[2], item[3], item[4], item[5], item[6], item[7], item[8], concept_id, scenario_id),
             )
         else:
             conn.execute(
-                "INSERT INTO concepts (id, scenario_id, name, description, parent_id, level, concept_type, related_class, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO concepts (id, scenario_id, name, description, parent_id, level, concept_type, related_class, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 item,
             )
 
@@ -617,14 +610,6 @@ def _run_extraction(scenario_id:str, business_name: str, batch_size: int,
                 str(e),
                 round(time.time() - started_at, 2),
             )
-
-
-@router.get("/api/extract/status")
-async def get_extract_status():
-    """获取提取进度"""
-    global extract_status
-    return extract_status
-
 
 if __name__ == "__main__":
     _sync_schema_db("blank")

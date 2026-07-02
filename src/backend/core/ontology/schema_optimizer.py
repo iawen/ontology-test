@@ -227,7 +227,7 @@ class SchemaOptimizer:
 
         class_sql = "SELECT * FROM schema_classes WHERE scenario_id=?"
         if incremental:
-            class_sql += " AND is_reviewed IS NOT TRUE"
+            class_sql += " AND is_reviewed IS NOT TRUE AND COALESCE(review_status, 'pending')='pending'"
         if target_class_ids:
             placeholders = ",".join("?" * len(target_class_ids))
             class_sql += f" AND id IN ({placeholders})"
@@ -238,7 +238,7 @@ class SchemaOptimizer:
 
         metric_sql = "SELECT * FROM metrics WHERE scenario_id=?"
         if incremental:
-            metric_sql += " AND is_reviewed IS NOT TRUE"
+            metric_sql += " AND is_reviewed IS NOT TRUE AND COALESCE(review_status, 'pending')='pending'"
         metric_rows = conn.execute(metric_sql, (sid,)).fetchall()
         metrics = [_row_to_dict(r) for r in metric_rows]
 
@@ -249,7 +249,7 @@ class SchemaOptimizer:
 
         concept_sql = "SELECT * FROM concepts WHERE scenario_id=?"
         if incremental:
-            concept_sql += " AND is_reviewed IS NOT TRUE"
+            concept_sql += " AND is_reviewed IS NOT TRUE AND COALESCE(review_status, 'pending')='pending'"
         concept_rows = conn.execute(concept_sql, (sid,)).fetchall()
         concepts = [_row_to_dict(r) for r in concept_rows]
 
@@ -854,8 +854,8 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
         if not cid:
             return False
         sid = self.scenario_id
-        exists = conn.execute("SELECT id, is_reviewed FROM schema_classes WHERE id=? AND scenario_id=?", (cid, sid)).fetchone()
-        if exists and bool(exists["is_reviewed"]):
+        exists = conn.execute("SELECT id, is_reviewed, review_status FROM schema_classes WHERE id=? AND scenario_id=?", (cid, sid)).fetchone()
+        if exists and (bool(exists["is_reviewed"]) or exists["review_status"] in {"approved", "rejected"}):
             return False
         values = (
             item.get("name_cn", ""), item.get("description", ""),
@@ -863,12 +863,12 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
         )
         if exists:
             conn.execute(
-                "UPDATE schema_classes SET name_cn=?, description=?, primary_key=?, csv_file=?, is_reviewed=FALSE, updated_at=CURRENT_TIMESTAMP WHERE id=? AND scenario_id=?",
+                "UPDATE schema_classes SET name_cn=?, description=?, primary_key=?, csv_file=?, is_reviewed=FALSE, review_status='pending', updated_at=CURRENT_TIMESTAMP WHERE id=? AND scenario_id=?",
                 (*values, cid, sid),
             )
         else:
             conn.execute(
-                "INSERT INTO schema_classes (id, scenario_id, name_cn, description, primary_key, csv_file, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO schema_classes (id, scenario_id, name_cn, description, primary_key, csv_file, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,FALSE,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 (cid, sid, *values),
             )
         return True
@@ -906,8 +906,8 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
         if not mid:
             return False
         sid = self.scenario_id
-        exists = conn.execute("SELECT id, is_reviewed FROM metrics WHERE id=? AND scenario_id=?", (mid, sid)).fetchone()
-        if exists and bool(exists["is_reviewed"]):
+        exists = conn.execute("SELECT id, is_reviewed, review_status FROM metrics WHERE id=? AND scenario_id=?", (mid, sid)).fetchone()
+        if exists and (bool(exists["is_reviewed"]) or exists["review_status"] in {"approved", "rejected"}):
             return False
         dims = json.dumps(item.get("dimensions", []), ensure_ascii=False)
         req_dims = json.dumps(item.get("required_dimensions", []), ensure_ascii=False)
@@ -918,14 +918,14 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
         )
         if exists:
             conn.execute(
-                """UPDATE metrics SET name=?, description=?, category=?, target_class=?, calculation=?, formula=?, dimensions=?, required_dimensions=?, filters_hint=?, chart_type=?, is_reviewed=FALSE, updated_at=CURRENT_TIMESTAMP
+                     """UPDATE metrics SET name=?, description=?, category=?, target_class=?, calculation=?, formula=?, dimensions=?, required_dimensions=?, filters_hint=?, chart_type=?, is_reviewed=FALSE, review_status='pending', updated_at=CURRENT_TIMESTAMP
                    WHERE id=? AND scenario_id=?""",
                 (*values, mid, sid),
             )
         else:
             conn.execute(
-                """INSERT INTO metrics (id, scenario_id, name, description, category, target_class, calculation, formula, dimensions, required_dimensions, filters_hint, chart_type, is_reviewed, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+                     """INSERT INTO metrics (id, scenario_id, name, description, category, target_class, calculation, formula, dimensions, required_dimensions, filters_hint, chart_type, is_reviewed, review_status, created_at, updated_at)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,FALSE,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
                 (mid, sid, *values),
             )
         return True
@@ -935,8 +935,8 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
         if not cid:
             return False
         sid = self.scenario_id
-        exists = conn.execute("SELECT id, is_reviewed FROM concepts WHERE id=? AND scenario_id=?", (cid, sid)).fetchone()
-        if exists and bool(exists["is_reviewed"]):
+        exists = conn.execute("SELECT id, is_reviewed, review_status FROM concepts WHERE id=? AND scenario_id=?", (cid, sid)).fetchone()
+        if exists and (bool(exists["is_reviewed"]) or exists["review_status"] in {"approved", "rejected"}):
             return False
         values = (
             item.get("name", ""), item.get("description", ""), item.get("parent_id", ""),
@@ -945,12 +945,12 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
         )
         if exists:
             conn.execute(
-                "UPDATE concepts SET name=?, description=?, parent_id=?, level=?, concept_type=?, related_class=?, sort_order=?, is_reviewed=FALSE, updated_at=CURRENT_TIMESTAMP WHERE id=? AND scenario_id=?",
+                "UPDATE concepts SET name=?, description=?, parent_id=?, level=?, concept_type=?, related_class=?, sort_order=?, is_reviewed=FALSE, review_status='pending', updated_at=CURRENT_TIMESTAMP WHERE id=? AND scenario_id=?",
                 (*values, cid, sid),
             )
         else:
             conn.execute(
-                "INSERT INTO concepts (id, scenario_id, name, description, parent_id, level, concept_type, related_class, sort_order, is_reviewed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,FALSE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO concepts (id, scenario_id, name, description, parent_id, level, concept_type, related_class, sort_order, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,FALSE,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 (cid, sid, *values),
             )
         return True

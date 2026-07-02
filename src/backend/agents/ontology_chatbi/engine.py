@@ -46,6 +46,20 @@ TOOL_PURPOSES = {
     "execute_action": "根据分析结果触发需要确认的业务动作。",
 }
 
+FINAL_ANSWER_PROMPT = """你是 ChatBI 的最终答复生成器。
+
+请只基于用户问题、已执行工具结果和模型草稿生成最终答复，不要提出或暗示还需要调用工具。
+要求：
+1. 用中文回答，表达简洁、自然、业务可读。
+2. 优先总结关键结论，再补充必要的数据依据或口径。
+3. 如果工具结果包含错误或没有数据，要说明限制，不要编造数值。
+4. 不要输出 SQL、JSON、工具参数或内部执行细节，除非用户明确要求。
+5. 保留对图表/明细结果有帮助的字段名和指标名。
+"""
+
+MAX_FINAL_TOOL_CONTEXT_CHARS = 12000
+MAX_FINAL_DRAFT_CHARS = 6000
+
 
 def get_tool_purpose(tool_name: str) -> str:
     return TOOL_PURPOSES.get(tool_name, "执行当前分析步骤所需的辅助能力。")
@@ -307,15 +321,18 @@ class ChatEngineV3:
 
         # 无工具调用 → 最终回答
         if not message.tool_calls:
-            content = message.content or ""
+            draft_content = message.content or ""
+            content = await self._generate_final_answer(state, draft_content)
             state.assistant_content += content
             state.sse_events.append({"type": "text", "content": content})
             state.messages.append({"role": "assistant", "content": content})
             logger.info(
-                "Chat LLM final answer: conversation_id=%s round=%d content_len=%d",
+                "Chat final answer generated: conversation_id=%s round=%d draft_len=%d content_len=%d tools=%d",
                 state.conversation_id,
                 state.current_round,
+                len(draft_content),
                 len(content),
+                len(state.all_tool_results),
             )
 
             # 检查是否需要行动
@@ -371,6 +388,7 @@ class ChatEngineV3:
         engine = get_engine(state.scenario_id)
         query_engine = get_query_engine(state.scenario_id)
         executor = ToolExecutor(state.scenario_id, self.entity_agent)
+        can_answer_directly = False
 
         for tc in state.pending_tool_calls:
             tool_name = tc.function.name
@@ -479,8 +497,27 @@ class ChatEngineV3:
                 "tool_call_id": tc.id,
                 "content": result_preview,
             })
+            if self._is_direct_final_query_result(tool_name, result):
+                can_answer_directly = True
 
         state.pending_tool_calls = []
+        if can_answer_directly:
+            content = await self._generate_final_answer(
+                state,
+                "query_ontology_data 已返回小结果集，数据足以直接回答用户问题。",
+            )
+            state.assistant_content += content
+            state.sse_events.append({"type": "text", "content": content})
+            state.messages.append({"role": "assistant", "content": content})
+            logger.info(
+                "Chat direct final answer from query result: conversation_id=%s round=%d tools=%d content_len=%d",
+                state.conversation_id,
+                state.current_round,
+                len(state.all_tool_results),
+                len(content),
+            )
+            return await self._check_action(state)
+
         return State.LLM_CALL
 
     async def _handle_clarify(self, state: AgentState) -> State:
@@ -519,6 +556,90 @@ class ChatEngineV3:
     # ============================================================
     # 辅助函数
     # ============================================================
+
+    async def _generate_final_answer(self, state: AgentState, draft_content: str) -> str:
+        """使用轻量最终答复 prompt 再调用一次模型，且不传 tools。"""
+        tool_context = self._build_final_tool_context(state.all_tool_results)
+        draft = self._truncate_text(draft_content, MAX_FINAL_DRAFT_CHARS)
+        user_content = (
+            f"用户问题：\n{state.user_message or '（无）'}\n\n"
+            f"已执行工具结果摘要：\n{tool_context}\n\n"
+            f"模型草稿：\n{draft or '（无）'}\n\n"
+            "请生成最终答复。"
+        )
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": FINAL_ANSWER_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0.3,
+                max_tokens=1600,
+            )
+            content = response.choices[0].message.content or ""
+            return content.strip() or draft_content
+        except Exception as exc:
+            logger.exception(
+                "Chat final answer generation failed, falling back to draft: conversation_id=%s error=%s",
+                state.conversation_id,
+                str(exc),
+            )
+            return draft_content or "抱歉，最终答复生成失败，请稍后重试。"
+
+    @classmethod
+    def _build_final_tool_context(cls, tool_results: list[dict]) -> str:
+        if not tool_results:
+            return "（无工具调用结果）"
+
+        chunks = []
+        total_len = 0
+        for index, item in enumerate(tool_results, start=1):
+            if not isinstance(item, dict):
+                continue
+            summary = {
+                "index": index,
+                "name": item.get("name", ""),
+                "description": item.get("description", ""),
+                "arguments": item.get("arguments", {}),
+                "result": item.get("result"),
+            }
+            text = cls._json_dumps(summary)
+            remaining = MAX_FINAL_TOOL_CONTEXT_CHARS - total_len
+            if remaining <= 0:
+                break
+            if len(text) > remaining:
+                text = cls._truncate_text(text, remaining)
+            chunks.append(text)
+            total_len += len(text)
+
+        return "\n".join(chunks) if chunks else "（无有效工具调用结果）"
+
+    @staticmethod
+    def _truncate_text(text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        return text[:max(0, max_chars - 16)] + "...[已截断]"
+
+    @staticmethod
+    def _is_direct_final_query_result(tool_name: str, result) -> bool:
+        if tool_name != "query_ontology_data" or not isinstance(result, dict):
+            return False
+        if result.get("error") or result.get("type") != "query_result":
+            return False
+
+        rows = result.get("rows")
+        if not isinstance(rows, list) or not rows:
+            return False
+
+        counts = [len(rows)]
+        for key in ("row_count", "total"):
+            value = result.get(key)
+            if isinstance(value, int):
+                counts.append(value)
+
+        return max(counts) <= 100
 
     @classmethod
     def _json_dumps(cls, value) -> str:

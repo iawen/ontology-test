@@ -21,9 +21,6 @@ from prompts.prompt import get_engine
 from tools.helpers import create_token
 
 
-# from modules.chat import router as chat_router
-# from modules.deep_chat import router as chat_router
-# from modules.deep_chat_v2 import router as chat_router
 from agents.ontology_chatbi.views import router as chat_router
 
 from modules.scenarios import router as scenarios_router

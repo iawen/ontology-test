@@ -86,7 +86,7 @@ async def delete_alert_rule(scenario_id: str, rule_id: str):
     return {"status": "ok"}
 
 
-@router.post("/api/admin/scenarios/{scenario_id}/alert_rules/{rule_id}/test")
+@router.post("/api/admin/scenarios/{scenario_id}/alert_rules/{rule_id}/check")
 async def test_alert_rule(scenario_id: str, rule_id: str):
     """测试告警规则（手动触发一次检查）"""
     conn = get_db()

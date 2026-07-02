@@ -15,10 +15,27 @@ from core.models.models import MetricBatchDelete, MetricCreate, MetricUpdate, Co
 router = APIRouter()
 
 
+REVIEW_STATUSES = {"pending", "approved", "rejected"}
+
+
 def _reviewed_value(value) -> bool:
     if isinstance(value, str):
         return value.lower() in {"1", "true", "yes", "y"}
     return bool(value)
+
+
+def _review_status(value, is_reviewed=False) -> str:
+    if value == "rejected":
+        return "rejected"
+    if value == "approved" or _reviewed_value(is_reviewed):
+        return "approved"
+    if isinstance(value, str) and value in REVIEW_STATUSES:
+        return value
+    return "pending"
+
+
+def _is_reviewed_status(value) -> int:
+    return int(value == "approved")
 
 
 def _sync_ontology_files(scenario_id: str):
@@ -49,7 +66,8 @@ async def list_metrics(scenario_id: str):
         d["required_dimensions"] = json.loads(d.get("required_dimensions", "[]"))
         # chart_type 可能不存在于旧数据库中
         d.setdefault("chart_type", "bar")
-        d["is_reviewed"] = _reviewed_value(d.get("is_reviewed", 0))
+        d["review_status"] = _review_status(d.get("review_status"), d.get("is_reviewed", 0))
+        d["is_reviewed"] = d["review_status"] == "approved"
         result.append(d)
     return result
 
@@ -57,18 +75,19 @@ async def list_metrics(scenario_id: str):
 @router.post("/api/admin/scenarios/{scenario_id}/metrics")
 async def create_metric(scenario_id: str, req: MetricCreate):
     conn = get_db()
+    review_status = _review_status(req.review_status, req.is_reviewed)
     try:
         conn.execute(
             """INSERT INTO metrics
                (id, scenario_id, name, description, category, target_class,
                 calculation, formula, dimensions, required_dimensions,
-                     filters_hint, chart_type, sort_order, is_reviewed, created_at, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+                     filters_hint, chart_type, sort_order, is_reviewed, review_status, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
             (req.id, scenario_id, req.name, req.description, req.category,
              req.target_class, req.calculation, req.formula,
              json.dumps(req.dimensions, ensure_ascii=False),
              json.dumps(req.required_dimensions, ensure_ascii=False),
-                 req.filters_hint, req.chart_type, req.sort_order, int(req.is_reviewed)),
+                 req.filters_hint, req.chart_type, req.sort_order, _is_reviewed_status(review_status), review_status),
         )
         conn.commit()
     except Exception as e:
@@ -97,9 +116,12 @@ async def update_metric(scenario_id: str, metric_id: str, req: MetricUpdate):
     if req.required_dimensions is not None:
         sets.append("required_dimensions=?")
         vals.append(json.dumps(req.required_dimensions, ensure_ascii=False))
-    if req.is_reviewed is not None:
+    if req.review_status is not None or req.is_reviewed is not None:
+        review_status = _review_status(req.review_status, req.is_reviewed)
         sets.append("is_reviewed=?")
-        vals.append(int(req.is_reviewed))
+        vals.append(_is_reviewed_status(review_status))
+        sets.append("review_status=?")
+        vals.append(review_status)
     if not sets:
         conn.close()
         return {"status": "ok"}
@@ -129,13 +151,15 @@ async def batch_delete_metrics(scenario_id: str, req: MetricBatchDelete):
         return {"status": "ok", "deleted": 0}
 
     conn = get_db()
-    conn.executemany(
-        "DELETE FROM metrics WHERE id=? AND scenario_id=?",
-        [(metric_id, scenario_id) for metric_id in ids],
-    )
-    deleted = conn.total_changes
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.executemany(
+            "DELETE FROM metrics WHERE id=? AND scenario_id=?",
+            [(metric_id, scenario_id) for metric_id in ids],
+        )
+        deleted = cursor.rowcount if cursor.rowcount >= 0 else len(ids)
+        conn.commit()
+    finally:
+        conn.close()
     _sync_ontology_files(scenario_id)
     return {"status": "ok", "deleted": deleted}
 
@@ -183,20 +207,26 @@ async def list_concepts(scenario_id: str):
         (scenario_id,)
     ).fetchall()
     conn.close()
-    return [dict(r) | {"is_reviewed": _reviewed_value(r.get("is_reviewed", 0))} for r in rows]
+    result = []
+    for row in rows:
+        d = dict(row)
+        review_status = _review_status(d.get("review_status"), d.get("is_reviewed", 0))
+        result.append(d | {"review_status": review_status, "is_reviewed": review_status == "approved"})
+    return result
 
 
 @router.post("/api/admin/scenarios/{scenario_id}/concepts")
 async def create_concept(scenario_id: str, req: ConceptCreate):
     conn = get_db()
+    review_status = _review_status(req.review_status, req.is_reviewed)
     try:
         conn.execute(
             """INSERT INTO concepts
                (id, scenario_id, name, description, parent_id, level,
-                   concept_type, related_class, sort_order, is_reviewed, created_at, updated_at)
-                  VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+                   concept_type, related_class, sort_order, is_reviewed, review_status, created_at, updated_at)
+                  VALUES (?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
             (req.id, scenario_id, req.name, req.description, req.parent_id,
-                 req.level, req.concept_type, req.related_class, req.sort_order, int(req.is_reviewed)),
+                 req.level, req.concept_type, req.related_class, req.sort_order, _is_reviewed_status(review_status), review_status),
         )
         conn.commit()
     except Exception as e:
@@ -214,10 +244,16 @@ async def update_concept(scenario_id: str, concept_id: str, req: ConceptUpdate):
     for k, v in [("name", req.name), ("description", req.description),
                   ("parent_id", req.parent_id), ("level", req.level),
                   ("concept_type", req.concept_type), ("related_class", req.related_class),
-                  ("sort_order", req.sort_order), ("is_reviewed", req.is_reviewed)]:
+                  ("sort_order", req.sort_order)]:
         if v is not None and v != "":
             sets.append(f"{k}=?")
             vals.append(v)
+    if req.review_status is not None or req.is_reviewed is not None:
+        review_status = _review_status(req.review_status, req.is_reviewed)
+        sets.append("is_reviewed=?")
+        vals.append(_is_reviewed_status(review_status))
+        sets.append("review_status=?")
+        vals.append(review_status)
     if not sets:
         conn.close()
         return {"status": "ok"}

@@ -292,14 +292,17 @@ def _migrate_db(conn, dialect):
             ("SELECT csv_file FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN csv_file TEXT DEFAULT ''"),
             ("SELECT primary_key FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN primary_key TEXT DEFAULT ''"),
             ("SELECT is_reviewed FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
+            ("SELECT review_status FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN review_status TEXT DEFAULT 'pending'"),
             ("SELECT created_at FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN created_at TEXT DEFAULT ''"),
             ("SELECT updated_at FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN updated_at TEXT DEFAULT ''"),
             ("SELECT created_at FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN created_at TEXT DEFAULT ''"),
             ("SELECT updated_at FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN updated_at TEXT DEFAULT ''"),
             ("SELECT is_reviewed FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
+            ("SELECT review_status FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN review_status TEXT DEFAULT 'pending'"),
             ("SELECT created_at FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN created_at TEXT DEFAULT ''"),
             ("SELECT updated_at FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN updated_at TEXT DEFAULT ''"),
             ("SELECT is_reviewed FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
+            ("SELECT review_status FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN review_status TEXT DEFAULT 'pending'"),
             ("SELECT created_at FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN created_at TEXT DEFAULT ''"),
             ("SELECT updated_at FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN updated_at TEXT DEFAULT ''"),
         ]
@@ -311,6 +314,8 @@ def _migrate_db(conn, dialect):
         for table in ("schema_classes", "schema_relationships", "metrics", "concepts"):
             conn.execute(f"UPDATE {table} SET created_at=CURRENT_TIMESTAMP WHERE created_at IS NULL OR created_at='' ")
             conn.execute(f"UPDATE {table} SET updated_at=CURRENT_TIMESTAMP WHERE updated_at IS NULL OR updated_at='' ")
+        for table in ("schema_classes", "metrics", "concepts"):
+            conn.execute(f"UPDATE {table} SET review_status='approved' WHERE is_reviewed=1 AND (review_status IS NULL OR review_status='' OR review_status='pending')")
         return
 
     if dialect == "postgresql":
@@ -325,14 +330,17 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS csv_file TEXT DEFAULT ''",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS primary_key TEXT DEFAULT ''",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
+            "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
+            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
+            "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         ]
@@ -348,19 +356,24 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS csv_file TEXT DEFAULT ''",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS primary_key TEXT DEFAULT ''",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
+            "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
+            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
+            "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         ]
     for statement in migrations:
         conn.execute(statement)
+    for table in ("schema_classes", "metrics", "concepts"):
+        conn.execute(f"UPDATE {table} SET review_status='approved' WHERE is_reviewed=1 AND (review_status IS NULL OR review_status='' OR review_status='pending')")
 
 
 def _schema_sql(dialect):
@@ -399,6 +412,7 @@ def _schema_sql(dialect):
             csv_file TEXT DEFAULT '',
             primary_key TEXT DEFAULT '',
             is_reviewed INTEGER DEFAULT 0,
+            review_status TEXT DEFAULT 'pending',
             created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
             updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id, scenario_id)
@@ -480,6 +494,7 @@ def _schema_sql(dialect):
             chart_type TEXT DEFAULT 'bar',
             sort_order INTEGER DEFAULT 0,
             is_reviewed INTEGER DEFAULT 0,
+            review_status TEXT DEFAULT 'pending',
             created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
             updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id, scenario_id)
@@ -495,6 +510,7 @@ def _schema_sql(dialect):
             related_class TEXT DEFAULT '',
             sort_order INTEGER DEFAULT 0,
             is_reviewed INTEGER DEFAULT 0,
+            review_status TEXT DEFAULT 'pending',
             created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
             updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id, scenario_id)

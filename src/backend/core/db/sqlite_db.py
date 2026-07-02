@@ -45,6 +45,7 @@ def init_db():
             csv_file TEXT DEFAULT '',
             primary_key TEXT DEFAULT '',
             is_reviewed INTEGER DEFAULT 0,
+            review_status TEXT DEFAULT 'pending',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id, scenario_id)
@@ -126,6 +127,7 @@ def init_db():
             chart_type TEXT DEFAULT 'bar',
             sort_order INTEGER DEFAULT 0,
             is_reviewed INTEGER DEFAULT 0,
+            review_status TEXT DEFAULT 'pending',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id, scenario_id)
@@ -141,6 +143,7 @@ def init_db():
             related_class TEXT DEFAULT '',
             sort_order INTEGER DEFAULT 0,
             is_reviewed INTEGER DEFAULT 0,
+            review_status TEXT DEFAULT 'pending',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id, scenario_id)
@@ -323,14 +326,19 @@ def _migrate_db(conn):
         ("schema_classes", "csv_file", "ALTER TABLE schema_classes ADD COLUMN csv_file TEXT DEFAULT ''"),
         ("schema_classes", "primary_key", "ALTER TABLE schema_classes ADD COLUMN primary_key TEXT DEFAULT ''"),
         ("schema_classes", "is_reviewed", "ALTER TABLE schema_classes ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
+        ("schema_classes", "review_status", "ALTER TABLE schema_classes ADD COLUMN review_status TEXT DEFAULT 'pending'"),
         ("metrics", "is_reviewed", "ALTER TABLE metrics ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
+        ("metrics", "review_status", "ALTER TABLE metrics ADD COLUMN review_status TEXT DEFAULT 'pending'"),
         ("concepts", "is_reviewed", "ALTER TABLE concepts ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
+        ("concepts", "review_status", "ALTER TABLE concepts ADD COLUMN review_status TEXT DEFAULT 'pending'"),
     ]
     for table, column, statement in migrations:
         try:
             conn.execute(f"SELECT {column} FROM {table} LIMIT 1")
         except sqlite3.OperationalError:
             conn.execute(statement)
+    for table in ("schema_classes", "metrics", "concepts"):
+        conn.execute(f"UPDATE {table} SET review_status='approved' WHERE is_reviewed=1 AND (review_status IS NULL OR review_status='' OR review_status='pending')")
 
 
 if __name__ == "__main__":

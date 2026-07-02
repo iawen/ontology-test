@@ -2,6 +2,8 @@
 from pydantic import BaseModel
 from typing import Optional
 
+ReviewStatus = str
+
 
 class LoginReq(BaseModel):
     username: str
@@ -42,6 +44,7 @@ class SchemaClassEdit(BaseModel):
     csv_file: str = ""
     primary_key: str = ""
     is_reviewed: bool = False
+    review_status: ReviewStatus = "pending"
 
 
 class SchemaRelationEdit(BaseModel):
@@ -70,6 +73,7 @@ class MetricCreate(BaseModel):
     chart_type: str = "bar"
     sort_order: int = 0
     is_reviewed: bool = False
+    review_status: ReviewStatus = "pending"
 
 
 class MetricUpdate(BaseModel):
@@ -85,6 +89,7 @@ class MetricUpdate(BaseModel):
     chart_type: str = ""
     sort_order: int | None = None
     is_reviewed: bool | None = None
+    review_status: ReviewStatus | None = None
 
 
 class MetricBatchDelete(BaseModel):
@@ -105,6 +110,7 @@ class ConceptCreate(BaseModel):
     related_class: str = ""
     sort_order: int = 0
     is_reviewed: bool = False
+    review_status: ReviewStatus = "pending"
 
 
 class ConceptUpdate(BaseModel):
@@ -116,6 +122,7 @@ class ConceptUpdate(BaseModel):
     related_class: str = ""
     sort_order: int | None = None
     is_reviewed: bool | None = None
+    review_status: ReviewStatus | None = None
 
 
 # ============================================================

@@ -41,6 +41,9 @@ class SchemaRetrieverAgent:
         keywords = self._extract_keywords(user_message)
         relevant_classes = self._find_relevant_classes(keywords, ontology_engine)
         relevant_metrics = self._find_relevant_metrics(keywords, ontology_engine)
+        relevant_classes = self._merge_metric_target_classes(
+            relevant_classes, relevant_metrics, ontology_engine
+        )
         relevant_rels = self._find_relevant_relationships(relevant_classes, ontology_engine)
 
         context = self._build_context(
@@ -84,6 +87,15 @@ class SchemaRetrieverAgent:
                     break
         return list(relevant)
 
+    def _merge_metric_target_classes(self, class_ids: List[str], metric_ids: List[str], oe) -> List[str]:
+        merged = set(class_ids)
+        for metric in oe.list_metrics():
+            if metric.get("id") in metric_ids:
+                target_class = metric.get("target_class") or metric.get("class_id")
+                if target_class:
+                    merged.add(target_class)
+        return list(merged)
+
     def _find_relevant_relationships(self, class_ids: List[str], oe) -> List[dict]:
         relevant = []
         for rel in oe.relationships:
@@ -94,6 +106,7 @@ class SchemaRetrieverAgent:
     def _build_context(self, oe, class_ids: List[str], metric_ids: List[str], rels: List[dict]) -> str:
         """构建精简上下文"""
         parts = []
+        metrics_by_class = self._group_metrics_by_class(oe.list_metrics())
 
         # 1. 全局摘要（始终包含）
         all_classes = [f"{c['id']}({c.get('name_cn','')})" for c in oe.list_classes()]
@@ -101,18 +114,31 @@ class SchemaRetrieverAgent:
 
         # 2. 相关 Class 详情
         if class_ids:
-            parts.append("## 相关实体类详情")
+            parts.append("## 相关实体类、字段与指标")
             for c in oe.list_classes():
                 if c["id"] in class_ids:
                     props = c.get("properties", [])[:10]
-                    parts.append(f"- **{c['id']}**({c.get('name_cn','')}): {', '.join(props)}")
+                    class_metrics = metrics_by_class.get(c["id"], [])
+                    lines = [
+                        f"- **{c['id']}**({c.get('name_cn','')})",
+                        f"  字段: {', '.join(props) or '（暂无）'}",
+                    ]
+                    if class_metrics:
+                        lines.append("  关联指标:")
+                        for metric in class_metrics:
+                            lines.append(f"    {self._format_metric(metric)}")
+                    else:
+                        lines.append("  关联指标: （暂无）")
+                    parts.append("\n".join(lines))
 
-        # 3. 相关 Metric 详情
+        # 3. 命中但未归属到相关实体的 Metric
         if metric_ids:
-            parts.append("## 相关指标详情")
+            unlisted_metrics = []
             for m in oe.list_metrics():
-                if m["id"] in metric_ids:
-                    parts.append(f"- **{m['id']}**({m.get('name','')}): {m.get('formula','')}")
+                if m["id"] in metric_ids and m.get("target_class") not in class_ids:
+                    unlisted_metrics.append(self._format_metric(m))
+            if unlisted_metrics:
+                parts.append("## 其他命中指标\n" + "\n".join(unlisted_metrics))
 
         # 4. 相关 Relationship
         if rels:
@@ -121,6 +147,31 @@ class SchemaRetrieverAgent:
                 parts.append(f"- {r['source']} --[{r.get('type','')}]--> {r['target']} (JOIN: {r.get('join_key','')})")
 
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _group_metrics_by_class(metrics: List[dict]) -> Dict[str, List[dict]]:
+        grouped: Dict[str, List[dict]] = {}
+        for metric in metrics:
+            target_class = metric.get("target_class") or metric.get("class_id") or "__unbound__"
+            grouped.setdefault(target_class, []).append(metric)
+        return grouped
+
+    @staticmethod
+    def _format_metric(metric: dict) -> str:
+        name = metric.get("name") or metric.get("name_cn") or metric.get("id") or ""
+        formula = metric.get("formula") or metric.get("calculation") or ""
+        dimensions = metric.get("dimensions") or []
+        if isinstance(dimensions, str):
+            try:
+                dimensions = json.loads(dimensions)
+            except json.JSONDecodeError:
+                dimensions = [dimensions]
+        return (
+            f"- **{name}** (`{metric.get('id', '')}`)"
+            f" | 说明: {metric.get('description', '') or '-'}"
+            f" | 计算: {formula or '-'}"
+            f" | 维度: {', '.join(dimensions) if dimensions else '-'}"
+        )
 
 
 # ============================================================
