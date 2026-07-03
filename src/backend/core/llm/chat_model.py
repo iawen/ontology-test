@@ -95,12 +95,18 @@ def get_sync_client() -> OpenAI:
         return __g_sync_client
 
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    ca_file = _build_ca_file()
-    __g_sync_client = OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY", ""),
-        base_url=base_url,
-        http_client=httpx.Client(verify=ca_file),
-    )
+    if Cfg.openai_ssl:
+        ca_file = _build_ca_file()
+        __g_sync_client = OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY", ""),
+            base_url=base_url,
+            http_client=httpx.Client(verify=ca_file),
+        )
+    else:
+        __g_sync_client = OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY", ""),
+            base_url=base_url,
+        )
     return __g_sync_client
 
 
