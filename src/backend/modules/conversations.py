@@ -94,6 +94,11 @@ async def get_messages(conv_id: str, request: Request):
                 item["visualization"] = json.loads(r["visualization"])
             except Exception:
                 pass
+        if "answer_datasets" in r.keys() and r["answer_datasets"]:
+            try:
+                item["answer_datasets"] = json.loads(r["answer_datasets"])
+            except Exception:
+                pass
         if r["steps"]:
             try:
                 item["steps"] = json.loads(r["steps"])

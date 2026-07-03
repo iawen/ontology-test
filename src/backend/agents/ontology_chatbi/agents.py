@@ -21,6 +21,24 @@ from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass
 
 from tools.logger import logger
+from .constants import (
+    AUTOCORRECT_VALUE_SEARCH_LIMIT,
+    CONTEXT_COMPRESSOR_HARD_LIMIT,
+    CONTEXT_COMPRESSOR_HEAD_RATIO,
+    CONTEXT_COMPRESSOR_TAIL_RATIO,
+    ENTITY_CANDIDATE_CONTAINS_SCORE,
+    ENTITY_CN_VARIANT_MAX_WINDOW,
+    ENTITY_CORE_CONTAINS_SCORE,
+    ENTITY_CORE_EXACT_SCORE,
+    ENTITY_FIELD_VALUE_SEARCH_LIMIT,
+    ENTITY_HINT_CANDIDATE_LIMIT,
+    ENTITY_MATCH_THRESHOLD,
+    ENTITY_MENTION_LIMIT,
+    SCHEMA_CLASS_PROPERTY_PREVIEW_LIMIT,
+    TEXT_FILTER_VALUE_SEARCH_LIMIT,
+    TOOL_AUTOCORRECT_LOG_MAX_CHARS,
+    TOOL_EXECUTOR_MAX_RETRY,
+)
 
 
 # ============================================================
@@ -117,7 +135,7 @@ class SchemaRetrieverAgent:
             parts.append("## 相关实体类、字段与指标")
             for c in oe.list_classes():
                 if c["id"] in class_ids:
-                    props = c.get("properties", [])[:10]
+                    props = c.get("properties", [])[:SCHEMA_CLASS_PROPERTY_PREVIEW_LIMIT]
                     class_metrics = metrics_by_class.get(c["id"], [])
                     lines = [
                         f"- **{c['id']}**({c.get('name_cn','')})",
@@ -230,15 +248,15 @@ class ContextCompressorAgent:
       输出: compressed_context: str
     """
 
-    HARD_LIMIT = 20000
+    HARD_LIMIT = CONTEXT_COMPRESSOR_HARD_LIMIT
 
     async def compress(self, context: str, limit: int = None) -> str:
         limit = limit or self.HARD_LIMIT
         if len(context) <= limit:
             return context
         lines = context.splitlines()
-        head_limit = int(limit * 0.75)
-        tail_limit = int(limit * 0.25)
+        head_limit = int(limit * CONTEXT_COMPRESSOR_HEAD_RATIO)
+        tail_limit = int(limit * CONTEXT_COMPRESSOR_TAIL_RATIO)
         head_lines = []
         head_size = 0
         for line in lines:
@@ -288,14 +306,14 @@ class EntityDisambiguatorAgent:
                     if not candidates:
                         continue
                     best_match, score, all_cands = self._fuzzy_match(uv, candidates)
-                    if best_match and score >= 0.75 and best_match != uv:
+                    if best_match and score >= ENTITY_MATCH_THRESHOLD and best_match != uv:
                         hints.append({
                             "user_value": uv,
                             "standard_value": best_match,
                             "field": field_name,
                             "class_id": class_id,
                             "similarity": score,
-                            "all_candidates": all_cands[:5],
+                            "all_candidates": all_cands[:ENTITY_HINT_CANDIDATE_LIMIT],
                         })
         return hints
 
@@ -310,7 +328,7 @@ class EntityDisambiguatorAgent:
 
     def _get_field_values(self, class_id: str, field_name: str, qe, keyword: str) -> List[str]:
         try:
-            result = qe.fuzzy_search_values(class_id, field_name, keyword, limit=30)
+            result = qe.fuzzy_search_values(class_id, field_name, keyword, limit=ENTITY_FIELD_VALUE_SEARCH_LIMIT)
             return result.get("matched_values") or result.get("values", [])
         except:
             return []
@@ -323,14 +341,14 @@ class EntityDisambiguatorAgent:
             for mention in self._mention_variants(item.strip()):
                 if mention not in mentions:
                     mentions.append(mention)
-        return mentions[:12]
+        return mentions[:ENTITY_MENTION_LIMIT]
 
     def _mention_variants(self, value: str) -> List[str]:
         if len(value) < 2:
             return []
         variants = [value]
         if re.fullmatch(r"[\u4e00-\u9fff]{3,}", value):
-            max_window = min(6, len(value))
+            max_window = min(ENTITY_CN_VARIANT_MAX_WINDOW, len(value))
             for size in range(2, max_window + 1):
                 for start in range(0, len(value) - size + 1):
                     variants.append(value[start:start + size])
@@ -364,11 +382,11 @@ class EntityDisambiguatorAgent:
             if value_clean == cand_clean:
                 score = 1.0
             elif value_core and value_core == cand_clean:
-                score = 0.95
+                score = ENTITY_CORE_EXACT_SCORE
             elif value_core and value_core in cand_clean:
-                score = 0.85
+                score = ENTITY_CORE_CONTAINS_SCORE
             elif cand_clean in value_clean:
-                score = 0.80
+                score = ENTITY_CANDIDATE_CONTAINS_SCORE
             else:
                 set1, set2 = set(value_clean), set(cand_clean)
                 intersection = set1 & set2
@@ -404,7 +422,7 @@ class ToolExecutor:
       - 再次失败走向 CLARIFY 或抛出异常
     """
 
-    MAX_RETRY = 1  # 死循环防线
+    MAX_RETRY = TOOL_EXECUTOR_MAX_RETRY
 
     def __init__(self, scenario_id: str, entity_agent: EntityDisambiguatorAgent):
         self.scenario_id = scenario_id
@@ -442,8 +460,8 @@ class ToolExecutor:
                         "Tool args auto-corrected: scenario_id=%s tool=%s original=%s corrected=%s",
                         self.scenario_id,
                         tool_name,
-                        json.dumps(arguments, ensure_ascii=False, default=str)[:1000],
-                        json.dumps(corrected_args, ensure_ascii=False, default=str)[:1000],
+                        json.dumps(arguments, ensure_ascii=False, default=str)[:TOOL_AUTOCORRECT_LOG_MAX_CHARS],
+                        json.dumps(corrected_args, ensure_ascii=False, default=str)[:TOOL_AUTOCORRECT_LOG_MAX_CHARS],
                     )
                     return await self.execute(
                         tool_name, corrected_args, query_engine, engine, retry_count + 1
@@ -530,12 +548,12 @@ class ToolExecutor:
 
     async def _align_text_filter_value(self, query_engine, class_id: str, field: str, value: str) -> Optional[str]:
         try:
-            result = query_engine.fuzzy_search_values(class_id, field, value, limit=20)
+            result = query_engine.fuzzy_search_values(class_id, field, value, limit=TEXT_FILTER_VALUE_SEARCH_LIMIT)
             candidates = result.get("matched_values") or result.get("values", [])
         except Exception:
             return None
         best_match, score, _ = self.entity_agent._fuzzy_match(value, candidates)
-        return best_match if best_match and score >= 0.75 else None
+        return best_match if best_match and score >= ENTITY_MATCH_THRESHOLD else None
 
     async def _auto_correct_args(self, arguments: dict, query_engine) -> dict:
         """后置自动校正：修正 query_ontology_data 的 filter 参数"""
@@ -550,14 +568,14 @@ class ToolExecutor:
             # 尝试模糊匹配修正
             candidates = []
             try:
-                result = query_engine.fuzzy_search_values(target_class, field, str(value), limit=50)
+                result = query_engine.fuzzy_search_values(target_class, field, str(value), limit=AUTOCORRECT_VALUE_SEARCH_LIMIT)
                 candidates = result.get("matched_values") or result.get("values", [])
             except:
                 pass
 
             if candidates:
                 best_match, score, _ = self.entity_agent._fuzzy_match(str(value), candidates)
-                if best_match and score >= 0.75:
+                if best_match and score >= ENTITY_MATCH_THRESHOLD:
                     new_filters.append({**f, "value": best_match})
                 else:
                     new_filters.append(f)

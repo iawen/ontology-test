@@ -36,6 +36,15 @@ export interface AlertsData {
 
 export type VisualizationData = SchemaInfoData | QueryResultData | AlertsData;
 
+export interface AnswerDataset {
+  id: string;
+  name: string;
+  arguments?: Record<string, unknown>;
+  chart_type?: ChartConfigData["chart_type"];
+  chart_config?: ChartConfigData;
+  data: QueryResultData;
+}
+
 export interface Scenario {
   id: string;
   name: string;
@@ -163,6 +172,7 @@ export interface Message {
   content: string;
   timestamp: number;
   visualization?: VisualizationData;
+  answerDatasets?: AnswerDataset[];
   isLoading?: boolean; // 代表该消息正在生成/思考中
   steps?: ToolStep[];
   clarification?: ClarificationData;

@@ -12,6 +12,8 @@ from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 
+from .constants import DEFAULT_MAX_ROUNDS
+
 
 class State(str, Enum):
     """Chat 状态机状态"""
@@ -54,7 +56,7 @@ class AgentState:
     # LLM 配置
     system_prompt: str = ""
     tools: List[dict] = field(default_factory=list)
-    max_rounds: int = 20
+    max_rounds: int = DEFAULT_MAX_ROUNDS
     current_round: int = 0
 
     # 上下文管理
@@ -68,9 +70,11 @@ class AgentState:
     tool_call_records: List[ToolCallRecord] = field(default_factory=list)
     all_tool_results: List[dict] = field(default_factory=list)
     tool_timings: Dict[str, dict] = field(default_factory=dict)
+    python_analyze_enforced: bool = False
 
     # 持久化输出
     assistant_content: str = ""
+    answer_datasets: List[dict] = field(default_factory=list)
     action_confirm: Optional[dict] = None
 
     # 流式事件

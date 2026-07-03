@@ -305,6 +305,7 @@ def _migrate_db(conn, dialect):
             ("SELECT review_status FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN review_status TEXT DEFAULT 'pending'"),
             ("SELECT created_at FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN created_at TEXT DEFAULT ''"),
             ("SELECT updated_at FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN updated_at TEXT DEFAULT ''"),
+            ("SELECT answer_datasets FROM messages LIMIT 1", "ALTER TABLE messages ADD COLUMN answer_datasets TEXT DEFAULT ''"),
         ]
         for check_sql, alter_sql in migrations:
             try:
@@ -343,6 +344,7 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS answer_datasets TEXT DEFAULT ''",
         ]
     else:
         migrations = [
@@ -369,6 +371,7 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS answer_datasets TEXT DEFAULT ''",
         ]
     for statement in migrations:
         conn.execute(statement)
@@ -468,6 +471,7 @@ def _schema_sql(dialect):
             role TEXT NOT NULL,
             content TEXT DEFAULT '',
             visualization TEXT DEFAULT '',
+            answer_datasets TEXT DEFAULT '',
             steps TEXT DEFAULT '',
             action_confirm TEXT DEFAULT '',
             created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP

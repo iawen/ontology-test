@@ -212,6 +212,8 @@ class OntologyAssetValidator:
         if not text_formula:
             return []
 
+        text_formula = self._strip_formula_output_aliases(text_formula)
+
         text_formula = re.sub(r"'[^']*'", " ", text_formula)
         quoted_fields = []
         for pattern in (r'"([^"]+)"', r"`([^`]+)`", r"\[([^\]]+)\]"):
@@ -235,6 +237,50 @@ class OntologyAssetValidator:
             if field not in fields:
                 fields.append(field)
         return fields
+
+    def _split_top_level_commas(self, text: str) -> list[str]:
+        parts = []
+        start = 0
+        depth = 0
+        quote_char = ""
+        index = 0
+        while index < len(text):
+            ch = text[index]
+            if quote_char:
+                if ch == quote_char:
+                    if index + 1 < len(text) and text[index + 1] == quote_char:
+                        index += 1
+                    else:
+                        quote_char = ""
+                index += 1
+                continue
+
+            if ch in {"'", '"', "`"}:
+                quote_char = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif ch == "," and depth == 0:
+                part = text[start:index].strip()
+                if part:
+                    parts.append(part)
+                start = index + 1
+            index += 1
+
+        tail = text[start:].strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    def _strip_formula_output_aliases(self, formula: str) -> str:
+        parts = []
+        for part in self._split_top_level_commas(formula):
+            alias_match = re.match(r"(?is)^(.*?)\s+AS\s+[A-Za-z_][\w]*\s*$", part)
+            if not alias_match:
+                alias_match = re.match(r"(?is)^(.*\))\s+[A-Za-z_][\w]*\s*$", part)
+            parts.append(alias_match.group(1).strip() if alias_match else part)
+        return ", ".join(parts)
 
     def _log_asset_drop(self, asset_type: str, asset_id: str, reason: str) -> None:
         print(f"[Ontology Validation] drop {asset_type} {asset_id}: {reason}")

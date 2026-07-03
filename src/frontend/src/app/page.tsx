@@ -5,7 +5,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
-  VisualizationData, Scenario, QueryResultData
+  Scenario, QueryResultData
 } from "@/lib/types";
 import { ThemeProvider } from "@/contexts/ThemeContext";
 
@@ -19,7 +19,7 @@ import PlanProgressCard from "@/components/PlanProgressCard";
 import LoginOverlay from "@/components/LoginOverlay";
 import SidebarPanel from "@/components/SidebarPanel";
 import ToolStepsPanel from "@/components/ToolStepsPanel";
-import type { Message, Conversation, Suggestion, ToolStep } from "@/lib/types";
+import type { AnswerDataset, Message, Conversation, Suggestion, ToolStep } from "@/lib/types";
 
 function normalizeQueryResult(value: any): QueryResultData | undefined {
   if (!value || value.type !== "query_result" || value.error) return undefined;
@@ -43,12 +43,22 @@ function normalizeQueryResult(value: any): QueryResultData | undefined {
   };
 }
 
-function pickLatestValidQueryResult(toolResults: any[]): QueryResultData | undefined {
-  for (let index = toolResults.length - 1; index >= 0; index -= 1) {
-    const normalized = normalizeQueryResult(toolResults[index]?.result);
-    if (normalized) return normalized;
-  }
-  return undefined;
+function normalizeAnswerDatasets(value: any): AnswerDataset[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item, index) => {
+      const data = normalizeQueryResult(item?.data || item?.result || item);
+      if (!data) return undefined;
+      return {
+        id: String(item?.id || `query_${index + 1}`),
+        name: String(item?.name || data.class_name || `Query ${index + 1}`),
+        arguments: item?.arguments || undefined,
+        chart_type: item?.chart_type || item?.chartConfig?.chart_type || item?.chart_config?.chart_type,
+        chart_config: item?.chart_config || item?.chartConfig || undefined,
+        data,
+      } satisfies AnswerDataset;
+    })
+    .filter(Boolean) as AnswerDataset[];
 }
 
 function parseSseEvent(raw: string): any {
@@ -213,6 +223,7 @@ function AppContent() {
           content: m.content,
           timestamp: new Date(m.created_at).getTime(),
           visualization: m.visualization || undefined,
+          answerDatasets: normalizeAnswerDatasets(m.answer_datasets),
           steps: m.steps || [],
           actionConfirm: m.action_confirm || undefined,
           isLoading: false,
@@ -276,12 +287,16 @@ function AppContent() {
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (token) headers["Authorization"] = `Bearer ${token}`;
 
-      const response = await fetch("http://localhost:8000/api/chat", {
+      const response = await fetch("/api/chat", {
         method: "POST",
         headers,
         body: JSON.stringify({ scenario_id: currentScenario, messages: chatHistory, conversation_id: convId }),
       });
 
+      if (response.status === 401) {
+        handleLogout();
+        throw new Error("登录状态已失效，请重新登录");
+      }
       if (!response.ok) throw new Error(`Chat API 请求失败: ${response.status}`);
 
       if (!response.body) throw new Error("ReadableStream 获取失败");
@@ -292,7 +307,7 @@ function AppContent() {
       let accumulatedContent = "";
       // 🌟 核心：使用局部追踪器，确保在 React 渲染周期内高频并发的数据引用被彻底断开，强制刷新 UI
       let currentSteps: ToolStep[] = [];
-      let latestVisualization: VisualizationData | undefined = undefined;
+      let answerDatasets: AnswerDataset[] = [];
       let currentPlan: Message["plan"] | undefined = undefined;
       let actionConfirm: Message["actionConfirm"] | undefined = undefined;
 
@@ -445,13 +460,13 @@ function AppContent() {
                 );
                 break;
 
-              case "chart_data":
-                latestVisualization = normalizeQueryResult(event.data);
-                if (latestVisualization) {
+              case "answer_datasets":
+                answerDatasets = normalizeAnswerDatasets(event.data);
+                if (answerDatasets.length > 0) {
                   setMessages((prev) =>
                     prev.map((m) =>
                       m.id === aiMsgId
-                        ? { ...m, visualization: latestVisualization, chartConfig: event.chart_config || undefined, isLoading: false }
+                        ? { ...m, answerDatasets, isLoading: false }
                         : m
                     )
                   );
@@ -459,18 +474,17 @@ function AppContent() {
                 break;
 
               case "done":
-                let finalViz: VisualizationData | undefined = latestVisualization;
-                if (Array.isArray(event.tool_results)) {
-                  finalViz = pickLatestValidQueryResult(event.tool_results) || finalViz;
+                const finalAnswerDatasets = normalizeAnswerDatasets(event.answer_datasets);
+                if (finalAnswerDatasets.length > 0) {
+                  answerDatasets = finalAnswerDatasets;
                 }
-
                 setMessages((prev) =>
                   prev.map((m) =>
                     m.id === aiMsgId
                       ? {
                           ...m,
                           isLoading: false,
-                          visualization: finalViz || m.visualization,
+                          answerDatasets: answerDatasets.length > 0 ? answerDatasets : m.answerDatasets,
                           steps: currentSteps,
                           plan: currentPlan || m.plan,
                         }
@@ -532,6 +546,8 @@ function AppContent() {
       );
     }
 
+    const answerDatasetItems = msg.answerDatasets || [];
+
     return (
       <div key={msg.id} className="flex justify-start mb-6">
         <div className="w-full max-w-[95%] space-y-3">
@@ -586,7 +602,24 @@ function AppContent() {
             />
           )}
 
-          {msg.visualization && msg.visualization.type === "query_result" && (
+          {answerDatasetItems.length > 0 && (
+            <div className="space-y-3">
+              {answerDatasetItems.map((dataset, index) => (
+                <div key={dataset.id || index} className="max-w-full overflow-hidden rounded-lg border border-slate-200/60 dark:border-slate-800 shadow-sm">
+                  <div className="border-b border-slate-200/60 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-600 dark:border-slate-800 dark:bg-slate-900/60 dark:text-slate-300">
+                    {dataset.name || `Query ${index + 1}`}
+                  </div>
+                  <QueryResult
+                    data={dataset.data}
+                    chartConfig={dataset.chart_config || (dataset.chart_type ? { chart_type: dataset.chart_type, title: dataset.name, data: dataset.data.rows } : undefined)}
+                    onDrilldown={handleTableDrilldown}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+
+          {answerDatasetItems.length === 0 && msg.visualization && msg.visualization.type === "query_result" && (
             <div className="max-w-full overflow-hidden rounded-lg border border-slate-200/60 dark:border-slate-800 shadow-sm">
               <QueryResult
                 data={msg.visualization as QueryResultData}
