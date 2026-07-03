@@ -101,6 +101,7 @@ def init_db():
             role TEXT NOT NULL,
             content TEXT DEFAULT '',
             visualization TEXT DEFAULT '',
+            answer_datasets TEXT DEFAULT '',
             steps TEXT DEFAULT '',
             action_confirm TEXT DEFAULT '',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP

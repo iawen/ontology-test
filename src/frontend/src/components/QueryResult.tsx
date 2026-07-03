@@ -1,12 +1,12 @@
 "use client";
 import ReactEChartsCore from "echarts-for-react/lib/core";
 import * as echarts from "echarts/core";
-import { BarChart, PieChart, LineChart, ScatterChart } from "echarts/charts";
+import { BarChart, PieChart, LineChart, ScatterChart, GaugeChart } from "echarts/charts";
 import { GridComponent, TooltipComponent, LegendComponent, TitleComponent } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
 import type { QueryResultData, ChartConfigData } from "@/lib/types";
 
-echarts.use([BarChart, PieChart, LineChart, ScatterChart, GridComponent, TooltipComponent, LegendComponent, TitleComponent, CanvasRenderer]);
+echarts.use([BarChart, PieChart, LineChart, ScatterChart, GaugeChart, GridComponent, TooltipComponent, LegendComponent, TitleComponent, CanvasRenderer]);
 
 const PALETTE = ["#6366f1", "#22d3ee", "#f59e0b", "#34d399", "#f43f5e", "#a78bfa", "#fb923c", "#2dd4bf"];
 
@@ -17,11 +17,15 @@ interface Props {
 }
 
 /** 自动推断图表类型 */
-function inferChartType(data: QueryResultData): "bar" | "pie" | "line" {
+function inferChartType(data: QueryResultData): ChartConfigData["chart_type"] {
   const { rows, columns, aggregated, dimensions } = data;
-  if (!aggregated || !dimensions || dimensions.length === 0 || rows.length === 0) return "bar";
+  const { numericCols } = detectColumns(data);
+  if (rows.length === 1 && numericCols.length === 1) return "gauge";
+  if (!aggregated || !dimensions || dimensions.length === 0 || rows.length === 0) return "table";
+  const firstDimension = String(dimensions[0] || "").toLowerCase();
+  if (["date", "time", "month", "year", "quarter", "日期", "时间", "月", "年", "季度"].some((token) => firstDimension.includes(token))) return "line";
   // 数据量 <= 8 适合饼图
-  if (rows.length <= 8 && dimensions.length === 1) return "pie";
+  if (rows.length <= 8 && dimensions.length === 1 && numericCols.length === 1) return "pie";
   // 默认柱状图
   return "bar";
 }
@@ -30,8 +34,8 @@ function inferChartType(data: QueryResultData): "bar" | "pie" | "line" {
 function detectColumns(data: QueryResultData) {
   const { rows, columns } = data;
   const numericCols = columns.filter((col) => {
-    const vals = rows.slice(0, 20).map((r) => Number(r[col]));
-    return vals.filter((v) => !isNaN(v) && v !== 0).length > 3;
+    const vals = rows.slice(0, 20).map((r) => r[col]).filter((value) => value !== null && value !== undefined && value !== "");
+    return vals.length > 0 && vals.every((value) => Number.isFinite(Number(value)));
   });
   const dimCols = columns.filter((col) => !numericCols.includes(col));
   return { numericCols, dimCols };
@@ -42,6 +46,27 @@ function buildEChartsOption(data: QueryResultData, chartType: string) {
   const { rows, columns, dimensions, class_name } = data;
   const { numericCols, dimCols } = detectColumns(data);
   const dimKey = dimensions?.[0] || dimCols[0];
+
+  if (chartType === "table") {
+    return null;
+  }
+
+  if (chartType === "gauge" && rows.length > 0 && numericCols.length > 0) {
+    const value = Number(rows[0][numericCols[0]]) || 0;
+    return {
+      title: { text: class_name, left: "center", textStyle: { fontSize: 14, fontWeight: 500 } },
+      tooltip: { formatter: `{b}: ${value.toLocaleString()}` },
+      series: [{
+        type: "gauge",
+        min: 0,
+        max: value > 100 ? Math.ceil(value * 1.2) : 100,
+        progress: { show: true, width: 12 },
+        axisLine: { lineStyle: { width: 12 } },
+        detail: { valueAnimation: true, formatter: value.toLocaleString(), fontSize: 18 },
+        data: [{ value, name: numericCols[0] }],
+      }],
+    };
+  }
 
   if (chartType === "pie" && dimKey && numericCols.length > 0) {
     const pieData = rows.map((r, i) => ({
@@ -69,7 +94,7 @@ function buildEChartsOption(data: QueryResultData, chartType: string) {
     });
     const series = numericCols.slice(0, 4).map((col, si) => ({
       name: col,
-      type: chartType === "line" ? "line" : "bar",
+      type: chartType === "line" ? "line" : chartType === "scatter" ? "scatter" : "bar",
       data: rows.map((r) => Number(r[col]) || 0),
       itemStyle: { color: PALETTE[si % PALETTE.length] },
       smooth: chartType === "line",
@@ -115,7 +140,7 @@ export default function QueryResult({ data, chartConfig, onDrilldown }: Props) {
   return (
     <div className="my-3 space-y-3">
       {/* 图表区域 */}
-      {option && aggregated && rows.length > 0 && (
+      {option && rows.length > 0 && (
         <div className="rounded-lg border border-slate-200/60 dark:border-slate-700/40 bg-white/80 dark:bg-slate-800/60 overflow-hidden">
           <div className="flex items-center gap-2 px-4 py-2 border-b border-slate-100 dark:border-slate-700/30">
             <span className="font-semibold text-sm" style={{ color: "var(--text-primary)" }}>

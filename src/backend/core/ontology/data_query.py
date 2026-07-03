@@ -377,28 +377,137 @@ class DataQueryEngine:
         match = re.search(r"\b(SUM|AVG|MIN|MAX|COUNT)\s*\(", formula, re.IGNORECASE)
         return match.group(1).upper() if match else None
 
-    def _metric_expr(self, metric_info: dict, metric_name: str, default_class: str, alias_map: dict) -> str:
+    def _split_formula_parts(self, formula: str) -> list[str]:
+        text = str(formula or "").strip()
+        if not text:
+            return []
+
+        parts = []
+        start = 0
+        depth = 0
+        quote_char = ""
+        index = 0
+        while index < len(text):
+            ch = text[index]
+            if quote_char:
+                if ch == quote_char:
+                    if index + 1 < len(text) and text[index + 1] == quote_char:
+                        index += 1
+                    else:
+                        quote_char = ""
+                index += 1
+                continue
+
+            if ch in {"'", '"', "`"}:
+                quote_char = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif ch == "," and depth == 0:
+                part = text[start:index].strip()
+                if part:
+                    parts.append(part)
+                start = index + 1
+            index += 1
+
+        tail = text[start:].strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    def _split_formula_alias(self, formula: str) -> tuple[str, str]:
+        text = str(formula or "").strip()
+        match = re.match(r"(?is)^(.*?)\s+AS\s+([A-Za-z_][\w]*)\s*$", text)
+        if match:
+            return match.group(1).strip(), match.group(2).strip()
+        match = re.match(r"(?is)^(.*\))\s+([A-Za-z_][\w]*)\s*$", text)
+        if match:
+            return match.group(1).strip(), match.group(2).strip()
+        return text, ""
+
+    def _extract_simple_formula(self, formula: str) -> tuple[str, str] | None:
+        match = re.fullmatch(
+            r"\s*(SUM|AVG|MIN|MAX|COUNT)\s*\(\s*(DISTINCT\s+)?([A-Za-z_][\w]*)\s*\)\s*",
+            formula or "",
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        agg = match.group(1).upper()
+        distinct = "DISTINCT " if match.group(2) else ""
+        field = match.group(3)
+        return agg + "|" + distinct, field
+
+    def _formula_alias(self, metric_name: str, formula: str, index: int, total: int) -> str:
+        expr, explicit_alias = self._split_formula_alias(formula)
+        if explicit_alias:
+            return explicit_alias
+        simple = self._extract_simple_formula(expr)
+        if total > 1 and simple:
+            return simple[1]
+        return metric_name if index == 0 else f"{metric_name}_{index + 1}"
+
+    def _unique_alias(self, alias_name: str, used_aliases: set[str]) -> str:
+        base = str(alias_name or "metric").strip() or "metric"
+        alias_name = base
+        index = 2
+        while alias_name in used_aliases:
+            alias_name = f"{base}_{index}"
+            index += 1
+        used_aliases.add(alias_name)
+        return alias_name
+
+    def _dedupe_preserve_order(self, values: list) -> list:
+        deduped = []
+        seen = set()
+        for value in values or []:
+            key = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str) if isinstance(value, (dict, list)) else str(value)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(value)
+        return deduped
+
+    def _metric_expr_for_formula(self, metric_info: dict, metric_name: str, default_class: str, alias_map: dict, formula: str) -> str:
         cls = self._metric_class(metric_info, default_class)
         alias = alias_map.get(cls, "t0")
-        formula = str(metric_info.get("formula") or "").strip()
-        logical_field = metric_info.get("field") or self._extract_formula_field(formula)
+        expr, _ = self._split_formula_alias(formula)
+        simple = self._extract_simple_formula(expr)
+        logical_field = simple[1] if simple else metric_info.get("field")
 
         if logical_field:
             p_col = self.oe.map_field(cls, logical_field)
             cls = self._resolve_formula_class(cls, p_col, alias_map)
             alias = alias_map.get(cls, "t0")
-            agg_func = (metric_info.get("aggregation") or self._extract_formula_aggregation(formula) or "SUM").upper()
-            return f'{agg_func}({self._col_ref(alias, p_col)})'
+            agg_spec = (simple[0] if simple else (metric_info.get("aggregation") or self._extract_formula_aggregation(expr) or "SUM").upper() + "|")
+            agg_func, distinct = agg_spec.split("|", 1)
+            return f'{agg_func}({distinct}{self._col_ref(alias, p_col)})'
 
-        if formula:
-            return formula
+        return expr
+
+    def _metric_exprs(self, metric_info: dict, metric_name: str, default_class: str, alias_map: dict) -> list[tuple[str, str]]:
+        formula = str(metric_info.get("formula") or "").strip()
+        formula_parts = self._split_formula_parts(formula)
+        if formula_parts:
+            total = len(formula_parts)
+            return [
+                (
+                    self._metric_expr_for_formula(metric_info, metric_name, default_class, alias_map, part),
+                    self._formula_alias(metric_name, part, index, total),
+                )
+                for index, part in enumerate(formula_parts)
+            ]
 
         cls = self.oe.find_class_by_field(metric_name) or default_class
         alias = alias_map.get(cls, "t0")
         p_col = self.oe.map_field(cls, metric_name)
         f_type = self.oe.get_field_type(cls, metric_name)
         agg_func = "SUM" if f_type == "numeric" else "COUNT"
-        return f'{agg_func}({self._col_ref(alias, p_col)})'
+        return [(f'{agg_func}({self._col_ref(alias, p_col)})', metric_name)]
+
+    def _metric_expr(self, metric_info: dict, metric_name: str, default_class: str, alias_map: dict) -> str:
+        return self._metric_exprs(metric_info, metric_name, default_class, alias_map)[0][0]
 
     ALLOWED_OPERATORS = {
         "=", "!=", "<>", ">", "<", ">=", "<=",
@@ -497,6 +606,7 @@ class DataQueryEngine:
         filters = filters or []
         having = having or []
         join_classes = join_classes or []
+        metrics = self._dedupe_preserve_order(metrics)
         query_id = uuid.uuid4().hex[:8]
         build_started = time.time()
 
@@ -663,6 +773,7 @@ class DataQueryEngine:
         # ── 3. 构建多表解耦的 SELECT 与 GROUP BY ──
         select_parts = []
         group_parts = []
+        used_select_aliases = set()
         
         # 维度映射 (自动匹配别名与分组)
         for dim in dimensions:
@@ -680,6 +791,7 @@ class DataQueryEngine:
                 return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
             col_str = self._col_ref(alias, p_col)
             select_parts.append(f'{col_str} AS {self._alias_ref(dim)}')
+            used_select_aliases.add(dim)
             group_parts.append(col_str)
             logger.debug(
                 "DataQuery dimension mapped: query_id=%s dimension=%s class=%s alias=%s physical_col=%s",
@@ -695,7 +807,7 @@ class DataQueryEngine:
             m_info = self.oe.get_metric_info(metric)
             if m_info:
                 try:
-                    metric_expr = self._metric_expr(m_info, metric, target_class, alias_map)
+                    metric_exprs = self._metric_exprs(m_info, metric, target_class, alias_map)
                 except ValueError as e:
                     logger.warning(
                         "DataQuery metric build failed: query_id=%s metric=%s error=%s",
@@ -704,14 +816,17 @@ class DataQueryEngine:
                         str(e),
                     )
                     return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
-                select_parts.append(f'{metric_expr} AS {self._alias_ref(metric)}')
-                logger.debug(
-                    "DataQuery metric mapped: query_id=%s metric=%s class=%s expression=%s",
-                    query_id,
-                    metric,
-                    self._metric_class(m_info, target_class),
-                    metric_expr,
-                )
+                for metric_expr, output_alias in metric_exprs:
+                    unique_alias = self._unique_alias(output_alias, used_select_aliases)
+                    select_parts.append(f'{metric_expr} AS {self._alias_ref(unique_alias)}')
+                    logger.debug(
+                        "DataQuery metric mapped: query_id=%s metric=%s output_alias=%s class=%s expression=%s",
+                        query_id,
+                        metric,
+                        unique_alias,
+                        self._metric_class(m_info, target_class),
+                        metric_expr,
+                    )
             else:
                 # 兼容降级逻辑
                 cls = self.oe.find_class_by_field(metric) or target_class
@@ -730,11 +845,13 @@ class DataQueryEngine:
                 alias = alias_map.get(cls, "t0")
                 f_type = self.oe.get_field_type(cls, metric)
                 agg_func = "SUM" if f_type == "numeric" else "COUNT"
-                select_parts.append(f'{agg_func}({self._col_ref(alias, p_col)}) AS {self._alias_ref(metric)}')
+                unique_alias = self._unique_alias(metric, used_select_aliases)
+                select_parts.append(f'{agg_func}({self._col_ref(alias, p_col)}) AS {self._alias_ref(unique_alias)}')
                 logger.debug(
-                    "DataQuery metric fallback mapped: query_id=%s metric=%s class=%s alias=%s physical_col=%s aggregation=%s",
+                    "DataQuery metric fallback mapped: query_id=%s metric=%s output_alias=%s class=%s alias=%s physical_col=%s aggregation=%s",
                     query_id,
                     metric,
+                    unique_alias,
                     cls,
                     alias,
                     p_col,

@@ -38,31 +38,27 @@ from .agents import (
     EntityDisambiguatorAgent,
     ToolExecutor,
 )
-
-
-TOOL_PURPOSES = {
-    "query_ontology_data": "按指标、维度和筛选条件查询业务数据。",
-    "python_analyze": "基于查询结果做进一步统计、计算或归纳分析。",
-    "execute_action": "根据分析结果触发需要确认的业务动作。",
-}
-
-FINAL_ANSWER_PROMPT = """你是 ChatBI 的最终答复生成器。
-
-请只基于用户问题、已执行工具结果和模型草稿生成最终答复，不要提出或暗示还需要调用工具。
-要求：
-1. 用中文回答，表达简洁、自然、业务可读。
-2. 优先总结关键结论，再补充必要的数据依据或口径。
-3. 如果工具结果包含错误或没有数据，要说明限制，不要编造数值。
-4. 不要输出 SQL、JSON、工具参数或内部执行细节，除非用户明确要求。
-5. 保留对图表/明细结果有帮助的字段名和指标名。
-"""
-
-MAX_FINAL_TOOL_CONTEXT_CHARS = 12000
-MAX_FINAL_DRAFT_CHARS = 6000
+from .constants import (
+    CONVERSATION_MESSAGE_ID_SUFFIX_LENGTH,
+    DEFAULT_TOOL_PURPOSE,
+    DIRECT_FINAL_RESULT_MAX_ROWS,
+    FINAL_ANSWER_MAX_TOKENS,
+    FINAL_ANSWER_PROMPT,
+    FINAL_ANSWER_TEMPERATURE,
+    JSON_SAFE_PREVIEW_ROWS,
+    LLM_TOOL_CALL_MAX_TOKENS,
+    LLM_TOOL_CALL_TEMPERATURE,
+    MAX_FINAL_DRAFT_CHARS,
+    MAX_FINAL_TOOL_CONTEXT_CHARS,
+    MAX_STATE_TRANSITIONS,
+    TOOL_ARGUMENT_LOG_MAX_CHARS,
+    TOOL_PURPOSES,
+    TOOL_RESULT_PREVIEW_MAX_CHARS,
+)
 
 
 def get_tool_purpose(tool_name: str) -> str:
-    return TOOL_PURPOSES.get(tool_name, "执行当前分析步骤所需的辅助能力。")
+    return TOOL_PURPOSES.get(tool_name, DEFAULT_TOOL_PURPOSE)
 
 
 class ChatEngineV3:
@@ -115,7 +111,7 @@ class ChatEngineV3:
         current_state = State.INIT
         start_time = time.time()
         transition_count = 0
-        max_transitions = 50
+        max_transitions = MAX_STATE_TRANSITIONS
 
         logger.info(
             "Chat stream started: scenario_id=%s conversation_id=%s messages=%d user_message_len=%d",
@@ -157,6 +153,7 @@ class ChatEngineV3:
             done_event = {
                 "type": "done",
                 "tool_results": state.all_tool_results,
+                "answer_datasets": state.answer_datasets,
             }
             self._schedule_conversation_persistence(state)
             yield f"data: {self._json_dumps(done_event)}\n\n"
@@ -302,8 +299,8 @@ class ChatEngineV3:
                 messages=state.messages,
                 tools=state.tools,
                 tool_choice="auto",
-                temperature=0.5,
-                max_tokens=2048,
+                temperature=LLM_TOOL_CALL_TEMPERATURE,
+                max_tokens=LLM_TOOL_CALL_MAX_TOKENS,
             )
         except Exception as e:
             state.error = f"LLM 调用失败: {str(e)}"
@@ -322,10 +319,11 @@ class ChatEngineV3:
         # 无工具调用 → 最终回答
         if not message.tool_calls:
             draft_content = message.content or ""
-            content = await self._generate_final_answer(state, draft_content)
-            state.assistant_content += content
-            state.sse_events.append({"type": "text", "content": content})
-            state.messages.append({"role": "assistant", "content": content})
+            readiness = self._answer_readiness(state)
+            if readiness.get("needs_python_analyze") and not state.python_analyze_enforced:
+                return self._enforce_python_analyze(state, readiness.get("reason", "需要二次分析"))
+
+            content = await self._finalize_answer(state, draft_content)
             logger.info(
                 "Chat final answer generated: conversation_id=%s round=%d draft_len=%d content_len=%d tools=%d",
                 state.conversation_id,
@@ -388,7 +386,6 @@ class ChatEngineV3:
         engine = get_engine(state.scenario_id)
         query_engine = get_query_engine(state.scenario_id)
         executor = ToolExecutor(state.scenario_id, self.entity_agent)
-        can_answer_directly = False
 
         for tc in state.pending_tool_calls:
             tool_name = tc.function.name
@@ -410,7 +407,7 @@ class ChatEngineV3:
                 "Chat tool execution started: conversation_id=%s tool=%s args=%s",
                 state.conversation_id,
                 tool_name,
-                json.dumps(args, ensure_ascii=False, default=str)[:1000],
+                json.dumps(args, ensure_ascii=False, default=str)[:TOOL_ARGUMENT_LOG_MAX_CHARS],
             )
 
             # 执行工具（含后置自动校正，死循环防线）
@@ -424,8 +421,8 @@ class ChatEngineV3:
             execution_duration_ms = tool_finished_at - execution_started_at
             total_duration_ms = tool_finished_at - total_started_at
             result_preview = self._json_dumps(result)
-            if len(result_preview) > 3000:
-                result_preview = result_preview[:3000] + "...[结果过长已截断]"
+            if len(result_preview) > TOOL_RESULT_PREVIEW_MAX_CHARS:
+                result_preview = result_preview[:TOOL_RESULT_PREVIEW_MAX_CHARS] + "...[结果过长已截断]"
 
             if isinstance(result, dict) and result.get("error"):
                 logger.warning(
@@ -483,32 +480,22 @@ class ChatEngineV3:
                 "duration_ms": total_duration_ms,
             })
 
-            if isinstance(result, dict):
-                if result.get("type") == "clarification_needed":
-                    state.sse_events.append({"type": "clarification", "data": result})
-                elif result.get("type") == "drill_down_result":
-                    state.sse_events.append({"type": "drilldown", "data": result})
-                elif result.get("type") == "query_result" and result.get("row_count", 0) > 0:
-                    state.sse_events.append({"type": "chart_data", "data": result})
-
             # 注入工具结果到消息
             state.messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
                 "content": result_preview,
             })
-            if self._is_direct_final_query_result(tool_name, result):
-                can_answer_directly = True
-
         state.pending_tool_calls = []
-        if can_answer_directly:
-            content = await self._generate_final_answer(
+        readiness = self._answer_readiness(state)
+        if readiness.get("needs_python_analyze") and not state.python_analyze_enforced:
+            return self._enforce_python_analyze(state, readiness.get("reason", "需要二次分析"))
+
+        if readiness.get("can_answer_directly"):
+            content = await self._finalize_answer(
                 state,
-                "query_ontology_data 已返回小结果集，数据足以直接回答用户问题。",
+                readiness.get("reason") or "query_ontology_data 已返回小结果集，数据足以直接回答用户问题。",
             )
-            state.assistant_content += content
-            state.sse_events.append({"type": "text", "content": content})
-            state.messages.append({"role": "assistant", "content": content})
             logger.info(
                 "Chat direct final answer from query result: conversation_id=%s round=%d tools=%d content_len=%d",
                 state.conversation_id,
@@ -542,6 +529,7 @@ class ChatEngineV3:
         state.sse_events.append({
             "type": "done",
             "tool_results": state.all_tool_results,
+            "answer_datasets": state.answer_datasets,
         })
         return State.DONE
 
@@ -556,6 +544,32 @@ class ChatEngineV3:
     # ============================================================
     # 辅助函数
     # ============================================================
+
+    def _enforce_python_analyze(self, state: AgentState, reason: str) -> State:
+        state.python_analyze_enforced = True
+        state.messages.append({
+            "role": "system",
+            "content": self._build_python_analyze_instruction(state, reason),
+        })
+        logger.info(
+            "Chat python_analyze enforced before final answer: conversation_id=%s round=%d reason=%s",
+            state.conversation_id,
+            state.current_round,
+            reason,
+        )
+        return State.LLM_CALL
+
+    async def _finalize_answer(self, state: AgentState, draft_content: str) -> str:
+        readiness = self._answer_readiness(state)
+        state.answer_datasets = readiness.get("answer_datasets", []) if readiness.get("can_answer_directly") else []
+        content = await self._generate_final_answer(state, draft_content)
+        state.assistant_content += content
+        state.sse_events.append({"type": "text", "content": content})
+        if state.answer_datasets:
+            state.sse_events.append({"type": "answer_datasets", "data": state.answer_datasets})
+        state.messages.append({"role": "assistant", "content": content})
+        return content
+
 
     async def _generate_final_answer(self, state: AgentState, draft_content: str) -> str:
         """使用轻量最终答复 prompt 再调用一次模型，且不传 tools。"""
@@ -575,8 +589,8 @@ class ChatEngineV3:
                     {"role": "system", "content": FINAL_ANSWER_PROMPT},
                     {"role": "user", "content": user_content},
                 ],
-                temperature=0.3,
-                max_tokens=1600,
+                temperature=FINAL_ANSWER_TEMPERATURE,
+                max_tokens=FINAL_ANSWER_MAX_TOKENS,
             )
             content = response.choices[0].message.content or ""
             return content.strip() or draft_content
@@ -622,24 +636,198 @@ class ChatEngineV3:
             return text
         return text[:max(0, max_chars - 16)] + "...[已截断]"
 
+    def _answer_readiness(self, state: AgentState) -> dict:
+        query_items = self._successful_query_tool_items(state.all_tool_results)
+        if not query_items:
+            return {
+                "can_answer_directly": False,
+                "needs_python_analyze": False,
+                "answer_datasets": [],
+                "reason": "尚无可用于回答的 query_ontology_data 结果。",
+            }
+
+        counts = [self._query_result_row_count(item.get("result")) for item in query_items]
+        max_count = max(counts) if counts else 0
+        total_count = sum(counts)
+        answer_datasets = self._answer_datasets_for_frontend(state)
+        has_python_after_latest_query = self._has_successful_python_after_latest_query(state.all_tool_results)
+
+        if not has_python_after_latest_query:
+            if max_count > DIRECT_FINAL_RESULT_MAX_ROWS:
+                return {
+                    "can_answer_directly": False,
+                    "needs_python_analyze": True,
+                    "answer_datasets": answer_datasets,
+                    "reason": f"query_ontology_data 返回 {max_count} 行，超过可直接回答阈值 {DIRECT_FINAL_RESULT_MAX_ROWS}，需要先按用户问题做二次聚合或计算",
+                }
+            if len(query_items) >= 2 and self._is_comparison_question(state.user_message) and total_count > DIRECT_FINAL_RESULT_MAX_ROWS:
+                return {
+                    "can_answer_directly": False,
+                    "needs_python_analyze": True,
+                    "answer_datasets": answer_datasets,
+                    "reason": f"用户问题涉及比较，且已有 {len(query_items)} 个查询结果、合计 {total_count} 行，需要先用 python_analyze 对 df_1/df_2 等结果做同步/同比/环比/差异计算",
+                }
+
+        can_answer_directly = bool(answer_datasets) and max_count <= DIRECT_FINAL_RESULT_MAX_ROWS and total_count <= DIRECT_FINAL_RESULT_MAX_ROWS
+        if has_python_after_latest_query:
+            can_answer_directly = bool(answer_datasets)
+
+        return {
+            "can_answer_directly": can_answer_directly,
+            "needs_python_analyze": False,
+            "answer_datasets": answer_datasets if can_answer_directly else [],
+            "reason": "已确认原始查询数据可用于回答用户问题。" if can_answer_directly else "查询结果存在，但尚不能直接确认可回答用户问题。",
+        }
+
     @staticmethod
-    def _is_direct_final_query_result(tool_name: str, result) -> bool:
-        if tool_name != "query_ontology_data" or not isinstance(result, dict):
-            return False
-        if result.get("error") or result.get("type") != "query_result":
+    def _successful_query_tool_items(tool_results: list[dict]) -> list[dict]:
+        items = []
+        for item in tool_results or []:
+            if not isinstance(item, dict) or item.get("name") != "query_ontology_data":
+                continue
+            result = item.get("result")
+            if isinstance(result, dict) and result.get("type") == "query_result" and not result.get("error"):
+                items.append(item)
+        return items
+
+    @staticmethod
+    def _has_successful_python_after_latest_query(tool_results: list[dict]) -> bool:
+        latest_query_index = -1
+        for index, item in enumerate(tool_results or []):
+            if isinstance(item, dict) and item.get("name") == "query_ontology_data":
+                latest_query_index = index
+        if latest_query_index < 0:
             return False
 
+        for item in (tool_results or [])[latest_query_index + 1:]:
+            result = item.get("result") if isinstance(item, dict) else None
+            if isinstance(item, dict) and item.get("name") == "python_analyze" and isinstance(result, dict) and not result.get("error"):
+                return True
+        return False
+
+    @staticmethod
+    def _query_result_row_count(result) -> int:
+        if not isinstance(result, dict):
+            return 0
         rows = result.get("rows")
-        if not isinstance(rows, list) or not rows:
-            return False
-
-        counts = [len(rows)]
+        counts = [len(rows)] if isinstance(rows, list) else []
         for key in ("row_count", "total"):
             value = result.get(key)
             if isinstance(value, int):
                 counts.append(value)
+        return max(counts) if counts else 0
 
-        return max(counts) <= 100
+    @staticmethod
+    def _is_comparison_question(text: str) -> bool:
+        normalized = (text or "").lower()
+        keywords = (
+            "比较", "对比", "相比", "较", "差异", "变化", "增长", "下降", "增幅", "降幅",
+            "同比", "环比", "同期", "同步", "占比", "比例", "比率",
+            "compare", "comparison", "versus", " vs ", "yoy", "mom", "ratio", "rate", "growth",
+        )
+        return any(keyword in normalized for keyword in keywords)
+
+    def _build_python_analyze_instruction(self, state: AgentState, reason: str) -> str:
+        query_items = self._successful_query_tool_items(state.all_tool_results)
+        lines = [
+            "[系统分析要求] 当前不能直接给最终自然语言答复，必须先调用 python_analyze。",
+            f"原因：{reason}。",
+            "python_analyze 的职责只限于：",
+            "1. query_ontology_data 返回数据量较大时，按用户问题对完整数据进行聚合、汇总、排序、占比或其他计算，产出中间结果。",
+            "2. 用户问题涉及比较（如同步/同比/环比/差异/占比等）且已有多个查询结果、数据量较大时，使用 df_1、df_2 等完整查询结果进行二次比较计算。",
+            "调用要求：只调用 python_analyze，不要直接回答；代码应把最终中间结果赋给 result、df_result、output_data 或 summary。",
+            "可用查询结果：",
+        ]
+        for index, item in enumerate(query_items, start=1):
+            result = item.get("result") or {}
+            columns = result.get("columns") if isinstance(result.get("columns"), list) else []
+            if not columns and isinstance(result.get("rows"), list) and result.get("rows"):
+                columns = list(result["rows"][0].keys())
+            lines.append(
+                f"- df_{index}: {self._query_result_row_count(result)} 行；列: {', '.join(str(col) for col in columns) or '未知'}"
+            )
+        lines.append("其中 df 默认指向最后一次查询结果。")
+        return "\n".join(lines)
+
+    def _answer_datasets_for_frontend(self, state: AgentState) -> list[dict]:
+        datasets = []
+        engine = get_engine(state.scenario_id)
+        for index, item in enumerate(self._successful_query_tool_items(state.all_tool_results), start=1):
+            normalized = self._normalize_query_result(item.get("result"))
+            if not normalized:
+                continue
+            arguments = item.get("arguments", {}) if isinstance(item.get("arguments"), dict) else {}
+            chart_type = self._infer_dataset_chart_type(normalized, arguments, engine)
+            datasets.append({
+                "id": f"query_{index}",
+                "name": arguments.get("target_class") or normalized.get("class_name") or f"Query {index}",
+                "arguments": arguments,
+                "chart_type": chart_type,
+                "chart_config": self._build_dataset_chart_config(normalized, chart_type),
+                "data": normalized,
+            })
+        return datasets
+
+    def _infer_dataset_chart_type(self, data: dict, arguments: dict, engine) -> str:
+        metrics = arguments.get("metrics") if isinstance(arguments.get("metrics"), list) else []
+        for metric in metrics:
+            metric_info = engine.get_metric_info(str(metric)) if metric else None
+            chart_type = (metric_info or {}).get("chart_type")
+            if chart_type in {"bar", "line", "pie", "scatter", "gauge", "table"}:
+                return chart_type
+
+        rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+        columns = data.get("columns") if isinstance(data.get("columns"), list) else []
+        dimensions = data.get("dimensions") if isinstance(data.get("dimensions"), list) else []
+        numeric_columns = self._numeric_columns(rows, columns)
+
+        if not rows or not numeric_columns:
+            return "table"
+        if len(rows) == 1 and len(numeric_columns) == 1:
+            return "gauge"
+        if not dimensions:
+            return "table"
+
+        first_dimension = str(dimensions[0]).lower()
+        if any(token in first_dimension for token in ("date", "time", "month", "year", "quarter", "周", "月", "年", "季度", "日期", "时间")):
+            return "line"
+        if len(rows) <= 8 and len(dimensions) == 1 and len(numeric_columns) == 1:
+            return "pie"
+        return "bar"
+
+    @classmethod
+    def _build_dataset_chart_config(cls, data: dict, chart_type: str) -> dict:
+        rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+        columns = data.get("columns") if isinstance(data.get("columns"), list) else []
+        dimensions = data.get("dimensions") if isinstance(data.get("dimensions"), list) else []
+        numeric_columns = cls._numeric_columns(rows, columns)
+        return {
+            "chart_type": chart_type,
+            "title": data.get("class_name") or data.get("class_id") or "查询结果",
+            "x_field": dimensions[0] if dimensions else None,
+            "y_fields": numeric_columns[:4],
+            "data": rows,
+            "dimensions": dimensions,
+        }
+
+    @staticmethod
+    def _numeric_columns(rows: list, columns: list) -> list[str]:
+        numeric_columns = []
+        for column in columns or []:
+            values = [row.get(column) for row in (rows or [])[:20] if isinstance(row, dict)]
+            numeric_values = []
+            for value in values:
+                if isinstance(value, bool) or value is None or value == "":
+                    continue
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(number):
+                    numeric_values.append(number)
+            if numeric_values:
+                numeric_columns.append(column)
+        return numeric_columns
 
     @classmethod
     def _json_dumps(cls, value) -> str:
@@ -656,12 +844,12 @@ class ChatEngineV3:
 
         if pd is not None:
             if isinstance(value, pd.DataFrame):
-                return value.head(100).to_dict("records")
+                return value.head(JSON_SAFE_PREVIEW_ROWS).to_dict("records")
             if isinstance(value, pd.Series):
                 return {
                     "name": value.name,
-                    "index": [str(item) for item in value.head(100).index.tolist()],
-                    "values": [cls._make_json_safe(item) for item in value.head(100).tolist()],
+                    "index": [str(item) for item in value.head(JSON_SAFE_PREVIEW_ROWS).index.tolist()],
+                    "values": [cls._make_json_safe(item) for item in value.head(JSON_SAFE_PREVIEW_ROWS).tolist()],
                     "total": int(len(value)),
                 }
         if np is not None:
@@ -736,15 +924,16 @@ class ChatEngineV3:
             return None
 
         assistant_message = {
-            "id": f"a-{uuid.uuid4().hex[:12]}",
+            "id": f"a-{uuid.uuid4().hex[:CONVERSATION_MESSAGE_ID_SUFFIX_LENGTH]}",
             "role": "assistant",
             "content": state.assistant_content,
-            "visualization": self._pick_latest_valid_query_result(state.all_tool_results),
+            "visualization": None,
+            "answer_datasets": state.answer_datasets,
             "steps": self._build_tool_steps(state.all_tool_results),
             "action_confirm": state.action_confirm,
         }
         user_message = {
-            "id": f"u-{uuid.uuid4().hex[:12]}",
+            "id": f"u-{uuid.uuid4().hex[:CONVERSATION_MESSAGE_ID_SUFFIX_LENGTH]}",
             "role": "user",
             "content": state.user_message,
         }
@@ -813,7 +1002,7 @@ class ChatEngineV3:
         try:
             conv_id = payload["conversation_id"]
             conn.executemany(
-                "INSERT INTO messages (id, conversation_id, role, content, visualization, steps, action_confirm) VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO messages (id, conversation_id, role, content, visualization, answer_datasets, steps, action_confirm) VALUES (?,?,?,?,?,?,?,?)",
                 [
                     (
                         msg.get("id") or str(uuid.uuid4())[:8],
@@ -821,6 +1010,7 @@ class ChatEngineV3:
                         msg.get("role", "user"),
                         msg.get("content", ""),
                         json.dumps(msg.get("visualization"), ensure_ascii=False, default=str) if msg.get("visualization") else "",
+                        json.dumps(msg.get("answer_datasets"), ensure_ascii=False, default=str) if msg.get("answer_datasets") else "",
                         json.dumps(msg.get("steps"), ensure_ascii=False, default=str) if msg.get("steps") else "",
                         json.dumps(msg.get("action_confirm"), ensure_ascii=False, default=str) if msg.get("action_confirm") else "",
                     )
