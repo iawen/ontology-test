@@ -1,6 +1,12 @@
 
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Any
+from typing import Any
+
+from sqlalchemy import ForeignKey, Index, Text, text
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column
+
 
 ReviewStatus = str
 
@@ -11,9 +17,12 @@ class LoginReq(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    scenario_id: str
-    conversation_id: str
-    messages: list[dict]
+    session_id: str
+    agent_id: str
+    query_id: str | None = None
+    message: str
+    language: str | None = None
+    options: dict[str, Any] | None = None
 
 
 # ============================================================
@@ -43,7 +52,8 @@ class SchemaClassEdit(BaseModel):
     fields: list[dict] = []
     csv_file: str = ""
     primary_key: str = ""
-    is_reviewed: bool = False
+    # 管理端使用 -1 / 0 / 1 表示不通过、待审核、已通过；兼容旧客户端的 bool。
+    is_reviewed: int | bool = 0
     review_status: ReviewStatus = "pending"
 
 
@@ -51,8 +61,20 @@ class SchemaRelationEdit(BaseModel):
     source: str
     target: str
     type: str = ""
+    source_key: str = ""
+    target_key: str = ""
     join_key: str = ""
-    is_reviewed: bool = False
+    description: str = ""
+    # 管理端使用 -1 / 0 / 1 表示不通过、待审核、已通过；兼容旧客户端的 bool。
+    is_reviewed: int | bool = 0
+    review_status: ReviewStatus = "pending"
+
+
+class SchemaOptimizationRequest(BaseModel):
+    file_ids: list[str] = []
+    incremental: bool = True
+    target_class_ids: list[str] | None = None
+    enable_quality_assessment: bool = True
 
 
 # ============================================================
@@ -64,7 +86,9 @@ class MetricCreate(BaseModel):
     name: str
     description: str = ""
     category: str = ""
-    target_class: str = ""
+    # 管理端会同时提交 target_class / target_classes，且前者可能为数组。
+    target_class: str | list[str] = ""
+    target_classes: list[str] = []
     calculation: str = ""
     formula: str = ""
     dimensions: list[str] = []
@@ -72,7 +96,7 @@ class MetricCreate(BaseModel):
     filters_hint: str = ""
     chart_type: str = "bar"
     sort_order: int = 0
-    is_reviewed: bool = False
+    is_reviewed: int | bool = 0
     review_status: ReviewStatus = "pending"
 
 
@@ -80,7 +104,8 @@ class MetricUpdate(BaseModel):
     name: str = ""
     description: str = ""
     category: str = ""
-    target_class: str = ""
+    target_class: str | list[str] = ""
+    target_classes: list[str] | None = None
     calculation: str = ""
     formula: str = ""
     dimensions: list[str] | None = None
@@ -88,7 +113,7 @@ class MetricUpdate(BaseModel):
     filters_hint: str = ""
     chart_type: str = ""
     sort_order: int | None = None
-    is_reviewed: bool | None = None
+    is_reviewed: int | bool | None = None
     review_status: ReviewStatus | None = None
 
 
@@ -306,3 +331,30 @@ class AlertRuleUpdate(BaseModel):
     action_id: str = ""
     severity: str = ""
     is_active: bool | None = None
+
+
+class DeepAgentMessage:
+    id: Mapped[str] = mapped_column(Text, primary_key=True, comment="消息 ID。")
+    session_id: Mapped[str] = mapped_column(
+        Text,
+        ForeignKey("deep_agent_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="所属会话 ID。",
+    )
+    role: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        comment="消息角色：user/assistant/system。",
+    )
+    query_id: Mapped[str | None] = mapped_column(Text, default=None, comment="本轮查询 ID。")
+    content: Mapped[Any] = mapped_column(
+        JSONB, nullable=True, default=None, comment="消息内容，支持字符串或结构化 JSON。"
+    )
+    status: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="completed",
+        server_default="completed",
+        comment="消息状态。",
+    )
+

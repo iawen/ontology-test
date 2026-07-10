@@ -20,6 +20,7 @@ export interface QueryResultData {
   columns: string[];
   rows: Record<string, unknown>[];
   total: number;
+  sql?: string;
   aggregated?: boolean;
   dimensions?: string[];
   metrics?: Record<string, unknown>[];

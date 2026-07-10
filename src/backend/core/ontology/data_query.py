@@ -136,6 +136,45 @@ class DataQueryEngine:
             self._conn.row_factory = sqlite3.Row
         return self._conn
 
+    def field_available_in_class(self, class_id: str, field_name: str) -> bool:
+        """Return whether a logical or physical field belongs to a Schema class."""
+        field = str(field_name or "").strip()
+        if not field or class_id not in self.oe.classes:
+            return False
+        field_map = self.oe.get_field_map(class_id)
+        return field in field_map or field in field_map.values()
+
+    def candidate_field_classes(self, field_name: str, preferred_class: str = "") -> list[str]:
+        """List Schema classes containing a logical or physical field, preferring one class."""
+        candidates = [
+            class_id
+            for class_id in self.oe.classes
+            if self.field_available_in_class(class_id, field_name)
+        ]
+        if preferred_class in candidates:
+            candidates.remove(preferred_class)
+            candidates.insert(0, preferred_class)
+        return candidates
+
+    def get_field_distinct_values(self, class_id: str, field_name: str, limit: int = 200) -> dict:
+        """Read distinct non-null values for entity disambiguation from the configured data source."""
+        if not self.field_available_in_class(class_id, field_name):
+            return {"values": [], "matched_values": []}
+
+        safe_limit = max(1, min(int(limit or 200), 1000))
+        physical_field = self.oe.map_field(class_id, field_name)
+        self._register_csv(class_id)
+        table_name = self._resolve_table_name(class_id)
+        sql = (
+            f"SELECT DISTINCT {self._quote_ident(physical_field)} AS value "
+            f"FROM {self._quote_table(table_name)} "
+            f"WHERE {self._quote_ident(physical_field)} IS NOT NULL "
+            f"LIMIT {safe_limit}"
+        )
+        rows = self._execute_sql(sql)
+        values = [row.get("value") for row in rows if row.get("value") is not None]
+        return {"values": values, "matched_values": values}
+
     def _execute_sql(self, sql: str) -> list[dict]:
         started = time.time()
         if self._db_engine:

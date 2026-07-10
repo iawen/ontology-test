@@ -61,6 +61,7 @@ def init_db():
             join_key TEXT DEFAULT '',
             description TEXT DEFAULT '',
             is_reviewed INTEGER DEFAULT 0,
+            review_status TEXT DEFAULT 'pending',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
@@ -85,6 +86,7 @@ def init_db():
             changes_json TEXT DEFAULT '{}',
             error TEXT DEFAULT '',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            started_at TEXT DEFAULT CURRENT_TIMESTAMP,
             finished_at TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS conversations (
@@ -120,6 +122,7 @@ def init_db():
             description TEXT DEFAULT '',
             category TEXT DEFAULT '',
             target_class TEXT DEFAULT '',
+            target_classes TEXT DEFAULT '[]',
             calculation TEXT DEFAULT '',
             formula TEXT DEFAULT '',
             dimensions TEXT DEFAULT '[]',
@@ -319,10 +322,12 @@ def _migrate_db(conn):
     migrations = [
         ("metrics", "required_dimensions", "ALTER TABLE metrics ADD COLUMN required_dimensions TEXT DEFAULT '[]'"),
         ("metrics", "chart_type", "ALTER TABLE metrics ADD COLUMN chart_type TEXT DEFAULT 'bar'"),
+        ("metrics", "target_classes", "ALTER TABLE metrics ADD COLUMN target_classes TEXT DEFAULT '[]'"),
         ("schema_relationships", "source_key", "ALTER TABLE schema_relationships ADD COLUMN source_key TEXT DEFAULT ''"),
         ("schema_relationships", "target_key", "ALTER TABLE schema_relationships ADD COLUMN target_key TEXT DEFAULT ''"),
         ("schema_relationships", "join_key", "ALTER TABLE schema_relationships ADD COLUMN join_key TEXT DEFAULT ''"),
         ("schema_relationships", "is_reviewed", "ALTER TABLE schema_relationships ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
+        ("schema_relationships", "review_status", "ALTER TABLE schema_relationships ADD COLUMN review_status TEXT DEFAULT 'pending'"),
         ("schema_classes", "fields", "ALTER TABLE schema_classes ADD COLUMN fields TEXT DEFAULT '[]'"),
         ("schema_classes", "csv_file", "ALTER TABLE schema_classes ADD COLUMN csv_file TEXT DEFAULT ''"),
         ("schema_classes", "primary_key", "ALTER TABLE schema_classes ADD COLUMN primary_key TEXT DEFAULT ''"),
@@ -332,14 +337,17 @@ def _migrate_db(conn):
         ("metrics", "review_status", "ALTER TABLE metrics ADD COLUMN review_status TEXT DEFAULT 'pending'"),
         ("concepts", "is_reviewed", "ALTER TABLE concepts ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
         ("concepts", "review_status", "ALTER TABLE concepts ADD COLUMN review_status TEXT DEFAULT 'pending'"),
+        ("schema_optimization_runs", "started_at", "ALTER TABLE schema_optimization_runs ADD COLUMN started_at TEXT DEFAULT ''"),
     ]
     for table, column, statement in migrations:
         try:
             conn.execute(f"SELECT {column} FROM {table} LIMIT 1")
         except sqlite3.OperationalError:
             conn.execute(statement)
-    for table in ("schema_classes", "metrics", "concepts"):
+    for table in ("schema_classes", "schema_relationships", "metrics", "concepts"):
         conn.execute(f"UPDATE {table} SET review_status='approved' WHERE is_reviewed=1 AND (review_status IS NULL OR review_status='' OR review_status='pending')")
+    conn.execute("UPDATE metrics SET target_classes=json_array(target_class) WHERE (target_classes IS NULL OR target_classes='' OR target_classes='[]') AND target_class<>'' ")
+    conn.execute("UPDATE schema_optimization_runs SET started_at=created_at WHERE started_at IS NULL OR started_at='' ")
 
 
 if __name__ == "__main__":

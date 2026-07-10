@@ -284,10 +284,12 @@ def _migrate_db(conn, dialect):
         migrations = [
             ("SELECT required_dimensions FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN required_dimensions TEXT DEFAULT '[]'"),
             ("SELECT chart_type FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN chart_type TEXT DEFAULT 'bar'"),
+            ("SELECT target_classes FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN target_classes TEXT DEFAULT '[]'"),
             ("SELECT source_key FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN source_key TEXT DEFAULT ''"),
             ("SELECT target_key FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN target_key TEXT DEFAULT ''"),
             ("SELECT join_key FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN join_key TEXT DEFAULT ''"),
             ("SELECT is_reviewed FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
+            ("SELECT review_status FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN review_status TEXT DEFAULT 'pending'"),
             ("SELECT fields FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN fields TEXT DEFAULT '[]'"),
             ("SELECT csv_file FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN csv_file TEXT DEFAULT ''"),
             ("SELECT primary_key FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN primary_key TEXT DEFAULT ''"),
@@ -306,6 +308,7 @@ def _migrate_db(conn, dialect):
             ("SELECT created_at FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN created_at TEXT DEFAULT ''"),
             ("SELECT updated_at FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN updated_at TEXT DEFAULT ''"),
             ("SELECT answer_datasets FROM messages LIMIT 1", "ALTER TABLE messages ADD COLUMN answer_datasets TEXT DEFAULT ''"),
+            ("SELECT started_at FROM schema_optimization_runs LIMIT 1", "ALTER TABLE schema_optimization_runs ADD COLUMN started_at TEXT DEFAULT ''"),
         ]
         for check_sql, alter_sql in migrations:
             try:
@@ -315,7 +318,9 @@ def _migrate_db(conn, dialect):
         for table in ("schema_classes", "schema_relationships", "metrics", "concepts"):
             conn.execute(f"UPDATE {table} SET created_at=CURRENT_TIMESTAMP WHERE created_at IS NULL OR created_at='' ")
             conn.execute(f"UPDATE {table} SET updated_at=CURRENT_TIMESTAMP WHERE updated_at IS NULL OR updated_at='' ")
-        for table in ("schema_classes", "metrics", "concepts"):
+        conn.execute("UPDATE metrics SET target_classes=json_array(target_class) WHERE (target_classes IS NULL OR target_classes='' OR target_classes='[]') AND target_class<>'' ")
+        conn.execute("UPDATE schema_optimization_runs SET started_at=created_at WHERE started_at IS NULL OR started_at='' ")
+        for table in ("schema_classes", "schema_relationships", "metrics", "concepts"):
             conn.execute(f"UPDATE {table} SET review_status='approved' WHERE is_reviewed=1 AND (review_status IS NULL OR review_status='' OR review_status='pending')")
         return
 
@@ -323,10 +328,12 @@ def _migrate_db(conn, dialect):
         migrations = [
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS required_dimensions TEXT DEFAULT '[]'",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS chart_type TEXT DEFAULT 'bar'",
+            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS target_classes TEXT DEFAULT '[]'",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS source_key TEXT DEFAULT ''",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS target_key TEXT DEFAULT ''",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS join_key TEXT DEFAULT ''",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
+            "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS fields TEXT DEFAULT '[]'",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS csv_file TEXT DEFAULT ''",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS primary_key TEXT DEFAULT ''",
@@ -345,15 +352,18 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS answer_datasets TEXT DEFAULT ''",
+            "ALTER TABLE schema_optimization_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         ]
     else:
         migrations = [
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS required_dimensions TEXT DEFAULT '[]'",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS chart_type TEXT DEFAULT 'bar'",
+            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS target_classes TEXT DEFAULT '[]'",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS source_key TEXT DEFAULT ''",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS target_key TEXT DEFAULT ''",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS join_key TEXT DEFAULT ''",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
+            "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS fields TEXT DEFAULT '[]'",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS csv_file TEXT DEFAULT ''",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS primary_key TEXT DEFAULT ''",
@@ -372,10 +382,11 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS answer_datasets TEXT DEFAULT ''",
+            "ALTER TABLE schema_optimization_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         ]
     for statement in migrations:
         conn.execute(statement)
-    for table in ("schema_classes", "metrics", "concepts"):
+    for table in ("schema_classes", "schema_relationships", "metrics", "concepts"):
         conn.execute(f"UPDATE {table} SET review_status='approved' WHERE is_reviewed=1 AND (review_status IS NULL OR review_status='' OR review_status='pending')")
 
 
@@ -431,6 +442,7 @@ def _schema_sql(dialect):
             join_key TEXT DEFAULT '',
             description TEXT DEFAULT '',
             is_reviewed INTEGER DEFAULT 0,
+            review_status TEXT DEFAULT 'pending',
             created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
             updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP
         );
@@ -455,6 +467,7 @@ def _schema_sql(dialect):
             changes_json TEXT DEFAULT '{{}}',
             error TEXT DEFAULT '',
             created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
+            started_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
             finished_at TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS conversations (
@@ -490,6 +503,7 @@ def _schema_sql(dialect):
             description TEXT DEFAULT '',
             category TEXT DEFAULT '',
             target_class TEXT DEFAULT '',
+            target_classes TEXT DEFAULT '[]',
             calculation TEXT DEFAULT '',
             formula TEXT DEFAULT '',
             dimensions TEXT DEFAULT '[]',

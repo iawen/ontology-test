@@ -41,8 +41,11 @@ export interface SchemaRelationship {
   source: string;
   target: string;
   type: string;
-  join_key: string;
-  is_reviewed: boolean;
+  source_key: string;
+  target_key: string;
+  is_reviewed?: ReviewStatus | boolean;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface Metric {
@@ -52,6 +55,7 @@ export interface Metric {
   description: string;
   category: string;
   target_class: string;
+  target_classes?: string[];
   calculation: string;
   formula: string;
   dimensions: string[];
@@ -59,8 +63,9 @@ export interface Metric {
   filters_hint: string;
   chart_type: string;
   sort_order: number;
-  is_reviewed: boolean;
-  review_status?: ReviewStatus;
+  is_reviewed?: ReviewStatus | boolean;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface Concept {

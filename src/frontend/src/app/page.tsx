@@ -22,7 +22,7 @@ import ToolStepsPanel from "@/components/ToolStepsPanel";
 import type { AnswerDataset, Message, Conversation, Suggestion, ToolStep } from "@/lib/types";
 
 function normalizeQueryResult(value: any): QueryResultData | undefined {
-  if (!value || value.type !== "query_result" || value.error) return undefined;
+  if (!value || value.error) return undefined;
 
   const rows = Array.isArray(value.rows) ? value.rows : [];
   const columns = Array.isArray(value.columns)
@@ -35,6 +35,7 @@ function normalizeQueryResult(value: any): QueryResultData | undefined {
 
   return {
     ...value,
+    type: "query_result",
     class_id: value.class_id || value.target_class || "query_result",
     class_name: value.class_name || value.target_class || "查询结果",
     columns,
@@ -50,8 +51,10 @@ function normalizeAnswerDatasets(value: any): AnswerDataset[] {
       const data = normalizeQueryResult(item?.data || item?.result || item);
       if (!data) return undefined;
       return {
-        id: String(item?.id || `query_${index + 1}`),
-        name: String(item?.name || data.class_name || `Query ${index + 1}`),
+        id: String(item?.id || item?.dataset_index || `query_${index + 1}`),
+        name: String(
+          item?.name || item?.target_class || data.class_name || `Query ${index + 1}`,
+        ),
         arguments: item?.arguments || undefined,
         chart_type: item?.chart_type || item?.chartConfig?.chart_type || item?.chart_config?.chart_type,
         chart_config: item?.chart_config || item?.chartConfig || undefined,
@@ -71,6 +74,24 @@ function parseSseEvent(raw: string): any {
       return JSON.parse(normalized);
     }
     throw initialError;
+  }
+}
+
+function parseEventTimestamp(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const timestamp = Date.parse(value);
+    if (Number.isFinite(timestamp)) return timestamp;
+  }
+  return Date.now();
+}
+
+function parseToolPayload(value: unknown) {
+  if (typeof value !== "string") return value;
+  try {
+    return parseSseEvent(value);
+  } catch {
+    return value;
   }
 }
 
@@ -281,16 +302,19 @@ function AppContent() {
     setIsTyping(true);
 
     try {
-      const chatHistory = messages.map((m) => ({ role: m.role, content: m.content }));
-      chatHistory.push({ role: "user", content: text });
-
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (token) headers["Authorization"] = `Bearer ${token}`;
 
       const response = await fetch("/api/chat", {
         method: "POST",
         headers,
-        body: JSON.stringify({ scenario_id: currentScenario, messages: chatHistory, conversation_id: convId }),
+        body: JSON.stringify({
+          session_id: convId,
+          agent_id: currentScenario,
+          message: text,
+          language: navigator.language || "zh-CN",
+          options: { source: "frontend", conversation_id: convId },
+        }),
       });
 
       if (response.status === 401) {
@@ -315,17 +339,29 @@ function AppContent() {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
+        const blocks = buffer.split(/\r?\n\r?\n/);
+        buffer = blocks.pop() || "";
 
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const raw = line.slice(6).trim();
+        for (const block of blocks) {
+          const raw = block
+            .split(/\r?\n/)
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).trimStart())
+            .join("\n")
+            .trim();
           if (!raw) continue;
           try {
             const event = parseSseEvent(raw);
 
             switch (event.type) {
+              case "query_started":
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === aiMsgId ? { ...m, isLoading: true } : m,
+                  ),
+                );
+                break;
+
               case "plan":
                 currentPlan = event;
                 setMessages((prev) =>
@@ -441,6 +477,40 @@ function AppContent() {
                 );
                 break;
 
+              case "tools": {
+                const result = parseToolPayload(event.payload);
+                const startedAt = parseEventTimestamp(event.begin_time);
+                const durationMs = Math.round(Number(event.duration || 0) * 1000);
+                const finishedAt = startedAt + durationMs;
+                const failed = Boolean(
+                  result && typeof result === "object" && "error" in result && result.error,
+                );
+                currentSteps = [
+                  ...currentSteps,
+                  {
+                    name: event.tool_name || "工具调用",
+                    description: event.description,
+                    args:
+                      result && typeof result === "object"
+                        ? (result.arguments || {})
+                        : {},
+                    status: failed ? "failed" : "completed",
+                    result,
+                    startedAt,
+                    finishedAt,
+                    durationMs,
+                  },
+                ];
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === aiMsgId
+                      ? { ...m, steps: [...currentSteps], isLoading: false }
+                      : m,
+                  ),
+                );
+                break;
+              }
+
               case "clarification":
                 setMessages((prev) =>
                   prev.map((m) => (m.id === aiMsgId ? { ...m, clarification: event.data, isLoading: false } : m))
@@ -474,7 +544,14 @@ function AppContent() {
                 break;
 
               case "done":
-                const finalAnswerDatasets = normalizeAnswerDatasets(event.answer_datasets);
+                const finalAnswer = event.final_answer || {};
+                const finalAnswerContent =
+                  typeof finalAnswer === "string"
+                    ? finalAnswer
+                    : finalAnswer.final_answer || finalAnswer.plain_text_summary || "";
+                const finalAnswerDatasets = normalizeAnswerDatasets(
+                  event.answer_datasets || finalAnswer.supporting_datasets,
+                );
                 if (finalAnswerDatasets.length > 0) {
                   answerDatasets = finalAnswerDatasets;
                 }
@@ -483,6 +560,7 @@ function AppContent() {
                     m.id === aiMsgId
                       ? {
                           ...m,
+                          content: finalAnswerContent || m.content,
                           isLoading: false,
                           answerDatasets: answerDatasets.length > 0 ? answerDatasets : m.answerDatasets,
                           steps: currentSteps,

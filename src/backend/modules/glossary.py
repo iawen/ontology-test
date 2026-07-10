@@ -14,11 +14,31 @@ from core.models.models import GlossaryTermCreate, GlossaryTermUpdate
 router = APIRouter()
 
 
+def _aliases(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(alias).strip() for alias in value if str(alias).strip()]
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        parsed = [value]
+    return _aliases(parsed) if isinstance(parsed, list) else [str(parsed).strip()]
+
+
+def _term_id(term_id: str) -> int:
+    try:
+        return int(term_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, "术语 ID 无效") from exc
+
+
 # ============================================================
 # CRUD
 # ============================================================
 
-@router.get("/api/admin/scenarios/{scenario_id}/glossary")
+@router.get("/api/scenarios/{scenario_id}/glossary")
+@router.get("/api/admin/scenarios/{scenario_id}/glossary", include_in_schema=False)
 async def list_glossary(scenario_id: str):
     conn = get_db()
     rows = conn.execute(
@@ -26,10 +46,11 @@ async def list_glossary(scenario_id: str):
         (scenario_id,)
     ).fetchall()
     conn.close()
-    return [dict(r) | {"aliases": json.loads(r["aliases"])} for r in rows]
+    return [dict(row) | {"aliases": _aliases(row["aliases"])} for row in rows]
 
 
-@router.post("/api/admin/scenarios/{scenario_id}/glossary")
+@router.post("/api/scenarios/{scenario_id}/glossary")
+@router.post("/api/admin/scenarios/{scenario_id}/glossary", include_in_schema=False)
 async def create_glossary_term(scenario_id: str, req: GlossaryTermCreate):
     conn = get_db()
     try:
@@ -49,38 +70,37 @@ async def create_glossary_term(scenario_id: str, req: GlossaryTermCreate):
     return {"status": "ok"}
 
 
-@router.put("/api/admin/scenarios/{scenario_id}/glossary/{term_id}")
+@router.put("/api/scenarios/{scenario_id}/glossary/{term_id}")
+@router.put("/api/admin/scenarios/{scenario_id}/glossary/{term_id}", include_in_schema=False)
 async def update_glossary_term(scenario_id: str, term_id: str, req: GlossaryTermUpdate):
+    if not req.term.strip():
+        raise HTTPException(400, "术语必填")
     conn = get_db()
-    sets, vals = [], []
-    for k, v in [("term", req.term), ("standard_name", req.standard_name),
-                  ("description", req.description), ("category", req.category),
-                  ("sort_order", req.sort_order)]:
-        if v is not None and v != "":
-            sets.append(f"{k}=?")
-            vals.append(v)
-    if req.aliases is not None:
-        sets.append("aliases=?")
-        vals.append(json.dumps(req.aliases, ensure_ascii=False))
-    if not sets:
-        conn.close()
-        return {"status": "ok"}
-    vals.extend([int(term_id), scenario_id])
-    conn.execute(
-        f"UPDATE glossary_terms SET {','.join(sets)} WHERE id=? AND scenario_id=?",
-        vals
+    cursor = conn.execute(
+        """UPDATE glossary_terms
+           SET term=?, standard_name=?, aliases=?, description=?, category=?, sort_order=?
+           WHERE id=? AND scenario_id=?""",
+        (
+            req.term.strip(), req.standard_name, json.dumps(_aliases(req.aliases), ensure_ascii=False),
+            req.description, req.category, req.sort_order or 0, _term_id(term_id), scenario_id,
+        ),
     )
     conn.commit()
     conn.close()
+    if cursor.rowcount == 0:
+        raise HTTPException(404, "术语不存在")
     return {"status": "ok"}
 
 
-@router.delete("/api/admin/scenarios/{scenario_id}/glossary/{term_id}")
+@router.delete("/api/scenarios/{scenario_id}/glossary/{term_id}")
+@router.delete("/api/admin/scenarios/{scenario_id}/glossary/{term_id}", include_in_schema=False)
 async def delete_glossary_term(scenario_id: str, term_id: str):
     conn = get_db()
-    conn.execute("DELETE FROM glossary_terms WHERE id=? AND scenario_id=?", (int(term_id), scenario_id))
+    cursor = conn.execute("DELETE FROM glossary_terms WHERE id=? AND scenario_id=?", (_term_id(term_id), scenario_id))
     conn.commit()
     conn.close()
+    if cursor.rowcount == 0:
+        raise HTTPException(404, "术语不存在")
     return {"status": "ok"}
 
 
@@ -106,7 +126,7 @@ def get_glossary_for_prompt(scenario_id: str) -> str:
 
     lines = []
     for r in rows:
-        aliases = json.loads(r["aliases"]) if r["aliases"] else []
+        aliases = _aliases(r["aliases"])
         alias_str = f"（别名：{'、'.join(aliases)}）" if aliases else ""
         desc = f" — {r['description']}" if r["description"] else ""
         std = f"标准名：{r['standard_name']}" if r["standard_name"] else r["term"]
@@ -115,31 +135,3 @@ def get_glossary_for_prompt(scenario_id: str) -> str:
     return "\n".join(lines)
 
 
-def match_glossary_terms(scenario_id: str, user_message: str) -> list[dict]:
-    """
-    匹配用户消息中出现的专用名称，返回匹配到的条目列表。
-    用于在 chat 流程中识别用户使用了哪些企业术语。
-    """
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM glossary_terms WHERE scenario_id=?",
-        (scenario_id,)
-    ).fetchall()
-    conn.close()
-
-    matched = []
-    msg_lower = user_message.lower()
-    for r in rows:
-        aliases = json.loads(r["aliases"]) if r["aliases"] else []
-        all_terms = [r["term"]] + aliases + ([r["standard_name"]] if r["standard_name"] else [])
-        for t in all_terms:
-            if t and t.lower() in msg_lower:
-                matched.append({
-                    "term": r["term"],
-                    "standard_name": r["standard_name"],
-                    "aliases": aliases,
-                    "description": r["description"],
-                    "category": r["category"],
-                })
-                break  # 一个条目只匹配一次
-    return matched

@@ -1,24 +1,25 @@
 """
-Chat v3 - API 路由
+Data Query Chat v3 - 本地调试 API 路由
 ==================
-保持与原 /api/chat 接口兼容，内部使用状态机引擎。
+使用 session_id/agent_id/message 请求体，内部映射到状态机引擎并流式返回 SSE。
 """
 
+import shortuuid
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
-from core.models.models import ChatRequest
 from tools.logger import logger
+
 from .engine import ChatEngineV3
+from core.models.models import ChatRequest
 
-
-router = APIRouter()
+router = APIRouter()  # 本路由仅供本地调试导入使用，不在 app.api.router 中注册。
 
 
 @router.post("/api/chat")
 async def chat_v3(req: ChatRequest):
     """
-    Chat v3 接口（状态机驱动 + 无状态子智能体）。
+    Data Query 本地调试接口（状态机驱动 + 无状态子智能体）。
 
     改进：
       1. 动态上下文注入（解决 Schema 信息爆炸）
@@ -28,18 +29,16 @@ async def chat_v3(req: ChatRequest):
       5. 死循环防线（retry_count 限制）
     """
     logger.info(
-        "Chat API request received: scenario_id=%s conversation_id=%s messages=%d",
-        req.scenario_id,
-        req.conversation_id,
-        len(req.messages or []),
+        "Chat API request received: agent_id=%s session_id=%s message_len=%d language=%s",
+        req.agent_id,
+        req.session_id,
+        len(req.message),
+        req.language,
     )
-    engine = ChatEngineV3()
+    query_id = "chat_" + str(shortuuid.random())
+    req = req.model_copy(update={"query_id": query_id})
     return StreamingResponse(
-        engine.stream_chat(req),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        ChatEngineV3().stream_chat(req),
+        media_type="text/event-stream; charset=utf-8",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

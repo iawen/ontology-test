@@ -12,53 +12,57 @@ Chat v3 - 主控 Orchestrator
                                               CLARIFY / ACTION / FINAL_STREAM / DONE
 """
 
-import asyncio
 import json
 import math
+import re
 import time
 import uuid
-from datetime import datetime, timezone
-from typing import AsyncGenerator, Optional, Callable
+from collections.abc import AsyncGenerator
+from datetime import datetime
+from typing import cast
 
-from core.db.db import get_db
+import shortuuid
+from openai.types.chat import ChatCompletionMessageParam, ChatCompletionMessageToolCall
+
 from core.llm.chat_model import get_async_client, get_model_name
-from core.models.models import ChatRequest
-from prompts.prompt import (
-    init_prompt, get_system_prompt, get_system_tools, get_engine, get_query_engine,
-)
-from modules.actions import find_matching_actions, _execute_action, get_available_actions
 from tools.logger import logger
+from core.db.db import get_db
 
-from .state import State, AgentState, ToolCallRecord
-from .agents import (
-    SchemaRetrieverAgent,
-    GlossaryMatcherAgent,
-    SkillRouterAgent,
+from .constants import (
+    CAUSE_QUERY_KEYWORDS,
+    COMPARISON_EVIDENCE_KEYWORDS,
+    COMPARISON_QUERY_KEYWORDS,
+    DIRECT_ANSWER_MAX_JSON_CHARS,
+    DIRECT_ANSWER_MAX_ROWS,
+    FINAL_AFTER_TOOL_MAX_ROWS,
+    FINAL_ANSWER_MAX_CONTEXT_CHARS,
+    FINAL_ANSWER_SAMPLE_HEAD_ROWS,
+    FINAL_ANSWER_SAMPLE_TAIL_ROWS,
+    PYTHON_ANALYZE_COMPLEX_PATTERNS,
+    RATIO_EVIDENCE_KEYWORDS,
+    RATIO_QUERY_KEYWORDS,
+    SSE_CACHE_TTL_SECONDS,
+    TIME_DIMENSION_KEYWORDS,
+)
+from .helper import get_tool_display_name, get_tool_purpose
+from core.models.models import ChatRequest
+from .node import (
+    AnalysisOrganizerTool,
     ContextCompressorAgent,
     EntityDisambiguatorAgent,
+    GlossaryMatcherAgent,
+    OntologyAgent,
+    SchemaRetrieverAgent,
     ToolExecutor,
 )
-from .constants import (
-    CONVERSATION_MESSAGE_ID_SUFFIX_LENGTH,
-    DEFAULT_TOOL_PURPOSE,
-    DIRECT_FINAL_RESULT_MAX_ROWS,
-    FINAL_ANSWER_MAX_TOKENS,
+from .prompt import (
     FINAL_ANSWER_PROMPT,
-    FINAL_ANSWER_TEMPERATURE,
-    JSON_SAFE_PREVIEW_ROWS,
-    LLM_TOOL_CALL_MAX_TOKENS,
-    LLM_TOOL_CALL_TEMPERATURE,
-    MAX_FINAL_DRAFT_CHARS,
-    MAX_FINAL_TOOL_CONTEXT_CHARS,
-    MAX_STATE_TRANSITIONS,
-    TOOL_ARGUMENT_LOG_MAX_CHARS,
-    TOOL_PURPOSES,
-    TOOL_RESULT_PREVIEW_MAX_CHARS,
+    get_engine,
+    get_query_engine,
+    get_system_tools,
+    init_prompt,
 )
-
-
-def get_tool_purpose(tool_name: str) -> str:
-    return TOOL_PURPOSES.get(tool_name, DEFAULT_TOOL_PURPOSE)
+from .state import AgentState, State, ToolCallRecord
 
 
 class ChatEngineV3:
@@ -71,9 +75,10 @@ class ChatEngineV3:
         # 无状态子智能体实例化
         self.schema_agent = SchemaRetrieverAgent()
         self.glossary_agent = GlossaryMatcherAgent()
-        self.skill_agent = SkillRouterAgent()
         self.compressor_agent = ContextCompressorAgent()
         self.entity_agent = EntityDisambiguatorAgent()
+        self.ontology_agent = OntologyAgent(self.client, self.model_name)
+        self.analysis_tool = AnalysisOrganizerTool(self.client, self.model_name)
 
     async def stream_chat(self, req: ChatRequest) -> AsyncGenerator[str, None]:
         """
@@ -81,28 +86,34 @@ class ChatEngineV3:
 
         使用字典路由替代 if-elif 链，保持主循环扁平。
         """
-        state = AgentState(
-            scenario_id=req.scenario_id,
-            conversation_id=req.conversation_id or str(uuid.uuid4()),
-            messages=req.messages or [],
-        )
+        query_id = req.query_id or str(shortuuid.random())
+        session_id = req.session_id or str(shortuuid.random())
+        agent_id = req.agent_id or ""
+        user_message = req.message or ""
+        print(f"\n\n++++++++++++++++++++++\nuser_message： {user_message}\n++++++++++++++++++++++\n\n")
+        history_messages = await self._load_conversation_history(session_id, exclude_query_id=query_id)
+        current_user_message = {"role": "user", "content": user_message}
+        llm_messages = [*history_messages, current_user_message]
 
-        # 提取最后一条用户消息
-        for m in reversed(req.messages or []):
-            if m.get("role") == "user":
-                state.user_message = m.get("content", "")
-                break
+        state = AgentState(
+            agent_id=agent_id,
+            session_id=session_id,
+            query_id=query_id,
+            user_message=user_message,
+            messages=cast(list[ChatCompletionMessageParam], llm_messages),
+        )
+        self._persist_conversation_message(session_id, "user", user_message)
 
         # 状态路由表（轻量级字典路由，替代 if-elif 链）
         handlers = {
             State.INIT: self._handle_init,
             State.CONTEXT_PREP: self._handle_context_prep,
+            State.SCHEMA_PLAN: self._handle_schema_plan,
+            State.QUERY_PLAN: self._handle_query_plan,
             State.LLM_CALL: self._handle_llm_call,
             State.TOOL_DISPATCH: self._handle_tool_dispatch,
             State.TOOL_EXECUTE: self._handle_tool_execute,
             State.CLARIFY: self._handle_clarify,
-            State.ACTION_CONFIRM: self._handle_action_confirm,
-            State.ACTION_EXECUTE: self._handle_action_execute,
             State.FINAL_STREAM: self._handle_final_stream,
             State.DONE: self._handle_done,
             State.ERROR: self._handle_error,
@@ -111,17 +122,27 @@ class ChatEngineV3:
         current_state = State.INIT
         start_time = time.time()
         transition_count = 0
-        max_transitions = MAX_STATE_TRANSITIONS
+        max_transitions = 50
 
         logger.info(
-            "Chat stream started: scenario_id=%s conversation_id=%s messages=%d user_message_len=%d",
-            state.scenario_id,
-            state.conversation_id,
-            len(req.messages or []),
+            "Chat stream started: agent_id=%s session_id=%s query_id=%s messages=%d(%s) user_message_len=%d",
+            state.agent_id,
+            state.session_id,
+            state.query_id,
+            len(state.messages),
+            user_message,
             len(state.user_message),
         )
 
         try:
+            start_event = {
+                "type": "query_started",
+                "query_id": state.query_id,
+                "session_id": state.session_id,
+                "status": "running",
+            }
+            yield await self._format_sse_event(state.query_id, start_event)
+
             while current_state != State.DONE:
                 transition_count += 1
                 if transition_count > max_transitions:
@@ -135,8 +156,8 @@ class ChatEngineV3:
                     continue
 
                 logger.debug(
-                    "Chat state enter: conversation_id=%s state=%s round=%d",
-                    state.conversation_id,
+                    "Chat state enter: session_id=%s state=%s round=%d",
+                    state.session_id,
                     current_state.value,
                     state.current_round,
                 )
@@ -145,22 +166,44 @@ class ChatEngineV3:
 
                 # 发送待处理的 SSE 事件
                 for event in state.sse_events:
-                    yield f"data: {self._json_dumps(event)}\n\n"
+                    yield await self._format_sse_event(state.query_id, event)
                 state.sse_events.clear()
 
                 current_state = next_state
 
+            # await self._emit_analysis_event(state)
+            for event in state.sse_events:
+                yield await self._format_sse_event(state.query_id, event)
+            state.sse_events.clear()
+
+            supporting_datasets = self._build_supporting_datasets(state)
+            final_answer = self._build_final_answer(
+                state.assistant_content,
+                supporting_datasets=supporting_datasets,
+                duration_ms=state.final_answer_duration_ms,
+            )
             done_event = {
                 "type": "done",
-                "tool_results": state.all_tool_results,
-                "answer_datasets": state.answer_datasets,
+                "query_id": state.query_id,
+                "final_answer": final_answer,
+                "total_duration_ms": int((time.time() - start_time) * 1000),
+                # "tool_results": state.all_tool_results,
             }
-            self._schedule_conversation_persistence(state)
-            yield f"data: {self._json_dumps(done_event)}\n\n"
+            self._persist_conversation_message(
+                session_id,
+                "assistant",
+                state.assistant_content,
+                answer_datasets=self._build_persisted_answer_datasets(supporting_datasets),
+                visualization=self._build_persisted_visualization(supporting_datasets),
+                steps=self._build_persisted_tool_steps(state.all_tool_results),
+                action_confirm=state.action_confirm,
+            )
+            yield await self._format_sse_event(state.query_id, done_event)
             logger.info(
-                "Chat stream completed: scenario_id=%s conversation_id=%s rounds=%d tools=%d duration_ms=%d",
-                state.scenario_id,
-                state.conversation_id,
+                "Chat stream completed: agent_id=%s session_id=%s query_id=%s rounds=%d tools=%d duration_ms=%d",
+                state.agent_id,
+                state.session_id,
+                state.query_id,
                 state.current_round,
                 len(state.all_tool_results),
                 int((time.time() - start_time) * 1000),
@@ -168,125 +211,167 @@ class ChatEngineV3:
 
         except Exception as e:
             import traceback
+
             traceback.print_exc()
             logger.exception(
-                "Chat stream failed: scenario_id=%s conversation_id=%s state=%s error=%s",
-                state.scenario_id,
-                state.conversation_id,
+                "Chat stream failed: agent_id=%s session_id=%s state=%s error=%s",
+                state.agent_id,
+                state.session_id,
                 current_state.value if isinstance(current_state, State) else current_state,
                 str(e),
             )
-            yield f"data: {self._json_dumps({'type': 'error', 'content': str(e)})}\n\n"
+            error_event = {"type": "error", "query_id": query_id, "content": str(e)}
+            self._persist_conversation_message(session_id, "assistant", f"智能体系统异常: {e}")
+            yield await self._format_sse_event(query_id, error_event)
 
     # ============================================================
     # 状态处理函数（每个函数返回下一个状态）
     # ============================================================
     async def _handle_init(self, state: AgentState) -> State:
         """初始化场景"""
-        init_prompt(state.scenario_id)
-        state.system_prompt = get_system_prompt(state.scenario_id)
+        await init_prompt(state.agent_id)
         state.tools = get_system_tools()
         logger.info(
-            "Chat initialized: scenario_id=%s conversation_id=%s tools=%d system_prompt_len=%d",
-            state.scenario_id,
-            state.conversation_id,
+            "Chat initialized: agent_id=%s session_id=%s tools=%d planning_mode=staged",
+            state.agent_id,
+            state.session_id,
             len(state.tools or []),
-            len(state.system_prompt or ""),
         )
         return State.CONTEXT_PREP
 
     async def _handle_context_prep(self, state: AgentState) -> State:
-        """上下文准备：动态注入 Schema + 术语匹配 + 技能路由 + 实体消歧"""
-        engine = get_engine(state.scenario_id)
-        query_engine = get_query_engine(state.scenario_id)
-
-        # 1. Schema 动态检索
-        schema_result = await self.schema_agent.retrieve(state.user_message, engine)
-        state.inject_context(schema_result["context"])
-        relevant_classes = schema_result["relevant_classes"]
-        logger.info(
-            "Chat schema context prepared: conversation_id=%s relevant_classes=%d context_len=%d",
-            state.conversation_id,
-            len(relevant_classes),
-            len(schema_result.get("context", "")),
-        )
-
-        # 2. 术语匹配
-        glossary_matches = await self.glossary_agent.match(state.scenario_id, state.user_message)
+        """准备术语与候选 Schema 摘要，不向规划模型注入全量本体。"""
+        glossary_matches = await self.glossary_agent.match(state.agent_id, state.user_message)
         state.glossary_matches = glossary_matches
-
-        # 3. 技能路由
-        skill_matches = await self.skill_agent.route(state.scenario_id, state.user_message)
-        state.skill_matches = skill_matches
-
-        # 4. 实体消歧
-        entity_hints = await self.entity_agent.disambiguate(
-            state.user_message, relevant_classes, query_engine
-        )
-        state.inject_entity_hints(entity_hints)
-        logger.info(
-            "Chat dynamic context matched: conversation_id=%s glossary=%d skills=%d entity_hints=%d",
-            state.conversation_id,
-            len(glossary_matches),
-            len(skill_matches),
-            len(entity_hints),
-        )
-
-        # 5. 构建完整 system prompt
-        full_prompt = state.system_prompt + "\n\n" + state.ontology_context
-
-        # 6. 注入术语和技能
-        if glossary_matches:
-            glossary_note = "\n\n[术语匹配] 用户消息中包含以下专用术语：\n"
-            for gm in glossary_matches:
-                glossary_note += f"  - 「{gm['term']}」→ 标准名: {gm['standard_name']}"
-                if gm.get("description"):
-                    glossary_note += f"（{gm['description']}）"
-                glossary_note += "\n"
-            full_prompt += glossary_note
-
-        if skill_matches:
-            skill_note = "\n\n[技能匹配] 以下技能包与用户问题相关：\n"
-            for sk in skill_matches:
-                skill_note += f"  - **{sk['name']}**\n{sk['content'][:500]}\n\n"
-            full_prompt += skill_note
-
-        # 7. 注入实体消歧提示
-        if entity_hints:
-            entity_note = "\n\n[实体消歧提示] 用户提到的实体值对应数据库标准值：\n"
-            for eh in entity_hints:
-                entity_note += f"  - 用户说的「{eh['user_value']}」→ 数据库标准值: 「{eh['standard_value']}」(字段: {eh['field']}, 相似度: {eh['similarity']:.2f})\n"
-            full_prompt += entity_note
-
-        # 8. 上下文压缩
-        full_prompt = await self.compressor_agent.compress(full_prompt)
-        logger.info(
-            "Chat prompt ready: conversation_id=%s prompt_len=%d history_messages=%d",
-            state.conversation_id,
-            len(full_prompt),
-            len(state.messages),
-        )
-
-        # 9. 构建消息列表
-        state.messages = [{"role": "system", "content": full_prompt}] + [
-            m for m in state.messages if m.get("role") in ("user", "assistant") and m.get("content")
+        engine = get_engine(state.agent_id)
+        schema_result = await self.schema_agent.retrieve(state.user_message, engine)
+        state.schema_context = str(schema_result.get("schema_context") or "")
+        state.metric_context = str(schema_result.get("metric_context") or "")
+        state.metric_candidates = [
+            str(metric_id)
+            for metric_id in schema_result.get("relevant_metrics", [])
+            if isinstance(metric_id, str) and metric_id
         ]
+        state.ontology_context = state.schema_context
 
-        return State.LLM_CALL
+        logger.info(
+            "Chat planning context ready: session_id=%s glossary=%d schema_context_len=%d metric_context_len=%d",
+            state.session_id,
+            len(glossary_matches),
+            len(state.schema_context),
+            len(state.metric_context),
+        )
+        return State.SCHEMA_PLAN
+
+    async def _handle_schema_plan(self, state: AgentState) -> State:
+        """第一阶段：只识别主实体与显式关联实体，禁止执行查询。"""
+        engine = get_engine(state.agent_id)
+        if state.ontology_planning_started_at_ms is None:
+            state.ontology_planning_started_at_ms = int(time.time() * 1000)
+        feedback = str(state.scope_validation.get("error") or "")
+        validation = await self.ontology_agent.plan_schema_scope(
+            state.user_message,
+            state.schema_context,
+            state.glossary_matches,
+            engine,
+            feedback=feedback,
+            session_id=state.session_id,
+        )
+        state.scope_validation = validation
+        if not validation["valid"]:
+            attempts = state.planning_attempts.get("schema_scope", 0) + 1
+            state.planning_attempts["schema_scope"] = attempts
+            if attempts < 2:
+                logger.warning(
+                    "Schema scope plan rejected, replanning: session_id=%s attempt=%d error=%s",
+                    state.session_id,
+                    attempts,
+                    validation["error"],
+                )
+                return State.SCHEMA_PLAN
+            state.error = f"无法确定可执行的查询实体范围：{validation['error']}"
+            return State.ERROR
+
+        state.query_scope = {
+            "target_class": validation["target_class"],
+            "join_classes": validation["join_classes"],
+            "join_paths": validation["join_paths"],
+        }
+        logger.info(
+            "Schema scope planned: session_id=%s target_class=%s join_classes=%s",
+            state.session_id,
+            state.query_scope["target_class"],
+            self._json_dumps(state.query_scope["join_classes"]),
+        )
+        return State.QUERY_PLAN
+
+    async def _handle_query_plan(self, state: AgentState) -> State:
+        """第二阶段：在已校验的 Schema Scope 内识别指标、维度和条件。"""
+        engine = get_engine(state.agent_id)
+        query_engine = get_query_engine(state.agent_id)
+        feedback = str(state.plan_validation.get("error") or "")
+        validation = await self.ontology_agent.plan_query_details(
+            state.user_message,
+            state.query_scope,
+            state.metric_candidates,
+            engine,
+            query_engine,
+            feedback=feedback,
+            session_id=state.session_id,
+        )
+        state.plan_validation = validation
+        if not validation["valid"]:
+            attempts = state.planning_attempts.get("query_details", 0) + 1
+            state.planning_attempts["query_details"] = attempts
+            if attempts < 2:
+                logger.warning(
+                    "Query detail plan rejected, replanning: session_id=%s attempt=%d error=%s",
+                    state.session_id,
+                    attempts,
+                    validation["error"],
+                )
+                return State.QUERY_PLAN
+            state.error = f"无法生成可执行的查询参数：{validation['error']}"
+            return State.ERROR
+
+        state.query_scope = validation["query_scope"]
+        state.query_plan = validation["query_plan"]
+        state.planned_query_args = self._with_query_context(
+            "query_ontology_data",
+            {
+                "target_class": state.query_scope["target_class"],
+                "join_classes": state.query_scope["join_classes"],
+                **state.query_plan,
+            },
+            state.user_message,
+            state.glossary_matches,
+        )
+        self._emit_ontology_recognition_event(state, engine)
+        logger.info(
+            "Query plan validated: session_id=%s target_class=%s metrics=%s dimensions=%s filters=%d joins=%s",
+            state.session_id,
+            state.planned_query_args["target_class"],
+            self._json_dumps(state.planned_query_args.get("metrics", [])),
+            self._json_dumps(state.planned_query_args.get("dimensions", [])),
+            len(state.planned_query_args.get("filters", [])),
+            self._json_dumps(state.planned_query_args.get("join_classes", [])),
+        )
+        return State.TOOL_EXECUTE
 
     async def _handle_llm_call(self, state: AgentState) -> State:
         """调用 LLM"""
         if state.current_round >= state.max_rounds:
-            state.sse_events.append({
-                "type": "text",
-                "content": "已达到最大工具调用轮次，请尝试简化问题。"
-            })
+            if state.all_tool_results:
+                state.final_reason = "max_rounds"
+                state.assistant_content = "工具规划已达到最大轮次，请基于已有查询和分析结果尽力回答。"
+                return State.FINAL_STREAM
+            state.assistant_content = "已达到最大工具调用轮次，请尝试简化问题。"
             return State.DONE
 
         state.current_round += 1
         logger.info(
-            "Chat LLM call started: conversation_id=%s round=%d messages=%d tools=%d",
-            state.conversation_id,
+            "Chat LLM call started: session_id=%s round=%d messages=%d tools=%d",
+            state.session_id,
             state.current_round,
             len(state.messages),
             len(state.tools or []),
@@ -299,14 +384,14 @@ class ChatEngineV3:
                 messages=state.messages,
                 tools=state.tools,
                 tool_choice="auto",
-                temperature=LLM_TOOL_CALL_TEMPERATURE,
-                max_tokens=LLM_TOOL_CALL_MAX_TOKENS,
+                temperature=0.5,
+                max_tokens=2048,
             )
         except Exception as e:
             state.error = f"LLM 调用失败: {str(e)}"
             logger.exception(
-                "Chat LLM call failed: conversation_id=%s round=%d error=%s",
-                state.conversation_id,
+                "Chat LLM call failed: session_id=%s round=%d error=%s",
+                state.session_id,
                 state.current_round,
                 str(e),
             )
@@ -318,44 +403,48 @@ class ChatEngineV3:
 
         # 无工具调用 → 最终回答
         if not message.tool_calls:
-            draft_content = message.content or ""
-            readiness = self._answer_readiness(state)
-            if readiness.get("needs_python_analyze") and not state.python_analyze_enforced:
-                return self._enforce_python_analyze(state, readiness.get("reason", "需要二次分析"))
-
-            content = await self._finalize_answer(state, draft_content)
+            content = message.content or ""
+            if state.all_tool_results:
+                state.final_reason = "normal"
+                state.assistant_content = content
+                logger.info(
+                    "Chat LLM ready for final answer rewrite: session_id=%s round=%d draft_len=%d tool_results=%d",
+                    state.session_id,
+                    state.current_round,
+                    len(content),
+                    len(state.all_tool_results),
+                )
+                return State.FINAL_STREAM
+            state.assistant_content += content
+            state.messages.append(cast(ChatCompletionMessageParam, {"role": "assistant", "content": content}))
             logger.info(
-                "Chat final answer generated: conversation_id=%s round=%d draft_len=%d content_len=%d tools=%d",
-                state.conversation_id,
+                "Chat LLM final answer: session_id=%s round=%d content_len=%d",
+                state.session_id,
                 state.current_round,
-                len(draft_content),
                 len(content),
-                len(state.all_tool_results),
             )
-
-            # 检查是否需要行动
-            return await self._check_action(state)
+            return State.DONE
 
         # 有工具调用 → 进入工具分发
-        state.pending_tool_calls = message.tool_calls
-        state.messages.append(message.model_dump())
+        tool_calls = cast(list[ChatCompletionMessageToolCall], message.tool_calls)
+        state.pending_tool_calls = tool_calls
+        state.messages.append(cast(ChatCompletionMessageParam, message.model_dump()))
+        planning_text = message.content or ""
         logger.info(
-            "Chat LLM tool calls: conversation_id=%s round=%d tool_count=%d names=%s",
-            state.conversation_id,
+            "Chat LLM tool calls: session_id=%s round=%d tool_count=%d names=%s",
+            state.session_id,
             state.current_round,
-            len(message.tool_calls),
-            ",".join(tc.function.name for tc in message.tool_calls),
+            len(tool_calls),
+            ",".join(tc.function.name for tc in tool_calls),
         )
 
-        # 发送工具调用事件
-        for tc in message.tool_calls:
+        for tc in tool_calls:
             try:
-                tool_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                _ = json.loads(tc.function.arguments) if tc.function.arguments else {}
             except json.JSONDecodeError:
-                tool_args = {}
                 logger.warning(
-                    "Chat tool arguments are not valid JSON: conversation_id=%s tool=%s raw=%s",
-                    state.conversation_id,
+                    "Chat tool arguments are not valid JSON: session_id=%s tool=%s raw=%s",
+                    state.session_id,
                     tc.function.name,
                     tc.function.arguments,
                 )
@@ -364,15 +453,16 @@ class ChatEngineV3:
                 "planning_finished_at": llm_finished_at,
                 "planning_duration_ms": planning_duration_ms,
             }
-            state.sse_events.append({
-                "type": "tool",
-                "name": tc.function.name,
-                "description": get_tool_purpose(tc.function.name),
-                "arguments": tool_args,
-                "started_at": llm_started_at,
-                "planning_finished_at": llm_finished_at,
-                "planning_duration_ms": planning_duration_ms,
-            })
+            state.tool_reasoning_steps.append(
+                {
+                    "tool_call_id": tc.id,
+                    "tool_name": tc.function.name,
+                    "tool_display_name": get_tool_display_name(tc.function.name),
+                    "planning_text": planning_text,
+                    "arguments": self._parse_tool_arguments(tc.function.arguments),
+                    "round": state.current_round,
+                }
+            )
 
         return State.TOOL_DISPATCH
 
@@ -383,31 +473,101 @@ class ChatEngineV3:
 
     async def _handle_tool_execute(self, state: AgentState) -> State:
         """工具执行：含后置自动校正"""
-        engine = get_engine(state.scenario_id)
-        query_engine = get_query_engine(state.scenario_id)
-        executor = ToolExecutor(state.scenario_id, self.entity_agent)
+        engine = get_engine(state.agent_id)
+        query_engine = get_query_engine(state.agent_id)
+        executor = ToolExecutor(state.agent_id, self.entity_agent)
 
-        for tc in state.pending_tool_calls:
+        if state.planned_query_args and not state.query_executed:
+            return await self._execute_validated_query_plan(state, executor, query_engine, engine)
+
+        for tool_index, tc in enumerate(state.pending_tool_calls, start=1):
             tool_name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments) if tc.function.arguments else {}
-            except json.JSONDecodeError:
-                args = {}
+            args = self._parse_tool_arguments(tc.function.arguments)
+            args = self._with_query_context(tool_name, args, state.user_message, state.glossary_matches)
+
+            logger.info(
+                "========== TOOL CALL START | session_id=%s round=%d index=%d call_id=%s tool=%s ==========",
+                state.session_id,
+                state.current_round,
+                tool_index,
+                tc.id,
+                tool_name,
+            )
 
             if tool_name == "python_analyze" and "query_history" not in args:
                 args = {
                     **args,
                     "query_history": [
-                        item for item in state.all_tool_results
-                        if item.get("name") == "query_ontology_data"
+                        item for item in state.all_tool_results if item.get("name") == "query_ontology_data"
                     ],
                 }
 
+            if tool_name == "python_analyze":
+                direct_result = self._build_direct_answer_result(args)
+                if direct_result:
+                    now_ms = int(time.time() * 1000)
+                    state.tool_call_records.append(
+                        ToolCallRecord(
+                            tool_name=tool_name,
+                            arguments=args,
+                            result=direct_result,
+                        )
+                    )
+                    state.all_tool_results.append(
+                        {
+                            "name": tool_name,
+                            "description": direct_result["reason"],
+                            "arguments": args,
+                            "result": direct_result,
+                            "started_at": now_ms,
+                            "planning_finished_at": now_ms,
+                            "planning_duration_ms": 0,
+                            "execution_started_at": now_ms,
+                            "finished_at": now_ms,
+                            "execution_duration_ms": 0,
+                            "duration_ms": 0,
+                            "skipped": True,
+                        }
+                    )
+                    state.messages.append(
+                        cast(
+                            ChatCompletionMessageParam,
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": self._json_dumps(direct_result),
+                            },
+                        )
+                    )
+                    state.sse_events.append(
+                        {
+                            "type": "tools",
+                            "tool_name": get_tool_display_name(tool_name),
+                            "description": direct_result["reason"],
+                            "begin_time": self._format_event_time(now_ms),
+                            "payload": self._json_dumps(direct_result),
+                            "duration": 0,
+                        }
+                    )
+                    logger.info(
+                        "Python analyze skipped for direct answer: session_id=%s rows=%d json_chars=%d",
+                        state.session_id,
+                        direct_result["row_count"],
+                        direct_result["data_json_chars"],
+                    )
+                    logger.info(
+                        "========== TOOL CALL END | session_id=%s call_id=%s tool=%s status=skipped ==========",
+                        state.session_id,
+                        tc.id,
+                        tool_name,
+                    )
+                    continue
+
             logger.info(
-                "Chat tool execution started: conversation_id=%s tool=%s args=%s",
-                state.conversation_id,
+                "Chat tool execution started: session_id=%s tool=%s args=%s",
+                state.session_id,
                 tool_name,
-                json.dumps(args, ensure_ascii=False, default=str)[:TOOL_ARGUMENT_LOG_MAX_CHARS],
+                json.dumps(args, ensure_ascii=False, default=str)[:1000],
             )
 
             # 执行工具（含后置自动校正，死循环防线）
@@ -421,25 +581,33 @@ class ChatEngineV3:
             execution_duration_ms = tool_finished_at - execution_started_at
             total_duration_ms = tool_finished_at - total_started_at
             result_preview = self._json_dumps(result)
-            if len(result_preview) > TOOL_RESULT_PREVIEW_MAX_CHARS:
-                result_preview = result_preview[:TOOL_RESULT_PREVIEW_MAX_CHARS] + "...[结果过长已截断]"
+            if len(result_preview) > 3000:
+                result_preview = result_preview[:3000] + "...[结果过长已截断]"
 
             if isinstance(result, dict) and result.get("error"):
                 logger.warning(
-                    "Chat tool execution returned error: conversation_id=%s tool=%s error=%s",
-                    state.conversation_id,
+                    "Chat tool execution returned error: session_id=%s tool=%s error=%s",
+                    state.session_id,
                     tool_name,
                     result.get("error"),
                 )
             else:
                 logger.info(
-                    "Chat tool execution completed: conversation_id=%s tool=%s result_len=%d",
-                    state.conversation_id,
+                    "Chat tool execution completed: session_id=%s tool=%s result_len=%d",
+                    state.session_id,
                     tool_name,
                     len(result_preview),
                 )
 
             result_error = result.get("error") if isinstance(result, dict) else None
+            logger.info(
+                "========== TOOL CALL END | session_id=%s call_id=%s tool=%s status=%s duration_ms=%d ==========",
+                state.session_id,
+                tc.id,
+                tool_name,
+                "error" if result_error else "success",
+                total_duration_ms,
+            )
 
             # 记录工具调用
             record = ToolCallRecord(
@@ -450,61 +618,145 @@ class ChatEngineV3:
                 retry_count=1 if result_error else 0,
             )
             state.tool_call_records.append(record)
-            state.all_tool_results.append({
-                "name": tool_name,
-                "description": get_tool_purpose(tool_name),
-                "arguments": args,
-                "result": result,
-                "started_at": total_started_at,
-                "planning_finished_at": planning_finished_at,
-                "planning_duration_ms": planning_duration_ms,
-                "execution_started_at": execution_started_at,
-                "finished_at": tool_finished_at,
-                "execution_duration_ms": execution_duration_ms,
-                "duration_ms": total_duration_ms,
-            })
+            state.all_tool_results.append(
+                {
+                    "name": tool_name,
+                    "description": get_tool_purpose(tool_name),
+                    "arguments": args,
+                    "result": result,
+                    "started_at": total_started_at,
+                    "planning_finished_at": planning_finished_at,
+                    "planning_duration_ms": planning_duration_ms,
+                    "execution_started_at": execution_started_at,
+                    "finished_at": tool_finished_at,
+                    "execution_duration_ms": execution_duration_ms,
+                    "duration_ms": total_duration_ms,
+                }
+            )
 
             # 发送工具结果事件
-            state.sse_events.append({
-                "type": "tool_result",
-                "name": tool_name,
-                "description": get_tool_purpose(tool_name),
-                "result": result,
-                "result_preview": result_preview,
-                "started_at": total_started_at,
-                "planning_finished_at": planning_finished_at,
-                "planning_duration_ms": planning_duration_ms,
-                "execution_started_at": execution_started_at,
-                "finished_at": tool_finished_at,
-                "execution_duration_ms": execution_duration_ms,
-                "duration_ms": total_duration_ms,
-            })
+            state.sse_events.append(
+                {
+                    "type": "tools",
+                    "tool_name": get_tool_display_name(tool_name),
+                    "description": get_tool_purpose(tool_name),
+                    "begin_time": self._format_event_time(total_started_at),
+                    "payload": result if tool_name == "query_ontology_data" else (result if not result_error else None),
+                    "duration": round(total_duration_ms / 1000, 3),
+                }
+            )
 
             # 注入工具结果到消息
-            state.messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result_preview,
-            })
+            tool_content = self._build_tool_message_content(state, tool_name, args, result, result_preview)
+            state.messages.append(
+                cast(
+                    ChatCompletionMessageParam,
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": tool_content,
+                    },
+                )
+            )
+
         state.pending_tool_calls = []
-        readiness = self._answer_readiness(state)
-        if readiness.get("needs_python_analyze") and not state.python_analyze_enforced:
-            return self._enforce_python_analyze(state, readiness.get("reason", "需要二次分析"))
-
-        if readiness.get("can_answer_directly"):
-            content = await self._finalize_answer(
-                state,
-                readiness.get("reason") or "query_ontology_data 已返回小结果集，数据足以直接回答用户问题。",
-            )
+        if self._should_finalize_after_tool_execute(state):
+            state.final_reason = "small_tool_result"
+            state.assistant_content = "本轮查询结果行数较少，已足够支持直接回答用户问题。"
             logger.info(
-                "Chat direct final answer from query result: conversation_id=%s round=%d tools=%d content_len=%d",
-                state.conversation_id,
-                state.current_round,
+                "Chat final answer shortcut after tool execution: session_id=%s tool_results=%d",
+                state.session_id,
                 len(state.all_tool_results),
-                len(content),
             )
-            return await self._check_action(state)
+            return State.FINAL_STREAM
+        return State.LLM_CALL
 
+    async def _execute_validated_query_plan(self, state: AgentState, executor, query_engine, engine) -> State:
+        """Execute only the deterministic plan approved by both planning stages."""
+        arguments = dict(state.planned_query_args or {})
+        state.planned_query_args = None
+        state.query_executed = True
+        started_at = int(time.time() * 1000)
+
+        result = self._make_json_safe(await executor.execute("query_ontology_data", arguments, query_engine, engine))
+        finished_at = int(time.time() * 1000)
+        duration_ms = finished_at - started_at
+        result_error = result.get("error") if isinstance(result, dict) else "查询返回了无效结果"
+        result_preview = self._json_dumps(result)
+        if len(result_preview) > 3000:
+            result_preview = result_preview[:3000] + "...[结果过长已截断]"
+
+        state.tool_call_records.append(
+            ToolCallRecord(
+                tool_name="query_ontology_data",
+                arguments=arguments,
+                result=result if not result_error else None,
+                error=result_error,
+                retry_count=1 if result_error else 0,
+            )
+        )
+        state.all_tool_results.append(
+            {
+                "name": "query_ontology_data",
+                "description": get_tool_purpose("query_ontology_data"),
+                "arguments": arguments,
+                "result": result,
+                "started_at": started_at,
+                "planning_finished_at": started_at,
+                "planning_duration_ms": 0,
+                "execution_started_at": started_at,
+                "finished_at": finished_at,
+                "execution_duration_ms": duration_ms,
+                "duration_ms": duration_ms,
+            }
+        )
+        state.sse_events.append(
+            {
+                "type": "tools",
+                "tool_name": get_tool_display_name("query_ontology_data"),
+                "description": get_tool_purpose("query_ontology_data"),
+                "begin_time": self._format_event_time(started_at),
+                "payload": result,
+                "duration": round(duration_ms / 1000, 3),
+            }
+        )
+        logger.info(
+            "========== VALIDATED QUERY EXECUTION END | session_id=%s status=%s duration_ms=%d ==========",
+            state.session_id,
+            "error" if result_error else "success",
+            duration_ms,
+        )
+        if result_error:
+            state.error = str(result_error)
+            return State.ERROR
+        if self._should_finalize_after_tool_execute(state):
+            state.final_reason = "small_tool_result"
+            state.assistant_content = "查询结果已完成，可直接生成答复。"
+            return State.FINAL_STREAM
+
+        query_result_context = self._build_tool_message_content(
+            state,
+            "query_ontology_data",
+            arguments,
+            result,
+            result_preview,
+        )
+        state.messages = cast(
+            list[ChatCompletionMessageParam],
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是数据分析助手。已完成受控 SQL 查询，不能再次调用 query_ontology_data。"
+                        "如数据较大且需要聚合、排序、对比或计算，只可调用 python_analyze；"
+                        "否则直接基于查询结果回答。"
+                    ),
+                },
+                {"role": "user", "content": state.user_message},
+                {"role": "user", "content": f"已验证查询结果：{query_result_context}"},
+            ],
+        )
+        state.tools = [tool for tool in state.tools if tool.get("function", {}).get("name") == "python_analyze"]
         return State.LLM_CALL
 
     async def _handle_clarify(self, state: AgentState) -> State:
@@ -512,344 +764,664 @@ class ChatEngineV3:
         # 反问事件已在 LLM_CALL 中发送
         return State.DONE
 
-    async def _handle_action_confirm(self, state: AgentState) -> State:
-        """行动确认"""
-        return State.DONE
-
-    async def _handle_action_execute(self, state: AgentState) -> State:
-        """行动执行"""
-        return State.DONE
-
     async def _handle_final_stream(self, state: AgentState) -> State:
         """最终流式输出"""
+        final_started_at = time.time()
+        final_prompt = self._build_final_answer_prompt(state)
+        logger.info(
+            "Chat final answer generation started: session_id=%s reason=%s prompt_len=%d tool_results=%d",
+            state.session_id,
+            state.final_reason,
+            len(final_prompt),
+            len(state.all_tool_results),
+        )
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": FINAL_ANSWER_PROMPT,
+                    },
+                    {"role": "user", "content": final_prompt},
+                ],
+                temperature=0.2,
+                max_tokens=2048,
+            )
+        except Exception as e:
+            state.final_answer_duration_ms = int((time.time() - final_started_at) * 1000)
+            if state.assistant_content:
+                logger.warning(
+                    "Chat final answer generation failed, using draft: session_id=%s error=%s",
+                    state.session_id,
+                    str(e),
+                )
+                return State.DONE
+            state.error = f"最终答复生成失败: {str(e)}"
+            logger.exception(
+                "Chat final answer generation failed: session_id=%s error=%s",
+                state.session_id,
+                str(e),
+            )
+            return State.ERROR
+
+        content = response.choices[0].message.content or ""
+        state.final_answer_duration_ms = int((time.time() - final_started_at) * 1000)
+        state.assistant_content = content
+        state.messages.append(cast(ChatCompletionMessageParam, {"role": "assistant", "content": content}))
+        logger.info(
+            "Chat final answer generated: session_id=%s content_len=%d",
+            state.session_id,
+            len(content),
+        )
         return State.DONE
 
     async def _handle_done(self, state: AgentState) -> State:
         """完成"""
-        state.sse_events.append({
-            "type": "done",
-            "tool_results": state.all_tool_results,
-            "answer_datasets": state.answer_datasets,
-        })
+        state.sse_events.append(
+            {
+                "type": "done",
+                "tool_results": state.all_tool_results,
+            }
+        )
         return State.DONE
 
     async def _handle_error(self, state: AgentState) -> State:
         """错误处理"""
-        state.sse_events.append({
-            "type": "error",
-            "content": state.error or "未知错误",
-        })
+        state.sse_events.append(
+            {
+                "type": "error",
+                "content": state.error or "未知错误",
+            }
+        )
         return State.DONE
 
     # ============================================================
     # 辅助函数
     # ============================================================
 
-    def _enforce_python_analyze(self, state: AgentState, reason: str) -> State:
-        state.python_analyze_enforced = True
-        state.messages.append({
-            "role": "system",
-            "content": self._build_python_analyze_instruction(state, reason),
-        })
-        logger.info(
-            "Chat python_analyze enforced before final answer: conversation_id=%s round=%d reason=%s",
-            state.conversation_id,
-            state.current_round,
-            reason,
+    def _emit_ontology_recognition_event(self, state: AgentState, engine) -> None:
+        """Expose the completed ontology plan as a frontend tool-progress event."""
+        finished_at = int(time.time() * 1000)
+        started_at = state.ontology_planning_started_at_ms or finished_at
+        duration_seconds = round(max(0, finished_at - started_at) / 1000, 3)
+        class_by_id = {str(item.get("id") or ""): item for item in engine.list_classes()}
+        metric_by_id = {str(item.get("id") or ""): item for item in engine.list_metrics()}
+
+        def schema_summary(class_id: str) -> dict:
+            schema = class_by_id.get(class_id, {})
+            return {
+                "id": class_id,
+                "name": schema.get("name_cn") or schema.get("name") or class_id,
+            }
+
+        def metric_summary(metric_id: str) -> dict:
+            metric = metric_by_id.get(metric_id, {})
+            return {
+                "id": metric_id,
+                "name": metric.get("name") or metric.get("name_cn") or metric_id,
+            }
+
+        target_class = str(state.query_scope.get("target_class") or "")
+        join_classes = [str(class_id) for class_id in state.query_scope.get("join_classes") or [] if class_id]
+        candidate_metrics = [
+            metric_summary(metric_id) for metric_id in state.metric_candidates if metric_id in metric_by_id
+        ]
+        selected_metrics = [str(metric) for metric in state.query_plan.get("metrics") or [] if metric]
+        dimensions = [str(dimension) for dimension in state.query_plan.get("dimensions") or [] if dimension]
+        filters = list(state.query_plan.get("filters") or [])
+        having = list(state.query_plan.get("having") or [])
+        target_schema = schema_summary(target_class)
+        join_schemas = [schema_summary(class_id) for class_id in join_classes]
+
+        recognized_schemas = [target_schema, *join_schemas]
+        schema_text = "、".join(item["name"] for item in recognized_schemas if item["id"]) or "未识别"
+        candidate_metric_text = "、".join(item["name"] for item in candidate_metrics) or "无"
+        selected_metric_text = "、".join(selected_metrics) or "无"
+        dimension_text = "、".join(dimensions) or "无"
+        payload = {
+            "stage": "ontology_recognition",
+            "status": "completed",
+            "target_schema": target_schema,
+            "join_schemas": join_schemas,
+            "candidate_metrics": candidate_metrics,
+            "selected_metrics": selected_metrics,
+            "dimensions": dimensions,
+            "filters": filters,
+            "having": having,
+            "order_by": state.query_plan.get("order_by") or "",
+            "duration_ms": finished_at - started_at,
+        }
+        state.sse_events.append(
+            {
+                "type": "tools",
+                "tool_name": "本体语义识别",
+                "description": (
+                    f"已识别 Schema：{schema_text}；候选指标：{candidate_metric_text}；"
+                    f"查询指标：{selected_metric_text}；维度：{dimension_text}；筛选条件：{len(filters)} 个。"
+                ),
+                "begin_time": self._format_event_time(started_at),
+                "payload": payload,
+                "duration": duration_seconds,
+                "status": "completed",
+                "stage": "ontology_recognition",
+            }
         )
-        return State.LLM_CALL
 
-    async def _finalize_answer(self, state: AgentState, draft_content: str) -> str:
-        readiness = self._answer_readiness(state)
-        state.answer_datasets = readiness.get("answer_datasets", []) if readiness.get("can_answer_directly") else []
-        content = await self._generate_final_answer(state, draft_content)
-        state.assistant_content += content
-        state.sse_events.append({"type": "text", "content": content})
-        if state.answer_datasets:
-            state.sse_events.append({"type": "answer_datasets", "data": state.answer_datasets})
-        state.messages.append({"role": "assistant", "content": content})
-        return content
+    async def _format_sse_event(self, query_id: str, event: dict) -> str:
+        event_payload = dict(event)
+        event_payload.setdefault("query_id", query_id)
+        payload = self._json_dumps(event_payload)
+        return f"data: {payload}\n\n"
 
 
-    async def _generate_final_answer(self, state: AgentState, draft_content: str) -> str:
-        """使用轻量最终答复 prompt 再调用一次模型，且不传 tools。"""
-        tool_context = self._build_final_tool_context(state.all_tool_results)
-        draft = self._truncate_text(draft_content, MAX_FINAL_DRAFT_CHARS)
-        user_content = (
-            f"用户问题：\n{state.user_message or '（无）'}\n\n"
-            f"已执行工具结果摘要：\n{tool_context}\n\n"
-            f"模型草稿：\n{draft or '（无）'}\n\n"
-            "请生成最终答复。"
+    async def _emit_analysis_event(self, state: AgentState):
+        pending_steps = state.tool_reasoning_steps[state.analysis_processed_count :]
+        if not pending_steps:
+            return
+
+        payload = await self.analysis_tool.organize(state.user_message, pending_steps)
+        if not payload:
+            state.analysis_processed_count = len(state.tool_reasoning_steps)
+            return
+
+        state.analysis_payload.extend(payload)
+        state.analysis_processed_count = len(state.tool_reasoning_steps)
+        state.sse_events.append(
+            {
+                "type": "analysis",
+                "payload": payload,
+            }
         )
 
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": FINAL_ANSWER_PROMPT},
-                    {"role": "user", "content": user_content},
-                ],
-                temperature=FINAL_ANSWER_TEMPERATURE,
-                max_tokens=FINAL_ANSWER_MAX_TOKENS,
-            )
-            content = response.choices[0].message.content or ""
-            return content.strip() or draft_content
-        except Exception as exc:
-            logger.exception(
-                "Chat final answer generation failed, falling back to draft: conversation_id=%s error=%s",
-                state.conversation_id,
-                str(exc),
-            )
-            return draft_content or "抱歉，最终答复生成失败，请稍后重试。"
+    @staticmethod
+    def _parse_tool_arguments(arguments: str) -> dict:
+        if not arguments:
+            return {}
+        parsed: object = arguments
+        for _ in range(2):
+            if not isinstance(parsed, str):
+                break
+            try:
+                parsed = json.loads(parsed)
+            except json.JSONDecodeError:
+                return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _with_user_question(tool_name: str, args: dict, user_message: str) -> dict:
+        if tool_name != "query_ontology_data" or not user_message.strip():
+            return args
+        if str(args.get("user_question") or "").strip():
+            return args
+        return {**args, "user_question": user_message}
 
     @classmethod
-    def _build_final_tool_context(cls, tool_results: list[dict]) -> str:
-        if not tool_results:
-            return "（无工具调用结果）"
+    def _with_query_context(
+        cls,
+        tool_name: str,
+        args: dict,
+        user_message: str,
+        glossary_matches: list[dict],
+    ) -> dict:
+        args = cls._with_user_question(tool_name, args, user_message)
+        if tool_name != "query_ontology_data" or not glossary_matches or args.get("glossary_matches"):
+            return args
+        return {**args, "glossary_matches": glossary_matches}
 
-        chunks = []
-        total_len = 0
-        for index, item in enumerate(tool_results, start=1):
-            if not isinstance(item, dict):
-                continue
-            summary = {
-                "index": index,
-                "name": item.get("name", ""),
-                "description": item.get("description", ""),
-                "arguments": item.get("arguments", {}),
-                "result": item.get("result"),
-            }
-            text = cls._json_dumps(summary)
-            remaining = MAX_FINAL_TOOL_CONTEXT_CHARS - total_len
-            if remaining <= 0:
-                break
-            if len(text) > remaining:
-                text = cls._truncate_text(text, remaining)
-            chunks.append(text)
-            total_len += len(text)
+    @classmethod
+    def _build_direct_answer_result(cls, args: dict) -> dict | None:
+        query_history = args.get("query_history")
+        if not isinstance(query_history, list) or not query_history:
+            return None
 
-        return "\n".join(chunks) if chunks else "（无有效工具调用结果）"
+        last_query = query_history[-1]
+        if not isinstance(last_query, dict):
+            return None
+        raw_query_args = last_query.get("arguments")
+        query_args = raw_query_args if isinstance(raw_query_args, dict) else {}
+        query_result = last_query.get("result") if isinstance(last_query.get("result"), dict) else None
+        if not query_result or query_result.get("error"):
+            return None
 
-    @staticmethod
-    def _truncate_text(text: str, max_chars: int) -> str:
-        if len(text) <= max_chars:
-            return text
-        return text[:max(0, max_chars - 16)] + "...[已截断]"
+        rows = query_result.get("rows")
+        if not isinstance(rows, list):
+            return None
+        row_count = query_result.get("row_count")
+        if not isinstance(row_count, int):
+            row_count = len(rows)
 
-    def _answer_readiness(self, state: AgentState) -> dict:
-        query_items = self._successful_query_tool_items(state.all_tool_results)
-        if not query_items:
-            return {
-                "can_answer_directly": False,
-                "needs_python_analyze": False,
-                "answer_datasets": [],
-                "reason": "尚无可用于回答的 query_ontology_data 结果。",
-            }
+        metrics = query_args.get("metrics") or []
+        dimensions = query_args.get("dimensions") or []
+        is_aggregated = bool(metrics)
+        if not is_aggregated or row_count > DIRECT_ANSWER_MAX_ROWS:
+            return None
 
-        counts = [self._query_result_row_count(item.get("result")) for item in query_items]
-        max_count = max(counts) if counts else 0
-        total_count = sum(counts)
-        answer_datasets = self._answer_datasets_for_frontend(state)
-        has_python_after_latest_query = self._has_successful_python_after_latest_query(state.all_tool_results)
+        data_json = cls._json_dumps(rows)
+        if len(data_json) > DIRECT_ANSWER_MAX_JSON_CHARS:
+            return None
 
-        if not has_python_after_latest_query:
-            if max_count > DIRECT_FINAL_RESULT_MAX_ROWS:
-                return {
-                    "can_answer_directly": False,
-                    "needs_python_analyze": True,
-                    "answer_datasets": answer_datasets,
-                    "reason": f"query_ontology_data 返回 {max_count} 行，超过可直接回答阈值 {DIRECT_FINAL_RESULT_MAX_ROWS}，需要先按用户问题做二次聚合或计算",
-                }
-            if len(query_items) >= 2 and self._is_comparison_question(state.user_message) and total_count > DIRECT_FINAL_RESULT_MAX_ROWS:
-                return {
-                    "can_answer_directly": False,
-                    "needs_python_analyze": True,
-                    "answer_datasets": answer_datasets,
-                    "reason": f"用户问题涉及比较，且已有 {len(query_items)} 个查询结果、合计 {total_count} 行，需要先用 python_analyze 对 df_1/df_2 等结果做同步/同比/环比/差异计算",
-                }
+        code = str(args.get("code") or "").lower()
+        if any(pattern in code for pattern in PYTHON_ANALYZE_COMPLEX_PATTERNS):
+            return None
 
-        can_answer_directly = bool(answer_datasets) and max_count <= DIRECT_FINAL_RESULT_MAX_ROWS and total_count <= DIRECT_FINAL_RESULT_MAX_ROWS
-        if has_python_after_latest_query:
-            can_answer_directly = bool(answer_datasets)
-
+        source_metadata = cls._source_metadata_for_prompt(query_result)
         return {
-            "can_answer_directly": can_answer_directly,
-            "needs_python_analyze": False,
-            "answer_datasets": answer_datasets if can_answer_directly else [],
-            "reason": "已确认原始查询数据可用于回答用户问题。" if can_answer_directly else "查询结果存在，但尚不能直接确认可回答用户问题。",
+            "type": "direct_answer_recommended",
+            "reason": "查询结果已是小规模聚合数据，跳过 Python 分析，交由大模型直接基于结果回答。",
+            "row_count": row_count,
+            "data_json_chars": len(data_json),
+            "columns": query_result.get("columns", []),
+            "data_sources": source_metadata["data_sources"],
+            "table_descriptions": source_metadata["table_descriptions"],
+            "dimensions": dimensions,
+            "metrics": metrics,
+            "rows": rows,
+            "instruction": (
+                "这些数据已经是聚合后的完整查询结果，且数据量较小。"
+                "请不要再次要求调用 python_analyze，直接基于 rows、dimensions、metrics、data_sources "
+                "和 table_descriptions 回答用户问题；"
+                "如需做简单排序、最大/最小值、占比或文字归纳，可在回答中直接完成。"
+            ),
         }
 
-    @staticmethod
-    def _successful_query_tool_items(tool_results: list[dict]) -> list[dict]:
-        items = []
-        for item in tool_results or []:
-            if not isinstance(item, dict) or item.get("name") != "query_ontology_data":
-                continue
-            result = item.get("result")
-            if isinstance(result, dict) and result.get("type") == "query_result" and not result.get("error"):
-                items.append(item)
-        return items
-
-    @staticmethod
-    def _has_successful_python_after_latest_query(tool_results: list[dict]) -> bool:
-        latest_query_index = -1
-        for index, item in enumerate(tool_results or []):
-            if isinstance(item, dict) and item.get("name") == "query_ontology_data":
-                latest_query_index = index
-        if latest_query_index < 0:
+    @classmethod
+    def _should_finalize_after_tool_execute(cls, state: AgentState) -> bool:
+        if not state.all_tool_results:
             return False
 
-        for item in (tool_results or [])[latest_query_index + 1:]:
-            result = item.get("result") if isinstance(item, dict) else None
-            if isinstance(item, dict) and item.get("name") == "python_analyze" and isinstance(result, dict) and not result.get("error"):
-                return True
-        return False
+        last_result = state.all_tool_results[-1]
+        tool_name = last_result.get("name")
+        result = last_result.get("result")
+        if not isinstance(result, dict) or result.get("error"):
+            return False
 
-    @staticmethod
-    def _query_result_row_count(result) -> int:
-        if not isinstance(result, dict):
-            return 0
+        if tool_name == "python_analyze":
+            return True
+
+        if tool_name != "query_ontology_data":
+            return False
+
         rows = result.get("rows")
-        counts = [len(rows)] if isinstance(rows, list) else []
-        for key in ("row_count", "total"):
-            value = result.get(key)
-            if isinstance(value, int):
-                counts.append(value)
-        return max(counts) if counts else 0
-
-    @staticmethod
-    def _is_comparison_question(text: str) -> bool:
-        normalized = (text or "").lower()
-        keywords = (
-            "比较", "对比", "相比", "较", "差异", "变化", "增长", "下降", "增幅", "降幅",
-            "同比", "环比", "同期", "同步", "占比", "比例", "比率",
-            "compare", "comparison", "versus", " vs ", "yoy", "mom", "ratio", "rate", "growth",
-        )
-        return any(keyword in normalized for keyword in keywords)
-
-    def _build_python_analyze_instruction(self, state: AgentState, reason: str) -> str:
-        query_items = self._successful_query_tool_items(state.all_tool_results)
-        lines = [
-            "[系统分析要求] 当前不能直接给最终自然语言答复，必须先调用 python_analyze。",
-            f"原因：{reason}。",
-            "python_analyze 的职责只限于：",
-            "1. query_ontology_data 返回数据量较大时，按用户问题对完整数据进行聚合、汇总、排序、占比或其他计算，产出中间结果。",
-            "2. 用户问题涉及比较（如同步/同比/环比/差异/占比等）且已有多个查询结果、数据量较大时，使用 df_1、df_2 等完整查询结果进行二次比较计算。",
-            "调用要求：只调用 python_analyze，不要直接回答；代码应把最终中间结果赋给 result、df_result、output_data 或 summary。",
-            "可用查询结果：",
-        ]
-        for index, item in enumerate(query_items, start=1):
-            result = item.get("result") or {}
-            columns = result.get("columns") if isinstance(result.get("columns"), list) else []
-            if not columns and isinstance(result.get("rows"), list) and result.get("rows"):
-                columns = list(result["rows"][0].keys())
-            lines.append(
-                f"- df_{index}: {self._query_result_row_count(result)} 行；列: {', '.join(str(col) for col in columns) or '未知'}"
-            )
-        lines.append("其中 df 默认指向最后一次查询结果。")
-        return "\n".join(lines)
-
-    def _answer_datasets_for_frontend(self, state: AgentState) -> list[dict]:
-        datasets = []
-        engine = get_engine(state.scenario_id)
-        for index, item in enumerate(self._successful_query_tool_items(state.all_tool_results), start=1):
-            normalized = self._normalize_query_result(item.get("result"))
-            if not normalized:
-                continue
-            arguments = item.get("arguments", {}) if isinstance(item.get("arguments"), dict) else {}
-            chart_type = self._infer_dataset_chart_type(normalized, arguments, engine)
-            datasets.append({
-                "id": f"query_{index}",
-                "name": arguments.get("target_class") or normalized.get("class_name") or f"Query {index}",
-                "arguments": arguments,
-                "chart_type": chart_type,
-                "chart_config": self._build_dataset_chart_config(normalized, chart_type),
-                "data": normalized,
-            })
-        return datasets
-
-    def _infer_dataset_chart_type(self, data: dict, arguments: dict, engine) -> str:
-        metrics = arguments.get("metrics") if isinstance(arguments.get("metrics"), list) else []
-        for metric in metrics:
-            metric_info = engine.get_metric_info(str(metric)) if metric else None
-            chart_type = (metric_info or {}).get("chart_type")
-            if chart_type in {"bar", "line", "pie", "scatter", "gauge", "table"}:
-                return chart_type
-
-        rows = data.get("rows") if isinstance(data.get("rows"), list) else []
-        columns = data.get("columns") if isinstance(data.get("columns"), list) else []
-        dimensions = data.get("dimensions") if isinstance(data.get("dimensions"), list) else []
-        numeric_columns = self._numeric_columns(rows, columns)
-
-        if not rows or not numeric_columns:
-            return "table"
-        if len(rows) == 1 and len(numeric_columns) == 1:
-            return "gauge"
-        if not dimensions:
-            return "table"
-
-        first_dimension = str(dimensions[0]).lower()
-        if any(token in first_dimension for token in ("date", "time", "month", "year", "quarter", "周", "月", "年", "季度", "日期", "时间")):
-            return "line"
-        if len(rows) <= 8 and len(dimensions) == 1 and len(numeric_columns) == 1:
-            return "pie"
-        return "bar"
+        row_count = result.get("row_count")
+        if not isinstance(row_count, int):
+            row_count = len(rows) if isinstance(rows, list) else None
+        if row_count is None or row_count >= FINAL_AFTER_TOOL_MAX_ROWS:
+            return False
+        if not (isinstance(rows, list) or row_count == 0):
+            return False
+        return cls._query_result_satisfies_user_need(state, last_result, result, row_count)
 
     @classmethod
-    def _build_dataset_chart_config(cls, data: dict, chart_type: str) -> dict:
-        rows = data.get("rows") if isinstance(data.get("rows"), list) else []
-        columns = data.get("columns") if isinstance(data.get("columns"), list) else []
-        dimensions = data.get("dimensions") if isinstance(data.get("dimensions"), list) else []
-        numeric_columns = cls._numeric_columns(rows, columns)
-        return {
-            "chart_type": chart_type,
-            "title": data.get("class_name") or data.get("class_id") or "查询结果",
-            "x_field": dimensions[0] if dimensions else None,
-            "y_fields": numeric_columns[:4],
-            "data": rows,
-            "dimensions": dimensions,
-        }
+    def _query_result_satisfies_user_need(
+        cls,
+        state: AgentState,
+        tool_result: dict,
+        query_result: dict,
+        row_count: int,
+    ) -> bool:
+        question = state.user_message.lower()
+        evidence_text = cls._query_evidence_text(tool_result, query_result).lower()
 
-    @staticmethod
-    def _numeric_columns(rows: list, columns: list) -> list[str]:
-        numeric_columns = []
-        for column in columns or []:
-            values = [row.get(column) for row in (rows or [])[:20] if isinstance(row, dict)]
-            numeric_values = []
-            for value in values:
-                if isinstance(value, bool) or value is None or value == "":
-                    continue
-                try:
-                    number = float(value)
-                except (TypeError, ValueError):
-                    continue
-                if math.isfinite(number):
-                    numeric_values.append(number)
-            if numeric_values:
-                numeric_columns.append(column)
-        return numeric_columns
+        if any(keyword in question for keyword in CAUSE_QUERY_KEYWORDS):
+            logger.info(
+                "Small query result does not finalize because question asks for causal explanation: session_id=%s",
+                state.session_id,
+            )
+            return False
+
+        asks_comparison = any(keyword in question for keyword in COMPARISON_QUERY_KEYWORDS)
+        if asks_comparison and not cls._has_comparison_evidence(evidence_text, query_result, row_count):
+            logger.info(
+                "Small query result does not finalize because comparison evidence is insufficient: session_id=%s",
+                state.session_id,
+            )
+            return False
+
+        if any(keyword in question for keyword in RATIO_QUERY_KEYWORDS) and not any(
+            keyword in evidence_text for keyword in RATIO_EVIDENCE_KEYWORDS
+        ):
+            logger.info(
+                "Small query result does not finalize because ratio evidence is insufficient: session_id=%s",
+                state.session_id,
+            )
+            return False
+
+        return True
+
+    @classmethod
+    def _has_comparison_evidence(cls, evidence_text: str, query_result: dict, row_count: int) -> bool:
+        if any(keyword in evidence_text for keyword in COMPARISON_EVIDENCE_KEYWORDS):
+            return True
+        if row_count < 2:
+            return False
+
+        rows = query_result.get("rows")
+        if not isinstance(rows, list):
+            return False
+        return any(keyword in evidence_text for keyword in TIME_DIMENSION_KEYWORDS)
+
+    @classmethod
+    def _query_evidence_text(cls, tool_result: dict, query_result: dict) -> str:
+        source_metadata = cls._source_metadata_for_prompt(query_result)
+        compact = {
+            "arguments": tool_result.get("arguments", {}),
+            "columns": query_result.get("columns", []),
+            "dimensions": query_result.get("dimensions", []),
+            "metrics": query_result.get("metrics", []),
+            "data_sources": source_metadata["data_sources"],
+            "table_descriptions": source_metadata["table_descriptions"],
+        }
+        rows = query_result.get("rows")
+        if isinstance(rows, list) and rows:
+            compact["sample_rows"] = rows[: min(len(rows), 3)]
+        return cls._json_dumps(compact)
+
+    @classmethod
+    def _build_tool_message_content(
+        cls,
+        state: AgentState,
+        tool_name: str,
+        arguments: dict,
+        result: dict,
+        result_preview: str,
+    ) -> str:
+        guidance = cls._build_post_tool_guidance(state, tool_name, arguments, result)
+        if not guidance:
+            return result_preview
+        return cls._json_dumps(
+            {
+                "result": result_preview,
+                "next_step_guidance": guidance,
+            }
+        )
+
+    @classmethod
+    def _build_post_tool_guidance(
+        cls,
+        state: AgentState,
+        tool_name: str,
+        arguments: dict,
+        result: dict,
+    ) -> str:
+        if tool_name != "query_ontology_data" or not isinstance(result, dict) or result.get("error"):
+            return ""
+
+        rows = result.get("rows")
+        row_count = result.get("row_count")
+        if not isinstance(row_count, int):
+            row_count = len(rows) if isinstance(rows, list) else 0
+
+        question = state.user_message.lower()
+        is_comparison = any(keyword in question for keyword in COMPARISON_QUERY_KEYWORDS)
+        is_ratio = any(keyword in question for keyword in RATIO_QUERY_KEYWORDS)
+        is_large = row_count >= FINAL_AFTER_TOOL_MAX_ROWS
+
+        if is_large and is_comparison:
+            return (
+                "本次 query_ontology_data 已返回完整但较大的比较类数据。下一步应调用 python_analyze，"
+                "基于 df/df_1/df_2 计算当前值、对比期值、差值、变化方向和变化率；不要再次查询或截断数据。"
+            )
+        if is_large:
+            return (
+                "本次 query_ontology_data 已返回完整但较大的数据。下一步应调用 python_analyze，"
+                "按用户问题对 df/df_1/df_2 做聚合、筛选、排序、Top、占比或必要计算；不要再次查询或截断数据。"
+            )
+        if is_ratio:
+            return (
+                "用户问题涉及占比/比例/贡献率。如果当前结果未直接包含占比字段，下一步应调用 python_analyze "
+                "基于 df 计算总量和占比后再回答。"
+            )
+        comparison_evidence_text = cls._query_evidence_text({"arguments": arguments}, result).lower()
+        if is_comparison and not cls._has_comparison_evidence(comparison_evidence_text, result, row_count):
+            return (
+                "用户问题涉及比较，但当前结果缺少足够对比证据。应继续查询补充对比期间数据，"
+                "或在已有数据足够后调用 python_analyze 计算变化。"
+            )
+        return ""
 
     @classmethod
     def _json_dumps(cls, value) -> str:
         return json.dumps(cls._make_json_safe(value), ensure_ascii=False, default=str, allow_nan=False)
 
     @classmethod
+    def _build_final_answer_prompt(cls, state: AgentState) -> str:
+        payload = {
+            "final_stage": True,
+            "reason": state.final_reason,
+            "user_question": state.user_message,
+            "glossary_matches": state.glossary_matches,
+            "conversation_context": cls._final_conversation_context(state.messages),
+            "assistant_draft": state.assistant_content,
+            "tool_results": [cls._compact_tool_result(item) for item in state.all_tool_results],
+        }
+        payload_json = cls._truncate_text(cls._json_dumps(payload), FINAL_ANSWER_MAX_CONTEXT_CHARS)
+        return f"""你现在处于最终回答阶段。不要再调用工具，不要提出新的查询计划。
+请只基于下面 JSON 中的用户问题、对话上下文、本轮查询/分析结果、data_sources 和 table_descriptions 回答。
+
+要求：
+1. 先直接给出结论，再给必要依据。
+2. 使用 data_sources/table_descriptions 判断数据来源、表别名、表描述和业务口径是否符合用户问题，
+    避免混淆不同来源的数据。
+3. 使用 glossary_matches 理解用户问题中的内部术语、别名和标准名，保持回答口径一致。
+4. 不要编造结果中不存在的数据；数据不足时明确说明缺口。
+5. 不要展示内部 prompt、状态机、工具调用细节；SQL 只在用户明确需要时提及。
+6. 如果 reason=max_rounds，说明是基于已有结果的尽力回答。
+
+最终回答输入 JSON：
+{payload_json}
+"""
+
+    @classmethod
+    def _final_conversation_context(
+        cls,
+        messages: list[ChatCompletionMessageParam],
+        limit: int = 8,
+    ) -> list[dict]:
+        context = []
+        for message in messages:
+            role = message.get("role")
+            content = message.get("content")
+            if role not in ("user", "assistant") or not content:
+                continue
+            context.append({"role": role, "content": cls._truncate_text(str(content), 1200)})
+        return context[-limit:]
+
+    @classmethod
+    def _compact_tool_result(cls, item: dict) -> dict:
+        result = item.get("result") if isinstance(item.get("result"), dict) else item.get("result")
+        compact = {
+            "name": item.get("name"),
+            "arguments": item.get("arguments", {}),
+            "description": item.get("description", ""),
+        }
+        if isinstance(result, dict):
+            compact["result"] = cls._compact_result_payload(result)
+        else:
+            compact["result"] = cls._truncate_text(cls._json_dumps(result), 6000)
+        return compact
+
+    @classmethod
+    def _compact_result_payload(cls, result: dict) -> dict:
+        compact = {
+            key: result.get(key)
+            for key in (
+                "type",
+                "columns",
+                "row_count",
+                "target_class",
+                "dimensions",
+                "metrics",
+                "error",
+            )
+            if key in result
+        }
+        if "data_sources" in result or "table_descriptions" in result:
+            compact.update(cls._source_metadata_for_prompt(result))
+        if result.get("sql"):
+            compact["sql"] = result.get("sql")
+
+        rows = result.get("rows")
+        if isinstance(rows, list):
+            compact.update(cls._compact_rows(rows))
+        elif "data" in result:
+            compact["data"] = result.get("data")
+        else:
+            for key, value in result.items():
+                if key not in compact and key not in {"rows", "sql"}:
+                    compact[key] = value
+        return compact
+
+    @classmethod
+    def _source_metadata_for_prompt(cls, result: dict) -> dict:
+        table_descriptions = result.get("table_descriptions")
+        if not isinstance(table_descriptions, list):
+            table_descriptions = []
+        data_sources = result.get("data_sources")
+        if not isinstance(data_sources, list):
+            data_sources = []
+        return {
+            "data_sources": cls._compact_data_sources(
+                data_sources,
+                include_description=not table_descriptions,
+            ),
+            "table_descriptions": table_descriptions,
+        }
+
+    @staticmethod
+    def _compact_data_sources(data_sources: list, include_description: bool = False) -> list[dict]:
+        keys = ["class_id", "name_cn", "table_name", "table_alias", "csv_file", "data_source"]
+        if include_description:
+            keys.append("description")
+
+        compact_sources = []
+        for source in data_sources:
+            if not isinstance(source, dict):
+                continue
+            compact_sources.append({key: source.get(key) for key in keys if source.get(key) not in (None, "")})
+        return compact_sources
+
+    @staticmethod
+    def _compact_rows(rows: list) -> dict:
+        if len(rows) <= FINAL_ANSWER_SAMPLE_HEAD_ROWS:
+            return {"rows": rows}
+        return {
+            "rows_sample": rows[:FINAL_ANSWER_SAMPLE_HEAD_ROWS],
+            "rows_tail_sample": rows[-FINAL_ANSWER_SAMPLE_TAIL_ROWS:],
+            "rows_truncated": True,
+            "rows_omitted_count": max(
+                0,
+                len(rows) - FINAL_ANSWER_SAMPLE_HEAD_ROWS - FINAL_ANSWER_SAMPLE_TAIL_ROWS,
+            ),
+        }
+
+    @staticmethod
+    def _truncate_text(text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars].rstrip() + "...[truncated]"
+
+    @staticmethod
+    def _format_event_time(timestamp_ms: int) -> str:
+        return datetime.fromtimestamp(timestamp_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+
+    @classmethod
+    def _build_supporting_datasets(cls, state: AgentState) -> list[dict]:
+        datasets = []
+        for index, item in enumerate(state.all_tool_results):
+            if item.get("name") != "query_ontology_data":
+                continue
+            result = item.get("result")
+            if not isinstance(result, dict) or result.get("error"):
+                continue
+
+            rows = result.get("rows")
+            if not isinstance(rows, list):
+                continue
+
+            raw_arguments = item.get("arguments")
+            arguments = raw_arguments if isinstance(raw_arguments, dict) else {}
+            dataset = {
+                "dataset_index": len(datasets),
+                "tool_result_index": index,
+                "source_tool": "query_ontology_data",
+                "arguments": arguments,
+                "target_class": result.get("target_class") or arguments.get("target_class"),
+                "columns": result.get("columns", []),
+                "rows": rows,
+                "row_count": result.get("row_count", len(rows)),
+                "sql": result.get("sql", ""),
+                "data_sources": result.get("data_sources", []),
+                "table_descriptions": result.get("table_descriptions", []),
+            }
+            for key in ("data_scope", "is_full_result", "handled_by"):
+                if key in result:
+                    dataset[key] = result.get(key)
+            datasets.append(cls._make_json_safe(dataset))
+        return datasets
+
+    @classmethod
+    def _build_final_answer(
+        cls,
+        content: str,
+        supporting_datasets: list[dict] | None = None,
+        duration_ms: int | None = None,
+    ) -> dict:
+        content = cls._sanitize_final_answer_content(content)
+        return {
+            "format": "markdown",
+            "plain_text_summary": cls._build_plain_text_summary(content),
+            "sanitized": True,
+            "final_answer": content,
+            "supporting_datasets": supporting_datasets or [],
+            "duration_ms": duration_ms,
+        }
+
+    @classmethod
+    def _sanitize_final_answer_content(cls, content: str) -> str:
+        text = str(content or "").strip()
+        if not text:
+            return ""
+
+        fenced = re.fullmatch(r"```(?:markdown|md)?\s*\n(?P<body>[\s\S]*?)\n```", text, re.IGNORECASE)
+        if fenced:
+            text = fenced.group("body").strip()
+
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                return text
+            if isinstance(payload, dict):
+                answer = payload.get("final_answer") or payload.get("content") or payload.get("answer")
+                if isinstance(answer, str):
+                    return cls._sanitize_final_answer_content(answer)
+        return text
+
+    @staticmethod
+    def _build_plain_text_summary(content: str, max_length: int = 80) -> str:
+        plain_text = " ".join(line.strip("#*`>- ") for line in content.splitlines() if line.strip())
+        if len(plain_text) <= max_length:
+            return plain_text
+        return plain_text[:max_length].rstrip() + "..."
+
+    @classmethod
     def _make_json_safe(cls, value):
         try:
-            import pandas as pd
             import numpy as np
+            import pandas as pd
         except Exception:
             pd = None
             np = None
 
         if pd is not None:
             if isinstance(value, pd.DataFrame):
-                return value.head(JSON_SAFE_PREVIEW_ROWS).to_dict("records")
+                return cls._make_json_safe(value.head(100).to_dict("records"))
             if isinstance(value, pd.Series):
                 return {
                     "name": value.name,
-                    "index": [str(item) for item in value.head(JSON_SAFE_PREVIEW_ROWS).index.tolist()],
-                    "values": [cls._make_json_safe(item) for item in value.head(JSON_SAFE_PREVIEW_ROWS).tolist()],
+                    "index": [str(item) for item in value.head(100).index.tolist()],
+                    "values": [cls._make_json_safe(item) for item in value.head(100).tolist()],
                     "total": int(len(value)),
                 }
         if np is not None:
@@ -861,7 +1433,7 @@ class ChatEngineV3:
         if value is None or isinstance(value, (str, bool, int)):
             return value
         if isinstance(value, float):
-            return value if math.isfinite(value) else None
+            return cls._normalize_float(value)
         if pd is not None and (value is pd.NA or value is pd.NaT):
             return None
 
@@ -871,160 +1443,179 @@ class ChatEngineV3:
             return [cls._make_json_safe(item) for item in value]
         return value
 
-    async def _check_action(self, state: AgentState) -> State:
-        """检查是否需要触发行动"""
+    @staticmethod
+    def _normalize_float(value: float):
+        if not math.isfinite(value):
+            return None
+        nearest_integer = round(value)
+        if math.isclose(value, nearest_integer, rel_tol=0.0, abs_tol=1e-9):
+            return int(nearest_integer)
+        return value
+
+    async def _load_conversation_history(
+        self,
+        session_id: str,
+        limit: int = 20,
+        exclude_query_id: str | None = None,
+    ) -> list[dict[str, str]]:
+        if not session_id:
+            return []
+
+        conn = None
         try:
-            assistant_messages = [
-                m.get("content", "")
-                for m in state.messages
-                if m.get("role") == "assistant" and m.get("content")
-            ]
-            action_text = assistant_messages[-1] if assistant_messages else state.user_message
-            actions = await find_matching_actions(state.scenario_id, action_text)
-            if not actions:
-                return State.DONE
+            conn = get_db()
+            rows = conn.execute(
+                """SELECT role, content
+                   FROM messages
+                   WHERE conversation_id=? AND role IN ('user', 'assistant')
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT ?""",
+                (session_id, limit),
+            ).fetchall()
+        except Exception as exc:
+            logger.warning(
+                "Chat history load from messages failed: session_id=%s error=%s",
+                session_id,
+                str(exc),
+            )
+            return []
+        finally:
+            if conn is not None:
+                conn.close()
 
-            for act in actions:
-                if act.get("is_active") and act.get("requires_confirm"):
-                    state.action_confirm = {
-                        "action_id": act["id"],
-                        "action_name": act["name"],
-                        "description": act.get("description", ""),
-                        "action_type": act.get("action_type", "notification"),
-                        "requires_confirm": act.get("requires_confirm", True),
-                        "message": act.get("message", ""),
-                    }
-                    state.sse_events.append({
-                        "type": "action_confirm",
-                        "data": state.action_confirm,
-                        "action": {
-                            "id": act["id"],
-                            "name": act["name"],
-                            "description": act.get("description", ""),
-                            "action_type": act.get("action_type", "notification"),
-                            "message": act.get("message", ""),
-                        }
-                    })
-                    return State.ACTION_CONFIRM
-        except:
-            pass
-
-        return State.DONE
-
-    def _schedule_conversation_persistence(self, state: AgentState):
-        """在流式响应完成时异步保存本轮用户消息和助手回复。"""
-        payload = self._build_conversation_payload(state)
-        if not payload:
-            return
-        task = asyncio.create_task(self._persist_conversation_messages(payload))
-        task.add_done_callback(self._log_persistence_task_result)
-
-    def _build_conversation_payload(self, state: AgentState) -> Optional[dict]:
-        if not state.conversation_id or not state.user_message:
-            return None
-
-        assistant_message = {
-            "id": f"a-{uuid.uuid4().hex[:CONVERSATION_MESSAGE_ID_SUFFIX_LENGTH]}",
-            "role": "assistant",
-            "content": state.assistant_content,
-            "visualization": None,
-            "answer_datasets": state.answer_datasets,
-            "steps": self._build_tool_steps(state.all_tool_results),
-            "action_confirm": state.action_confirm,
-        }
-        user_message = {
-            "id": f"u-{uuid.uuid4().hex[:CONVERSATION_MESSAGE_ID_SUFFIX_LENGTH]}",
-            "role": "user",
-            "content": state.user_message,
-        }
-        return {
-            "conversation_id": state.conversation_id,
-            "messages": [user_message, assistant_message],
-        }
+        history = []
+        for message in reversed(rows):
+            content = self._history_content_for_llm(message["role"], message["content"])
+            if content:
+                history.append({"role": message["role"], "content": content})
+        return history
 
     @staticmethod
-    def _normalize_query_result(value: dict) -> Optional[dict]:
-        if not isinstance(value, dict) or value.get("type") != "query_result" or value.get("error"):
-            return None
+    def _build_persisted_answer_datasets(supporting_datasets: list[dict]) -> list[dict]:
+        """Convert internal query results into the JSON shape consumed by `normalizeAnswerDatasets`."""
+        datasets = []
+        for index, dataset in enumerate(supporting_datasets):
+            if not isinstance(dataset, dict):
+                continue
+            rows = dataset.get("rows")
+            columns = dataset.get("columns")
+            if not isinstance(rows, list) or not isinstance(columns, list):
+                continue
+            target_class = str(dataset.get("target_class") or "query_result")
+            data = {
+                "type": "query_result",
+                "class_id": target_class,
+                "class_name": target_class,
+                "target_class": target_class,
+                "columns": columns,
+                "rows": rows,
+                "total": dataset.get("row_count", len(rows)),
+                "row_count": dataset.get("row_count", len(rows)),
+                "sql": dataset.get("sql") or "",
+            }
+            datasets.append(
+                {
+                    "id": f"query_{index + 1}",
+                    "name": target_class,
+                    "arguments": dataset.get("arguments") or {},
+                    "data": data,
+                }
+            )
+        return datasets
 
-        rows = value.get("rows") if isinstance(value.get("rows"), list) else []
-        columns = value.get("columns") if isinstance(value.get("columns"), list) else []
-        if not columns and rows and isinstance(rows[0], dict):
-            columns = list(rows[0].keys())
+    @classmethod
+    def _build_persisted_visualization(cls, supporting_datasets: list[dict]) -> dict | None:
+        """Keep a legacy visualization payload for clients without answer-dataset support."""
+        datasets = cls._build_persisted_answer_datasets(supporting_datasets)
+        return datasets[0]["data"] if datasets else None
 
-        if not rows or not columns:
-            return None
-
-        normalized = dict(value)
-        normalized["class_id"] = value.get("class_id") or value.get("target_class") or "query_result"
-        normalized["class_name"] = value.get("class_name") or value.get("target_class") or "查询结果"
-        normalized["columns"] = columns
-        normalized["rows"] = rows
-        normalized["total"] = value.get("total") if isinstance(value.get("total"), int) else value.get("row_count", len(rows))
-        return normalized
-
-    def _pick_latest_valid_query_result(self, tool_results: list[dict]) -> Optional[dict]:
-        for item in reversed(tool_results or []):
-            normalized = self._normalize_query_result(item.get("result") if isinstance(item, dict) else None)
-            if normalized:
-                return normalized
-        return None
-
-    @staticmethod
-    def _build_tool_steps(tool_results: list[dict]) -> list[dict]:
+    @classmethod
+    def _build_persisted_tool_steps(cls, tool_results: list[dict]) -> list[dict]:
+        """Normalize internal execution records to the `ToolStep` shape used on conversation reload."""
         steps = []
-        for item in tool_results or []:
+        for item in tool_results:
             if not isinstance(item, dict):
                 continue
-            result = item.get("result")
-            steps.append({
-                "name": item.get("name", ""),
-                "description": item.get("description") or get_tool_purpose(item.get("name", "")),
-                "args": item.get("arguments", {}),
-                "status": "failed" if isinstance(result, dict) and result.get("error") else "completed",
-                "result": result,
-                "startedAt": item.get("started_at"),
-                "planningFinishedAt": item.get("planning_finished_at"),
-                "planningDurationMs": item.get("planning_duration_ms"),
-                "executionStartedAt": item.get("execution_started_at"),
-                "executionDurationMs": item.get("execution_duration_ms"),
-                "finishedAt": item.get("finished_at"),
-                "durationMs": item.get("duration_ms"),
-            })
+            result = cls._make_json_safe(item.get("result"))
+            steps.append(
+                {
+                    "name": item.get("name") or "工具调用",
+                    "description": item.get("description") or "",
+                    "args": cls._make_json_safe(item.get("arguments") or {}),
+                    "result": result,
+                    "status": "failed" if isinstance(result, dict) and result.get("error") else "completed",
+                    "startedAt": item.get("started_at"),
+                    "planningFinishedAt": item.get("planning_finished_at"),
+                    "planningDurationMs": item.get("planning_duration_ms"),
+                    "executionStartedAt": item.get("execution_started_at"),
+                    "executionDurationMs": item.get("execution_duration_ms"),
+                    "finishedAt": item.get("finished_at"),
+                    "durationMs": item.get("duration_ms"),
+                }
+            )
         return steps
 
-    async def _persist_conversation_messages(self, payload: dict):
-        await asyncio.to_thread(self._persist_conversation_messages_sync, payload)
-
     @staticmethod
-    def _persist_conversation_messages_sync(payload: dict):
-        conn = get_db()
+    def _persist_conversation_message(
+        session_id: str,
+        role: str,
+        content: str,
+        answer_datasets: list[dict] | None = None,
+        visualization: dict | None = None,
+        steps: list[dict] | None = None,
+        action_confirm: dict | None = None,
+    ) -> None:
+        """Persist messages in the application's existing conversation store."""
+        if not session_id or (not content and role != "assistant"):
+            return
+
+        conn = None
         try:
-            conv_id = payload["conversation_id"]
-            conn.executemany(
-                "INSERT INTO messages (id, conversation_id, role, content, visualization, answer_datasets, steps, action_confirm) VALUES (?,?,?,?,?,?,?,?)",
-                [
-                    (
-                        msg.get("id") or str(uuid.uuid4())[:8],
-                        conv_id,
-                        msg.get("role", "user"),
-                        msg.get("content", ""),
-                        json.dumps(msg.get("visualization"), ensure_ascii=False, default=str) if msg.get("visualization") else "",
-                        json.dumps(msg.get("answer_datasets"), ensure_ascii=False, default=str) if msg.get("answer_datasets") else "",
-                        json.dumps(msg.get("steps"), ensure_ascii=False, default=str) if msg.get("steps") else "",
-                        json.dumps(msg.get("action_confirm"), ensure_ascii=False, default=str) if msg.get("action_confirm") else "",
-                    )
-                    for msg in payload.get("messages", [])
-                ],
+            conn = get_db()
+            conn.execute(
+                """INSERT INTO messages
+                         (id, conversation_id, role, content, visualization, answer_datasets, steps, action_confirm)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()),
+                    session_id,
+                    role,
+                    content,
+                    json.dumps(visualization, ensure_ascii=False, default=str) if visualization else "",
+                    json.dumps(answer_datasets or [], ensure_ascii=False, default=str),
+                    json.dumps(steps or [], ensure_ascii=False, default=str),
+                    json.dumps(action_confirm, ensure_ascii=False, default=str) if action_confirm else "",
+                ),
             )
-            conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (datetime.now(timezone.utc), conv_id))
+            conn.execute(
+                "UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (session_id,),
+            )
             conn.commit()
-        finally:
-            conn.close()
-
-    @staticmethod
-    def _log_persistence_task_result(task: asyncio.Task):
-        try:
-            task.result()
         except Exception as exc:
-            logger.exception("Chat conversation persistence failed: error=%s", str(exc))
+            if conn is not None:
+                conn.rollback()
+            logger.warning(
+                "Chat message persistence failed: session_id=%s role=%s error=%s",
+                session_id,
+                role,
+                str(exc),
+            )
+        finally:
+            if conn is not None:
+                conn.close()
+
+    @classmethod
+    def _history_content_for_llm(cls, role: str, content: object) -> str:
+        if isinstance(content, str):
+            return content
+        if role == "assistant" and isinstance(content, dict):
+            final_answer = content.get("final_answer")
+            if isinstance(final_answer, dict):
+                answer = final_answer.get("final_answer") or final_answer.get("plain_text_summary")
+                return str(answer) if answer else ""
+            if isinstance(final_answer, str):
+                return final_answer
+        if isinstance(content, dict) and isinstance(content.get("content"), str):
+            return content["content"]
+        return cls._json_dumps(content) if content is not None else ""

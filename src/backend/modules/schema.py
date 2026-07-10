@@ -63,30 +63,35 @@ def _field_types(fields: list[dict]) -> dict:
 def _reviewed_value(value) -> bool:
     if isinstance(value, str):
         return value.lower() in {"1", "true", "yes", "y"}
-    return bool(value)
+    return value == 1 or value is True
 
 
 REVIEW_STATUSES = {"pending", "approved", "rejected"}
 
 
 def _review_status(value, is_reviewed=False) -> str:
-    if value == "rejected":
+    if isinstance(value, str) and value.lower() == "rejected":
         return "rejected"
-    if value == "approved" or _reviewed_value(is_reviewed):
+    if isinstance(is_reviewed, str) and is_reviewed.lower() in {"-1", "rejected"}:
+        return "rejected"
+    if is_reviewed == -1:
+        return "rejected"
+    if (isinstance(value, str) and value.lower() == "approved") or _reviewed_value(is_reviewed):
         return "approved"
-    if isinstance(value, str) and value in REVIEW_STATUSES:
-        return value
+    if isinstance(value, str) and value.lower() in REVIEW_STATUSES:
+        return value.lower()
     return "pending"
 
 
 def _is_reviewed_status(value) -> int:
-    return int(value == "approved")
+    return {"rejected": -1, "approved": 1}.get(value, 0)
 
 
-def _relationship_exists(conn, scenario_id: str, source: str, target: str, rel_type: str, join_key: str, exclude_id: int | None = None) -> bool:
+def _relationship_exists(conn, scenario_id: str, source: str, target: str, rel_type: str, source_key: str, target_key: str, exclude_id: int | None = None) -> bool:
     sql = """SELECT id FROM schema_relationships
-              WHERE scenario_id=? AND source=? AND target=? AND type=? AND COALESCE(join_key, '')=?"""
-    params: list = [scenario_id, source, target, rel_type, join_key or ""]
+              WHERE scenario_id=? AND source=? AND target=? AND type=?
+                AND COALESCE(source_key, '')=? AND COALESCE(target_key, '')=?"""
+    params: list = [scenario_id, source, target, rel_type, source_key or "", target_key or ""]
     if exclude_id is not None:
         sql += " AND id<>?"
         params.append(exclude_id)
@@ -97,7 +102,8 @@ def _relationship_exists(conn, scenario_id: str, source: str, target: str, rel_t
 # Schema CRUD API — 前端管理面板路径
 # ============================================================
 
-@router.get("/api/admin/scenarios/{scenario_id}/schema/classes")
+@router.get("/api/scenarios/{scenario_id}/schema/classes")
+@router.get("/api/admin/scenarios/{scenario_id}/schema/classes", include_in_schema=False)
 async def admin_list_classes(scenario_id: str):
     """管理面板：列出场景下所有 Schema 类"""
     conn = get_db()
@@ -112,12 +118,13 @@ async def admin_list_classes(scenario_id: str):
         d["properties"] = _json_list(d.get("properties", "[]"))
         d["fields"] = _normalize_fields(_json_list(d.get("fields", "[]")))
         d["review_status"] = _review_status(d.get("review_status"), d.get("is_reviewed", 0))
-        d["is_reviewed"] = d["review_status"] == "approved"
+        d["is_reviewed"] = _is_reviewed_status(d["review_status"])
         result.append(d)
     return result
 
 
-@router.post("/api/admin/scenarios/{scenario_id}/schema/classes")
+@router.post("/api/scenarios/{scenario_id}/schema/classes")
+@router.post("/api/admin/scenarios/{scenario_id}/schema/classes", include_in_schema=False)
 async def admin_create_class(scenario_id: str, req: SchemaClassEdit):
     """管理面板：新增 Schema 类"""
     conn = get_db()
@@ -145,7 +152,8 @@ async def admin_create_class(scenario_id: str, req: SchemaClassEdit):
     return {"status": "ok"}
 
 
-@router.put("/api/admin/scenarios/{scenario_id}/schema/classes/{class_id}")
+@router.put("/api/scenarios/{scenario_id}/schema/classes/{class_id}")
+@router.put("/api/admin/scenarios/{scenario_id}/schema/classes/{class_id}", include_in_schema=False)
 async def admin_update_class(scenario_id: str, class_id: str, req: SchemaClassEdit):
     """管理面板：更新 Schema 类"""
     conn = get_db()
@@ -170,7 +178,8 @@ async def admin_update_class(scenario_id: str, class_id: str, req: SchemaClassEd
     return {"status": "ok"}
 
 
-@router.delete("/api/admin/scenarios/{scenario_id}/schema/classes/{class_id}")
+@router.delete("/api/scenarios/{scenario_id}/schema/classes/{class_id}")
+@router.delete("/api/admin/scenarios/{scenario_id}/schema/classes/{class_id}", include_in_schema=False)
 async def admin_delete_class(scenario_id: str, class_id: str):
     """管理面板：删除 Schema 类"""
     conn = get_db()
@@ -190,7 +199,8 @@ async def admin_delete_class(scenario_id: str, class_id: str):
     return {"status": "ok"}
 
 
-@router.get("/api/admin/scenarios/{scenario_id}/schema/relationships")
+@router.get("/api/scenarios/{scenario_id}/schema/relationships")
+@router.get("/api/admin/scenarios/{scenario_id}/schema/relationships", include_in_schema=False)
 async def admin_list_relationships(scenario_id: str):
     """管理面板：列出场景下所有 Schema 关系"""
     conn = get_db()
@@ -202,23 +212,33 @@ async def admin_list_relationships(scenario_id: str):
     result = []
     for row in rows:
         d = dict(row)
-        result.append(d | {"is_reviewed": _reviewed_value(d.get("is_reviewed", 0))})
+        review_status = _review_status(d.get("review_status"), d.get("is_reviewed", 0))
+        result.append(d | {
+            "review_status": review_status,
+            "is_reviewed": _is_reviewed_status(review_status),
+        })
     return result
 
 
-@router.post("/api/admin/scenarios/{scenario_id}/schema/relationships")
+@router.post("/api/scenarios/{scenario_id}/schema/relationships")
+@router.post("/api/admin/scenarios/{scenario_id}/schema/relationships", include_in_schema=False)
 async def admin_create_relationship(scenario_id: str, req: SchemaRelationEdit):
     """管理面板：新增 Schema 关系"""
     conn = get_db()
-    if _relationship_exists(conn, scenario_id, req.source, req.target, req.type, req.join_key):
+    source_key = req.source_key.strip() or req.join_key.strip()
+    target_key = req.target_key.strip() or req.join_key.strip()
+    join_key = req.join_key.strip() or (source_key if source_key == target_key else "")
+    if _relationship_exists(conn, scenario_id, req.source, req.target, req.type, source_key, target_key):
         conn.close()
         raise HTTPException(400, "关系已存在，请勿重复添加")
+    review_status = _review_status(req.review_status, req.is_reviewed)
     try:
         conn.execute(
             """INSERT INTO schema_relationships
-                    (scenario_id, source, target, type, join_key, is_reviewed, created_at, updated_at)
-                    VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
-                (scenario_id, req.source, req.target, req.type, req.join_key, int(req.is_reviewed)),
+                    (scenario_id, source, target, type, source_key, target_key, join_key, description, is_reviewed, review_status, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+                (scenario_id, req.source, req.target, req.type, source_key, target_key,
+                 join_key, req.description, _is_reviewed_status(review_status), review_status),
         )
         conn.commit()
     except Exception as e:
@@ -230,18 +250,24 @@ async def admin_create_relationship(scenario_id: str, req: SchemaRelationEdit):
     return {"status": "ok"}
 
 
-@router.put("/api/admin/scenarios/{scenario_id}/schema/relationships/{rel_id}")
+@router.put("/api/scenarios/{scenario_id}/schema/relationships/{rel_id}")
+@router.put("/api/admin/scenarios/{scenario_id}/schema/relationships/{rel_id}", include_in_schema=False)
 async def admin_update_relationship(scenario_id: str, rel_id: int, req: SchemaRelationEdit):
     """管理面板：更新 Schema 关系"""
     conn = get_db()
-    if _relationship_exists(conn, scenario_id, req.source, req.target, req.type, req.join_key, exclude_id=rel_id):
+    source_key = req.source_key.strip() or req.join_key.strip()
+    target_key = req.target_key.strip() or req.join_key.strip()
+    join_key = req.join_key.strip() or (source_key if source_key == target_key else "")
+    if _relationship_exists(conn, scenario_id, req.source, req.target, req.type, source_key, target_key, exclude_id=rel_id):
         conn.close()
         raise HTTPException(400, "关系已存在，请勿重复添加")
+    review_status = _review_status(req.review_status, req.is_reviewed)
     conn.execute(
         """UPDATE schema_relationships
-              SET source=?, target=?, type=?, join_key=?, is_reviewed=?, updated_at=CURRENT_TIMESTAMP
+              SET source=?, target=?, type=?, source_key=?, target_key=?, join_key=?, description=?, is_reviewed=?, review_status=?, updated_at=CURRENT_TIMESTAMP
            WHERE id=? AND scenario_id=?""",
-        (req.source, req.target, req.type, req.join_key, int(req.is_reviewed), rel_id, scenario_id),
+        (req.source, req.target, req.type, source_key, target_key, join_key,
+         req.description, _is_reviewed_status(review_status), review_status, rel_id, scenario_id),
     )
     conn.commit()
     conn.close()
@@ -250,7 +276,8 @@ async def admin_update_relationship(scenario_id: str, rel_id: int, req: SchemaRe
     return {"status": "ok"}
 
 
-@router.delete("/api/admin/scenarios/{scenario_id}/schema/relationships/{rel_id}")
+@router.delete("/api/scenarios/{scenario_id}/schema/relationships/{rel_id}")
+@router.delete("/api/admin/scenarios/{scenario_id}/schema/relationships/{rel_id}", include_in_schema=False)
 async def admin_delete_relationship(scenario_id: str, rel_id: int):
     """管理面板：删除 Schema 关系"""
     conn = get_db()
@@ -303,7 +330,9 @@ def _sync_schema_files(scenario_id: str):
             "primary_key": c["primary_key"],
             "csv_file": c["csv_file"],
             "fields": fields,
-            "is_reviewed": _review_status(c.get("review_status"), c.get("is_reviewed", 0)) == "approved",
+            "is_reviewed": _is_reviewed_status(
+                _review_status(c.get("review_status"), c.get("is_reviewed", 0))
+            ),
             "review_status": _review_status(c.get("review_status"), c.get("is_reviewed", 0)),
         })
         mapping_classes[c["id"]] = {
@@ -314,7 +343,9 @@ def _sync_schema_files(scenario_id: str):
             "field_map": _field_map(fields, properties),
             "field_types": _field_types(fields),
             "data_source": "csv" if c["csv_file"].endswith(".csv") else "database",
-            "is_reviewed": _review_status(c.get("review_status"), c.get("is_reviewed", 0)) == "approved",
+            "is_reviewed": _is_reviewed_status(
+                _review_status(c.get("review_status"), c.get("is_reviewed", 0))
+            ),
             "review_status": _review_status(c.get("review_status"), c.get("is_reviewed", 0)),
         }
 
@@ -331,7 +362,10 @@ def _sync_schema_files(scenario_id: str):
             "target_key": r["target_key"] or join_key,
             "join_key": join_key,
             "description": r["description"],
-            "is_reviewed": _reviewed_value(r.get("is_reviewed", 0)),
+            "is_reviewed": _is_reviewed_status(
+                _review_status(r.get("review_status"), r.get("is_reviewed", 0))
+            ),
+            "review_status": _review_status(r.get("review_status"), r.get("is_reviewed", 0)),
         }
         parsed_rels.append(rel_item)
         mapping_rels.append(rel_item)
@@ -339,6 +373,9 @@ def _sync_schema_files(scenario_id: str):
     parsed_metrics = []
     for row in metrics:
         m = dict(row)
+        target_classes = _json_list(m.get("target_classes", "[]"))
+        if not target_classes and m.get("target_class"):
+            target_classes = [m["target_class"]]
         parsed_metrics.append({
             "id": m["id"],
             "name": m["name"],
@@ -346,6 +383,7 @@ def _sync_schema_files(scenario_id: str):
             "description": m["description"],
             "category": m["category"],
             "target_class": m["target_class"],
+            "target_classes": target_classes,
             "calculation": m["calculation"],
             "formula": m["formula"],
             "dimensions": _json_list(m["dimensions"]),
@@ -353,7 +391,9 @@ def _sync_schema_files(scenario_id: str):
             "filters_hint": m["filters_hint"],
             "chart_type": m["chart_type"],
             "sort_order": m["sort_order"],
-            "is_reviewed": _review_status(m.get("review_status"), m.get("is_reviewed", 0)) == "approved",
+            "is_reviewed": _is_reviewed_status(
+                _review_status(m.get("review_status"), m.get("is_reviewed", 0))
+            ),
             "review_status": _review_status(m.get("review_status"), m.get("is_reviewed", 0)),
         })
 
@@ -369,7 +409,9 @@ def _sync_schema_files(scenario_id: str):
             "concept_type": c["concept_type"],
             "related_class": c["related_class"],
             "sort_order": c["sort_order"],
-            "is_reviewed": _review_status(c.get("review_status"), c.get("is_reviewed", 0)) == "approved",
+            "is_reviewed": _is_reviewed_status(
+                _review_status(c.get("review_status"), c.get("is_reviewed", 0))
+            ),
             "review_status": _review_status(c.get("review_status"), c.get("is_reviewed", 0)),
         })
 

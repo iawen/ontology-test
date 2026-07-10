@@ -21,21 +21,42 @@ REVIEW_STATUSES = {"pending", "approved", "rejected"}
 def _reviewed_value(value) -> bool:
     if isinstance(value, str):
         return value.lower() in {"1", "true", "yes", "y"}
-    return bool(value)
+    return value == 1 or value is True
 
 
 def _review_status(value, is_reviewed=False) -> str:
-    if value == "rejected":
+    if isinstance(value, str) and value.lower() == "rejected":
         return "rejected"
-    if value == "approved" or _reviewed_value(is_reviewed):
+    if isinstance(is_reviewed, str) and is_reviewed.lower() in {"-1", "rejected"}:
+        return "rejected"
+    if is_reviewed == -1:
+        return "rejected"
+    if (isinstance(value, str) and value.lower() == "approved") or _reviewed_value(is_reviewed):
         return "approved"
-    if isinstance(value, str) and value in REVIEW_STATUSES:
-        return value
+    if isinstance(value, str) and value.lower() in REVIEW_STATUSES:
+        return value.lower()
     return "pending"
 
 
 def _is_reviewed_status(value) -> int:
-    return int(value == "approved")
+    return {"rejected": -1, "approved": 1}.get(value, 0)
+
+
+def _target_classes(target_class, target_classes=None) -> list[str]:
+    values = target_classes if target_classes is not None else target_class
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        return []
+    return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
+def _row_target_classes(row: dict) -> list[str]:
+    try:
+        values = json.loads(row.get("target_classes") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        values = []
+    return _target_classes(row.get("target_class", ""), values or None)
 
 
 def _sync_ontology_files(scenario_id: str):
@@ -51,7 +72,8 @@ def _sync_ontology_files(scenario_id: str):
 # 指标 CRUD
 # ============================================================
 
-@router.get("/api/admin/scenarios/{scenario_id}/metrics")
+@router.get("/api/scenarios/{scenario_id}/metrics")
+@router.get("/api/admin/scenarios/{scenario_id}/metrics", include_in_schema=False)
 async def list_metrics(scenario_id: str):
     conn = get_db()
     rows = conn.execute(
@@ -64,27 +86,34 @@ async def list_metrics(scenario_id: str):
         d = dict(r)
         d["dimensions"] = json.loads(d.get("dimensions", "[]"))
         d["required_dimensions"] = json.loads(d.get("required_dimensions", "[]"))
+        d["target_classes"] = _row_target_classes(d)
+        d["target_class"] = d["target_classes"][0] if d["target_classes"] else ""
         # chart_type 可能不存在于旧数据库中
         d.setdefault("chart_type", "bar")
         d["review_status"] = _review_status(d.get("review_status"), d.get("is_reviewed", 0))
-        d["is_reviewed"] = d["review_status"] == "approved"
+        d["is_reviewed"] = _is_reviewed_status(d["review_status"])
         result.append(d)
     return result
 
 
-@router.post("/api/admin/scenarios/{scenario_id}/metrics")
+@router.post("/api/scenarios/{scenario_id}/metrics")
+@router.post("/api/admin/scenarios/{scenario_id}/metrics", include_in_schema=False)
 async def create_metric(scenario_id: str, req: MetricCreate):
     conn = get_db()
     review_status = _review_status(req.review_status, req.is_reviewed)
+    target_classes = _target_classes(req.target_class, req.target_classes)
+    if not target_classes:
+        conn.close()
+        raise HTTPException(400, "目标类必填")
     try:
         conn.execute(
             """INSERT INTO metrics
-               (id, scenario_id, name, description, category, target_class,
+                             (id, scenario_id, name, description, category, target_class, target_classes,
                 calculation, formula, dimensions, required_dimensions,
-                     filters_hint, chart_type, sort_order, is_reviewed, review_status, created_at, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+                                         filters_hint, chart_type, sort_order, is_reviewed, review_status, created_at, updated_at)
+                                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
             (req.id, scenario_id, req.name, req.description, req.category,
-             req.target_class, req.calculation, req.formula,
+                         target_classes[0], json.dumps(target_classes, ensure_ascii=False), req.calculation, req.formula,
              json.dumps(req.dimensions, ensure_ascii=False),
              json.dumps(req.required_dimensions, ensure_ascii=False),
                  req.filters_hint, req.chart_type, req.sort_order, _is_reviewed_status(review_status), review_status),
@@ -98,18 +127,26 @@ async def create_metric(scenario_id: str, req: MetricCreate):
     return {"status": "ok"}
 
 
-@router.put("/api/admin/scenarios/{scenario_id}/metrics/{metric_id}")
+@router.put("/api/scenarios/{scenario_id}/metrics/{metric_id}")
+@router.put("/api/admin/scenarios/{scenario_id}/metrics/{metric_id}", include_in_schema=False)
 async def update_metric(scenario_id: str, metric_id: str, req: MetricUpdate):
     conn = get_db()
     sets, vals = [], []
     for k, v in [("name", req.name), ("description", req.description),
-                  ("category", req.category), ("target_class", req.target_class),
+                  ("category", req.category),
                   ("calculation", req.calculation), ("formula", req.formula),
                   ("filters_hint", req.filters_hint), ("chart_type", req.chart_type),
                   ("sort_order", req.sort_order)]:
         if v is not None and v != "":
             sets.append(f"{k}=?")
             vals.append(v)
+    if req.target_classes is not None or req.target_class != "":
+        target_classes = _target_classes(req.target_class, req.target_classes)
+        if not target_classes:
+            conn.close()
+            raise HTTPException(400, "目标类必填")
+        sets.extend(["target_class=?", "target_classes=?"])
+        vals.extend([target_classes[0], json.dumps(target_classes, ensure_ascii=False)])
     if req.dimensions is not None:
         sets.append("dimensions=?")
         vals.append(json.dumps(req.dimensions, ensure_ascii=False))
@@ -134,7 +171,8 @@ async def update_metric(scenario_id: str, metric_id: str, req: MetricUpdate):
     return {"status": "ok"}
 
 
-@router.delete("/api/admin/scenarios/{scenario_id}/metrics/{metric_id}")
+@router.delete("/api/scenarios/{scenario_id}/metrics/{metric_id}")
+@router.delete("/api/admin/scenarios/{scenario_id}/metrics/{metric_id}", include_in_schema=False)
 async def delete_metric(scenario_id: str, metric_id: str):
     conn = get_db()
     conn.execute("DELETE FROM metrics WHERE id=? AND scenario_id=?", (metric_id, scenario_id))
@@ -144,7 +182,8 @@ async def delete_metric(scenario_id: str, metric_id: str):
     return {"status": "ok"}
 
 
-@router.post("/api/admin/scenarios/{scenario_id}/metrics/batch-delete")
+@router.post("/api/scenarios/{scenario_id}/metrics/batch-delete")
+@router.post("/api/admin/scenarios/{scenario_id}/metrics/batch-delete", include_in_schema=False)
 async def batch_delete_metrics(scenario_id: str, req: MetricBatchDelete):
     ids = [metric_id for metric_id in req.ids if metric_id]
     if not ids:
@@ -185,6 +224,7 @@ def lookup_metric(scenario_id: str, metric_name: str) -> dict | None:
                 "description": r["description"],
                 "category": r["category"],
                 "target_class": r["target_class"],
+                "target_classes": _row_target_classes(dict(r)),
                 "calculation": r["calculation"],
                 "formula": r["formula"],
                 "dimensions": json.loads(r["dimensions"]),

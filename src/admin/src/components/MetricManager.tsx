@@ -1,15 +1,6 @@
 "use client";
-import { useState, useEffect } from "react";
-import type { ReactNode } from "react";
-import {
-  ArrowDown,
-  ArrowUp,
-  ChevronsUpDown,
-  Pencil,
-  Plus,
-  Trash2,
-  X,
-} from "lucide-react";
+import { useState, useEffect, useMemo } from "react";
+import { ArrowDown, ArrowUp, ArrowUpDown, Plus, X } from "lucide-react";
 import { useApp } from "@/contexts/AppContext";
 import { useApi } from "@/hooks/useApi";
 import { getCacheData, setCacheData, invalidateCache } from "@/lib/cache";
@@ -19,7 +10,13 @@ import EmptyState from "@/components/ui/EmptyState";
 import SearchInput from "@/components/ui/SearchInput";
 import LoadingSpinner from "@/components/ui/LoadingSpinner";
 import ScenarioSelector from "@/components/ScenarioSelector";
-import type { Metric } from "@/lib/types";
+import type { Metric, SchemaClass } from "@/lib/types";
+import {
+  normalizeReviewStatus,
+  reviewStatusClassName,
+  reviewStatusLabel,
+  type ReviewStatus,
+} from "@/lib/reviewStatus";
 
 const CHART_LABELS: Record<string, string> = {
   bar: "柱状图",
@@ -31,81 +28,124 @@ const CHART_LABELS: Record<string, string> = {
   funnel: "漏斗图",
   radar: "雷达图",
 };
-const REVIEW_BADGE = {
-  approved: "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-100",
-  pending: "bg-amber-50 text-amber-700 ring-1 ring-amber-100",
-  rejected: "bg-rose-50 text-rose-700 ring-1 ring-rose-100",
-};
-const REVIEW_LABELS = {
-  approved: "通过",
-  pending: "待审",
-  rejected: "不通过",
-} as const;
-const getReviewStatus = (
-  item?: Partial<Pick<Metric, "is_reviewed" | "review_status">> | null,
-) => item?.review_status || (item?.is_reviewed ? "approved" : "pending");
-type ReviewStatus = keyof typeof REVIEW_LABELS;
-type SortDirection = "asc" | "desc";
+
 type SortKey =
   | "name"
   | "category"
   | "target_class"
-  | "formula"
-  | "dimensions"
   | "chart_type"
-  | "review_status"
-  | "sort_order";
+  | "is_reviewed";
+type SortDirection = "asc" | "desc";
 
-const compactList = (items: string[] = [], limit = 3) => {
-  if (!items.length) return "-";
-  const head = items.slice(0, limit).join(", ");
-  return items.length > limit ? `${head} +${items.length - limit}` : head;
-};
+const SORTABLE_COLUMNS: Array<{ key: SortKey; label: string }> = [
+  { key: "name", label: "名称" },
+  { key: "category", label: "分类" },
+  { key: "target_class", label: "目标类" },
+  { key: "chart_type", label: "图表" },
+  { key: "is_reviewed", label: "审核" },
+];
 
-const collator = new Intl.Collator("zh-CN", {
-  numeric: true,
-  sensitivity: "base",
-});
-const metricSortValue = (metric: Metric, key: SortKey) => {
-  if (key === "dimensions") return (metric.dimensions || []).join(", ");
-  if (key === "review_status") return REVIEW_LABELS[getReviewStatus(metric)];
+const REVIEW_STATUS_OPTIONS: Array<{ value: ReviewStatus; label: string }> = [
+  { value: 0, label: "待审核" },
+  { value: 1, label: "已通过" },
+  { value: -1, label: "不通过" },
+];
+
+function metricIdFromName(name: string) {
+  return (
+    name
+      .trim()
+      .replace(/[^0-9A-Za-z_\-\u4e00-\u9fff]+/g, "_")
+      .replace(/^_+|_+$/g, "") || "metric"
+  );
+}
+
+function parseDimensionList(value: string) {
+  return value
+    .split(/[,，、;；\r\n]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeMetric(metric: Metric): Metric {
+  const targetClasses = Array.isArray(metric.target_classes)
+    ? metric.target_classes
+    : metric.target_class
+      ? [metric.target_class]
+      : [];
+  return {
+    ...metric,
+    target_class: metric.target_class || targetClasses[0] || "",
+    target_classes: targetClasses,
+    dimensions: Array.isArray(metric.dimensions) ? metric.dimensions : [],
+    required_dimensions: Array.isArray(metric.required_dimensions)
+      ? metric.required_dimensions
+      : [],
+  };
+}
+
+function metricSortValue(metric: Metric, key: SortKey) {
+  if (key === "is_reviewed") return normalizeReviewStatus(metric.is_reviewed);
   if (key === "chart_type")
     return CHART_LABELS[metric.chart_type] || metric.chart_type || "";
-  if (key === "sort_order") return metric.sort_order ?? 0;
-  return metric[key] || "";
-};
+  if (key === "target_class") return (metric.target_classes || []).join(",");
+  return String(metric[key] || "");
+}
 
-const compareMetrics = (left: Metric, right: Metric, key: SortKey) => {
-  const leftValue = metricSortValue(left, key);
-  const rightValue = metricSortValue(right, key);
-  if (typeof leftValue === "number" && typeof rightValue === "number")
-    return leftValue - rightValue;
-  return collator.compare(String(leftValue), String(rightValue));
-};
+function metricTargetClasses(metric: Partial<Metric> | null | undefined) {
+  if (!metric) return [];
+  if (Array.isArray(metric.target_classes)) return metric.target_classes;
+  return metric.target_class ? [metric.target_class] : [];
+}
+
+function schemaClassLabel(schemaClass: SchemaClass) {
+  return schemaClass.name_cn
+    ? `${schemaClass.name_cn} (${schemaClass.id})`
+    : schemaClass.id;
+}
 
 export default function MetricManager() {
-  const { token, activeScenario, addToast } = useApp();
-  const api = useApi(token);
+  const { activeScenario, addToast } = useApp();
+  const api = useApi();
   const [metrics, setMetrics] = useState<Metric[]>([]);
+  const [schemaClasses, setSchemaClasses] = useState<SchemaClass[]>([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
   const [filterCategory, setFilterCategory] = useState("");
   const [filterTargetClass, setFilterTargetClass] = useState("");
-  const [filterReviewStatus, setFilterReviewStatus] = useState<
-    "" | ReviewStatus
-  >("");
-  const [sortConfig, setSortConfig] = useState<{
-    key: SortKey;
-    direction: SortDirection;
-  }>({ key: "sort_order", direction: "asc" });
+  const [filterReviewStatus, setFilterReviewStatus] = useState("");
   const [editMetric, setEditMetric] = useState<Partial<Metric> | null>(null);
-  const [editingMetricId, setEditingMetricId] = useState<string | null>(null);
+  const [targetClassSearch, setTargetClassSearch] = useState("");
+  const [dimensionText, setDimensionText] = useState("");
+  const [requiredDimensionText, setRequiredDimensionText] = useState("");
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
-  const [isBulkDeleteOpen, setIsBulkDeleteOpen] = useState(false);
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [sort, setSort] = useState<{
+    key: SortKey;
+    direction: SortDirection;
+  }>({ key: "name", direction: "asc" });
 
   const cacheKey = `metrics:${activeScenario}`;
+
+  const loadSchemaClasses = async () => {
+    if (!activeScenario) return;
+    const schemaCache = getCacheData<{ classes: SchemaClass[] }>(
+      `schema:${activeScenario}`,
+    );
+    if (schemaCache?.classes) {
+      setSchemaClasses(schemaCache.classes);
+      return;
+    }
+
+    try {
+      const data = await api(
+        `/api/scenarios/${activeScenario}/schema/classes`,
+      );
+      setSchemaClasses(data || []);
+    } catch {
+      addToast("error", "加载目标类失败");
+    }
+  };
 
   const load = async (force = false) => {
     if (!activeScenario) return;
@@ -119,8 +159,8 @@ export default function MetricManager() {
     }
     setLoading(true);
     try {
-      const d = await api(`/api/admin/scenarios/${activeScenario}/metrics`);
-      const data = d || [];
+      const d = await api(`/api/scenarios/${activeScenario}/metrics`);
+      const data = (d || []).map(normalizeMetric);
       setMetrics(data);
       setCacheData(cacheKey, data);
     } catch {
@@ -132,29 +172,41 @@ export default function MetricManager() {
 
   useEffect(() => {
     if (activeScenario) {
-      setSelectedIds([]);
       load();
+      loadSchemaClasses();
     }
   }, [activeScenario]);
 
   const save = async () => {
-    if (!editingMetricId && !editMetric?.id) {
-      addToast("warning", "指标 ID 必填");
-      return;
-    }
     if (!editMetric?.name) {
       addToast("warning", "名称必填");
       return;
     }
-    const isEdit = !!editingMetricId;
+    if (!metricTargetClasses(editMetric).length) {
+      addToast("warning", "目标类必选");
+      return;
+    }
+    const isEdit = !!editMetric.id;
+    const payload = {
+      ...editMetric,
+      id: isEdit ? editMetric.id : metricIdFromName(editMetric.name),
+      target_class: metricTargetClasses(editMetric),
+      target_classes: metricTargetClasses(editMetric),
+      dimensions: parseDimensionList(dimensionText),
+      required_dimensions: parseDimensionList(requiredDimensionText),
+    };
     try {
-      await api(
-        `/api/admin/scenarios/${activeScenario}/metrics${isEdit ? `/${editingMetricId}` : ""}`,
-        { method: isEdit ? "PUT" : "POST", body: JSON.stringify(editMetric) },
-      );
+      const idSuffix = isEdit ? `/${editMetric.id}` : "";
+      await api(`/api/scenarios/${activeScenario}/metrics${idSuffix}`, {
+        method: isEdit ? "PUT" : "POST",
+        body: JSON.stringify(payload),
+      });
       addToast("success", isEdit ? "指标已更新" : "指标已创建");
       setIsModalOpen(false);
       setEditMetric(null);
+      setTargetClassSearch("");
+      setDimensionText("");
+      setRequiredDimensionText("");
       invalidateCache(cacheKey);
       load(true);
     } catch (e: any) {
@@ -164,7 +216,7 @@ export default function MetricManager() {
 
   const remove = async (id: string) => {
     try {
-      await api(`/api/admin/scenarios/${activeScenario}/metrics/${id}`, {
+      await api(`/api/scenarios/${activeScenario}/metrics/${id}`, {
         method: "DELETE",
       });
       addToast("success", "指标已删除");
@@ -175,162 +227,196 @@ export default function MetricManager() {
     }
   };
 
-  const removeSelected = async () => {
-    if (!activeScenario || selectedIds.length === 0) return;
-    const ids = [...selectedIds];
-    try {
-      await api(`/api/admin/scenarios/${activeScenario}/metrics/batch-delete`, {
-        method: "POST",
-        body: JSON.stringify({ ids }),
-      });
-      addToast("success", `已删除 ${ids.length} 个指标`);
-      setSelectedIds([]);
-      setIsBulkDeleteOpen(false);
-      invalidateCache(cacheKey);
-      load(true);
-    } catch (e: any) {
-      addToast("error", e.message || "批量删除失败");
+  const categories = useMemo(
+    () => [...new Set(metrics.map((m) => m.category).filter(Boolean))],
+    [metrics],
+  );
+  const targetClasses = useMemo(
+    () => [
+      ...new Set(
+        metrics.flatMap((m) => metricTargetClasses(m)).filter(Boolean),
+      ),
+    ],
+    [metrics],
+  );
+  const schemaClassOptions = useMemo(
+    () =>
+      [...schemaClasses].sort((left, right) =>
+        String(left.name_cn || left.id).localeCompare(
+          String(right.name_cn || right.id),
+          "zh-Hans-CN",
+          { numeric: true },
+        ),
+      ),
+    [schemaClasses],
+  );
+  const schemaClassById = useMemo(
+    () =>
+      new Map(
+        schemaClassOptions.map((schemaClass) => [schemaClass.id, schemaClass]),
+      ),
+    [schemaClassOptions],
+  );
+  const availableTargetClassOptions = useMemo(() => {
+    const selected = new Set(metricTargetClasses(editMetric));
+    const keyword = targetClassSearch.trim().toLowerCase();
+
+    return schemaClassOptions.filter((schemaClass) => {
+      if (selected.has(schemaClass.id)) return false;
+      if (!keyword) return true;
+      return [schemaClass.id, schemaClass.name_cn, schemaClass.description]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(keyword));
+    });
+  }, [editMetric, schemaClassOptions, targetClassSearch]);
+  const reviewStats = useMemo(() => {
+    const counts: Record<ReviewStatus, number> = { "-1": 0, "0": 0, "1": 0 };
+    for (const metric of metrics) {
+      counts[normalizeReviewStatus(metric.is_reviewed)] += 1;
     }
+    return counts;
+  }, [metrics]);
+  const filtered = useMemo(() => {
+    const keyword = search.toLowerCase();
+    return metrics.filter((m) => {
+      const ms =
+        !keyword ||
+        m.name.toLowerCase().includes(keyword) ||
+        m.description?.toLowerCase().includes(keyword);
+      const mc = !filterCategory || m.category === filterCategory;
+      const mt =
+        !filterTargetClass ||
+        metricTargetClasses(m).includes(filterTargetClass);
+      const mr =
+        !filterReviewStatus ||
+        normalizeReviewStatus(m.is_reviewed) === Number(filterReviewStatus);
+      return ms && mc && mt && mr;
+    });
+  }, [filterCategory, filterReviewStatus, filterTargetClass, metrics, search]);
+  const sortedMetrics = useMemo(() => {
+    return [...filtered].sort((left, right) => {
+      const leftValue = metricSortValue(left, sort.key);
+      const rightValue = metricSortValue(right, sort.key);
+      const direction = sort.direction === "asc" ? 1 : -1;
+
+      if (typeof leftValue === "number" && typeof rightValue === "number") {
+        return (leftValue - rightValue) * direction;
+      }
+      return (
+        String(leftValue).localeCompare(String(rightValue), "zh-Hans-CN", {
+          numeric: true,
+        }) * direction
+      );
+    });
+  }, [filtered, sort]);
+
+  const toggleSort = (key: SortKey) => {
+    setSort((current) => ({
+      key,
+      direction:
+        current.key === key && current.direction === "asc" ? "desc" : "asc",
+    }));
   };
 
-  const categories = [
-    ...new Set(metrics.map((m) => m.category).filter(Boolean)),
-  ].sort((a, b) => collator.compare(a, b));
-  const targetClasses = [
-    ...new Set(metrics.map((m) => m.target_class).filter(Boolean)),
-  ].sort((a, b) => collator.compare(a, b));
-  const filtered = metrics
-    .filter((m) => {
-      const keyword = search.toLowerCase();
-      const ms =
-        !search ||
-        [m.id, m.name, m.description, m.target_class, m.formula].some((v) =>
-          (v || "").toLowerCase().includes(keyword),
-        );
-      const mc = !filterCategory || m.category === filterCategory;
-      const mt = !filterTargetClass || m.target_class === filterTargetClass;
-      const mr =
-        !filterReviewStatus || getReviewStatus(m) === filterReviewStatus;
-      return ms && mc && mt && mr;
-    })
-    .sort(
-      (a, b) =>
-        compareMetrics(a, b, sortConfig.key) *
-        (sortConfig.direction === "asc" ? 1 : -1),
-    );
-  const visibleIds = filtered.map((m) => m.id);
-  const allVisibleSelected =
-    visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
-  const toggleMetric = (id: string) =>
-    setSelectedIds((prev) =>
-      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id],
-    );
-  const toggleVisible = () =>
-    setSelectedIds((prev) =>
-      allVisibleSelected
-        ? prev.filter((id) => !visibleIds.includes(id))
-        : Array.from(new Set([...prev, ...visibleIds])),
-    );
-  const openCreate = () => {
-    setEditingMetricId(null);
+  const targetClassLabel = (targetClass: string) => {
+    const schemaClass = schemaClassById.get(targetClass);
+    return schemaClass
+      ? schemaClassLabel(schemaClass)
+      : `${targetClass}（未匹配）`;
+  };
+
+  const updateTargetClasses = (targetClasses: string[]) => {
     setEditMetric({
-      id: "",
-      scenario_id: activeScenario,
-      category: "",
-      target_class: "",
-      calculation: "",
-      formula: "",
-      dimensions: [],
-      required_dimensions: [],
-      filters_hint: "",
-      chart_type: "bar",
-      sort_order: 0,
-      is_reviewed: false,
-      review_status: "pending",
+      ...editMetric!,
+      target_class: targetClasses[0] || "",
+      target_classes: targetClasses,
     });
-    setIsModalOpen(true);
   };
-  const openEdit = (metric: Metric) => {
-    setEditingMetricId(metric.id);
-    setEditMetric(metric);
-    setIsModalOpen(true);
+
+  const addTargetClass = (targetClass: string) => {
+    const current = metricTargetClasses(editMetric);
+    if (current.includes(targetClass)) return;
+    updateTargetClasses([...current, targetClass]);
   };
-  const closeModal = () => {
-    setIsModalOpen(false);
-    setEditMetric(null);
-    setEditingMetricId(null);
-  };
-  const changeSort = (key: SortKey) =>
-    setSortConfig((prev) =>
-      prev.key === key
-        ? { key, direction: prev.direction === "asc" ? "desc" : "asc" }
-        : { key, direction: "asc" },
+
+  const removeTargetClass = (targetClass: string) => {
+    updateTargetClasses(
+      metricTargetClasses(editMetric).filter((item) => item !== targetClass),
     );
-  const SortIcon = ({ column }: { column: SortKey }) =>
-    sortConfig.key !== column ? (
-      <ChevronsUpDown className="h-3.5 w-3.5 text-slate-400" />
-    ) : sortConfig.direction === "asc" ? (
-      <ArrowUp className="h-3.5 w-3.5 text-indigo-500" />
-    ) : (
-      <ArrowDown className="h-3.5 w-3.5 text-indigo-500" />
+  };
+
+  const renderSortableHeader = (key: SortKey, label: string) => {
+    const active = sort.key === key;
+    const Icon = active
+      ? sort.direction === "asc"
+        ? ArrowUp
+        : ArrowDown
+      : ArrowUpDown;
+    return (
+      <th key={key}>
+        <button
+          type="button"
+          onClick={() => toggleSort(key)}
+          className="inline-flex items-center gap-1.5 text-xs font-medium uppercase text-slate-500 transition-colors hover:text-slate-800"
+        >
+          <span>{label}</span>
+          <Icon className="h-3.5 w-3.5" />
+        </button>
+      </th>
     );
-  const SortHeader = ({
-    column,
-    children,
-    align = "left",
-  }: {
-    column: SortKey;
-    children: ReactNode;
-    align?: "left" | "right";
-  }) => (
-    <button
-      type="button"
-      onClick={() => changeSort(column)}
-      className={`inline-flex w-full items-center gap-1 text-xs font-semibold text-slate-600 transition-colors hover:text-indigo-600 ${align === "right" ? "justify-end" : "justify-start"}`}
-    >
-      <span>{children}</span>
-      <SortIcon column={column} />
-    </button>
-  );
+  };
 
   if (!activeScenario)
     return (
       <div>
-        <h2 className="text-lg font-semibold text-slate-800 mb-4">指标管理</h2>
+        <h2 className="mb-4 text-lg font-semibold text-slate-800">指标管理</h2>
         <ScenarioSelector />
       </div>
     );
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-4">
-        <div>
-          <h2 className="text-lg font-semibold text-slate-800">指标管理</h2>
-          <p className="mt-1 text-xs text-slate-500">
-            共 {metrics.length} 个指标，当前显示 {filtered.length} 个
-          </p>
-        </div>
+      <div className="mb-4 flex items-center justify-between">
+        <h2 className="text-lg font-semibold text-slate-800">指标管理</h2>
         <button
-          onClick={openCreate}
-          className="btn-primary inline-flex items-center gap-2"
+          onClick={() => {
+            setEditMetric({
+              scenario_id: activeScenario,
+              category: "",
+              target_class: "",
+              target_classes: [],
+              calculation: "",
+              formula: "",
+              dimensions: [],
+              required_dimensions: [],
+              filters_hint: "",
+              chart_type: "bar",
+              sort_order: 0,
+              is_reviewed: 0,
+            });
+            setDimensionText("");
+            setRequiredDimensionText("");
+            setTargetClassSearch("");
+            setIsModalOpen(true);
+          }}
+          className="btn-primary"
         >
-          <Plus className="h-4 w-4" />
-          新增指标
+          + 新增指标
         </button>
       </div>
       <ScenarioSelector />
-      <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center">
-        <div className="min-w-0 flex-1">
+      <div className="mb-4 grid gap-3 md:grid-cols-[minmax(0,1fr)_10rem_10rem_8rem]">
+        <div className="flex-1">
           <SearchInput
             value={search}
             onChange={setSearch}
-            placeholder="搜索名称、ID、目标类或公式..."
+            placeholder="搜索指标..."
           />
         </div>
         <select
           value={filterCategory}
           onChange={(e) => setFilterCategory(e.target.value)}
-          className="text-sm lg:w-40"
+          className="text-sm"
         >
           <option value="">全部分类</option>
           {categories.map((c) => (
@@ -342,238 +428,158 @@ export default function MetricManager() {
         <select
           value={filterTargetClass}
           onChange={(e) => setFilterTargetClass(e.target.value)}
-          className="text-sm lg:w-44"
+          className="text-sm"
         >
           <option value="">全部目标类</option>
-          {targetClasses.map((c) => (
-            <option key={c} value={c}>
-              {c}
+          {targetClasses.map((targetClass) => (
+            <option key={targetClass} value={targetClass}>
+              {targetClass}
             </option>
           ))}
         </select>
         <select
           value={filterReviewStatus}
-          onChange={(e) =>
-            setFilterReviewStatus(e.target.value as "" | ReviewStatus)
-          }
-          className="text-sm lg:w-36"
+          onChange={(e) => setFilterReviewStatus(e.target.value)}
+          className="text-sm"
         >
           <option value="">全部审核</option>
-          {Object.entries(REVIEW_LABELS).map(([key, label]) => (
-            <option key={key} value={key}>
-              {label}
+          {REVIEW_STATUS_OPTIONS.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
             </option>
           ))}
         </select>
       </div>
-      {selectedIds.length > 0 && (
-        <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-red-100 bg-red-50 px-3 py-2">
-          <span className="text-sm font-medium text-red-700">
-            已选 {selectedIds.length} 个指标
-          </span>
-          <button
-            onClick={() => setIsBulkDeleteOpen(true)}
-            className="inline-flex items-center gap-1.5 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-red-700"
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-            批量删除
-          </button>
-          <button
-            onClick={() => setSelectedIds([])}
-            className="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-red-600 transition-colors hover:bg-red-100"
-          >
-            <X className="h-3.5 w-3.5" />
-            取消选择
-          </button>
-        </div>
-      )}
-
-      <style jsx>{`
-        .metric-clamp {
-          display: -webkit-box;
-          -webkit-line-clamp: 2;
-          -webkit-box-orient: vertical;
-          overflow: hidden;
-        }
-      `}</style>
-
-      <div className="mb-2 flex items-center justify-between text-xs text-slate-500">
-        <span>使用勾选框选择指标后可批量删除。</span>
-        <span>
-          {selectedIds.length > 0 ? `已选 ${selectedIds.length}` : "未选择"}
-        </span>
+      <div className="mb-4 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+        <span className="mr-1 font-medium text-slate-600">审核统计</span>
+        {REVIEW_STATUS_OPTIONS.map((option) => {
+          const active = filterReviewStatus === String(option.value);
+          return (
+            <button
+              key={option.value}
+              type="button"
+              onClick={() =>
+                setFilterReviewStatus(active ? "" : String(option.value))
+              }
+              className={`inline-flex items-center gap-1 rounded px-2 py-1 transition-colors ${
+                active
+                  ? reviewStatusClassName(option.value)
+                  : "bg-slate-50 text-slate-600 hover:bg-slate-100"
+              }`}
+            >
+              <span>{option.label}</span>
+              <span className="font-semibold">{reviewStats[option.value]}</span>
+            </button>
+          );
+        })}
+        <button
+          type="button"
+          onClick={() => setFilterReviewStatus("")}
+          className={`inline-flex items-center gap-1 rounded px-2 py-1 transition-colors ${
+            filterReviewStatus === ""
+              ? "bg-slate-700 text-white"
+              : "bg-slate-50 text-slate-600 hover:bg-slate-100"
+          }`}
+        >
+          <span>全部</span>
+          <span className="font-semibold">{metrics.length}</span>
+        </button>
       </div>
 
-      {loading ? (
-        <LoadingSpinner />
-      ) : filtered.length === 0 ? (
+      {loading && <LoadingSpinner />}
+      {!loading && sortedMetrics.length === 0 && (
         <EmptyState
           icon="📐"
           title="暂无指标"
           description="使用AI提取或手动创建"
         />
-      ) : (
+      )}
+      {!loading && sortedMetrics.length > 0 && (
         <div className="card overflow-hidden">
           <div className="overflow-x-auto">
-            <table className="data-table table-fixed min-w-[1120px]">
+            <table className="data-table min-w-[900px] table-fixed">
               <colgroup>
-                <col className="w-12" />
-                <col className="w-[240px]" />
-                <col className="w-28" />
-                <col className="w-[180px]" />
-                <col className="w-[260px]" />
-                <col className="w-[170px]" />
+                <col className="w-60" />
+                <col className="w-24" />
+                <col className="w-56" />
                 <col className="w-24" />
                 <col className="w-24" />
-                <col className="w-28" />
+                <col className="w-24" />
               </colgroup>
               <thead>
                 <tr>
-                  <th>
-                    <input
-                      type="checkbox"
-                      checked={allVisibleSelected}
-                      onChange={toggleVisible}
-                      className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                      aria-label="选择当前指标列表"
-                    />
-                  </th>
-                  <th>
-                    <SortHeader column="name">指标</SortHeader>
-                  </th>
-                  <th>
-                    <SortHeader column="category">分类</SortHeader>
-                  </th>
-                  <th>
-                    <SortHeader column="target_class">目标类</SortHeader>
-                  </th>
-                  <th>
-                    <SortHeader column="formula">公式</SortHeader>
-                  </th>
-                  <th>
-                    <SortHeader column="dimensions">维度</SortHeader>
-                  </th>
-                  <th>
-                    <SortHeader column="chart_type">图表</SortHeader>
-                  </th>
-                  <th>
-                    <SortHeader column="review_status">审核</SortHeader>
-                  </th>
+                  {SORTABLE_COLUMNS.map((column) =>
+                    renderSortableHeader(column.key, column.label),
+                  )}
                   <th className="text-right">操作</th>
                 </tr>
               </thead>
               <tbody>
-                {filtered.map((m) => (
-                  <tr
-                    key={m.id}
-                    className={
-                      selectedIds.includes(m.id) ? "bg-indigo-50/40" : ""
-                    }
-                  >
-                    <td>
-                      <input
-                        type="checkbox"
-                        checked={selectedIds.includes(m.id)}
-                        onChange={() => toggleMetric(m.id)}
-                        className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                        aria-label={`选择 ${m.name}`}
-                      />
+                {sortedMetrics.map((m) => (
+                  <tr key={m.id}>
+                    <td
+                      className="whitespace-normal break-words font-medium leading-relaxed text-slate-700"
+                      title={
+                        m.description ? `${m.name}\n\n${m.description}` : m.name
+                      }
+                    >
+                      {m.name}
                     </td>
                     <td>
-                      <div className="min-w-0">
-                        <div
-                          className="metric-clamp font-medium text-slate-800"
-                          title={m.name}
-                        >
-                          {m.name || "未命名指标"}
-                        </div>
-                        <div
-                          className="mt-1 truncate font-mono text-[11px] text-slate-400"
-                          title={m.id}
-                        >
-                          {m.id}
-                        </div>
-                        {m.description && (
-                          <div
-                            className="metric-clamp mt-1 text-xs text-slate-500"
-                            title={m.description}
-                          >
-                            {m.description}
-                          </div>
+                      <span className="inline-block max-w-full break-words rounded bg-slate-100 px-1.5 py-0.5 text-xs leading-relaxed text-slate-500">
+                        {m.category || "-"}
+                      </span>
+                    </td>
+                    <td className="whitespace-normal break-words text-xs leading-relaxed">
+                      <div className="flex flex-wrap gap-1">
+                        {metricTargetClasses(m).length ? (
+                          metricTargetClasses(m).map((targetClass) => (
+                            <span
+                              key={targetClass}
+                              className="rounded-full bg-sky-50 px-2 py-0.5 text-sky-700"
+                              title={targetClassLabel(targetClass)}
+                            >
+                              {targetClass}
+                            </span>
+                          ))
+                        ) : (
+                          <span className="text-slate-400">-</span>
                         )}
                       </div>
                     </td>
                     <td>
-                      <span className="inline-flex max-w-full rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">
-                        <span className="truncate">{m.category || "-"}</span>
-                      </span>
-                    </td>
-                    <td>
-                      <div
-                        className="truncate font-mono text-xs text-slate-600"
-                        title={m.target_class}
-                      >
-                        {m.target_class || "-"}
-                      </div>
-                    </td>
-                    <td>
-                      <code
-                        className="metric-clamp rounded-md bg-slate-50 px-2 py-1 font-mono text-xs text-slate-600 ring-1 ring-slate-100"
-                        title={m.formula}
-                      >
-                        {m.formula || "-"}
-                      </code>
-                    </td>
-                    <td>
-                      <div
-                        className="metric-clamp text-xs text-slate-500"
-                        title={(m.dimensions || []).join(", ")}
-                      >
-                        {compactList(m.dimensions)}
-                      </div>
-                      {m.required_dimensions?.length > 0 && (
-                        <div
-                          className="mt-1 truncate text-[11px] text-slate-400"
-                          title={m.required_dimensions.join(", ")}
-                        >
-                          必需：{compactList(m.required_dimensions, 2)}
-                        </div>
-                      )}
-                    </td>
-                    <td>
-                      <span className="inline-flex rounded bg-indigo-50 px-1.5 py-0.5 text-xs text-indigo-600 ring-1 ring-indigo-100">
+                      <span className="inline-block max-w-full break-words rounded bg-indigo-50 px-1.5 py-0.5 text-xs leading-relaxed text-indigo-600">
                         {CHART_LABELS[m.chart_type] || m.chart_type}
                       </span>
                     </td>
                     <td>
-                      {(() => {
-                        const status = getReviewStatus(m);
-                        return (
-                          <span
-                            className={`inline-flex rounded px-1.5 py-0.5 text-xs ${REVIEW_BADGE[status]}`}
-                          >
-                            {REVIEW_LABELS[status]}
-                          </span>
-                        );
-                      })()}
+                      <span
+                        className={`inline-block rounded px-1.5 py-0.5 text-xs ${reviewStatusClassName(m.is_reviewed)}`}
+                      >
+                        {reviewStatusLabel(m.is_reviewed)}
+                      </span>
                     </td>
-                    <td className="text-right">
-                      <div className="flex justify-end gap-1">
-                        <button
-                          onClick={() => openEdit(m)}
-                          className="btn-ghost p-1.5"
-                          title="编辑"
-                        >
-                          <Pencil className="h-4 w-4" />
-                        </button>
-                        <button
-                          onClick={() => setDeleteTarget(m.id)}
-                          className="btn-ghost p-1.5 text-red-500"
-                          title="删除"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
-                      </div>
+                    <td className="whitespace-nowrap text-right">
+                      <button
+                        onClick={() => {
+                          setEditMetric(m);
+                          setDimensionText((m.dimensions || []).join(", "));
+                          setRequiredDimensionText(
+                            (m.required_dimensions || []).join(", "),
+                          );
+                          setTargetClassSearch("");
+                          setIsModalOpen(true);
+                        }}
+                        className="btn-ghost text-xs"
+                      >
+                        编辑
+                      </button>
+                      <button
+                        onClick={() => setDeleteTarget(m.id)}
+                        className="btn-ghost text-xs text-red-500"
+                      >
+                        删除
+                      </button>
                     </td>
                   </tr>
                 ))}
@@ -585,11 +591,26 @@ export default function MetricManager() {
 
       <Modal
         isOpen={isModalOpen}
-        onClose={closeModal}
-        title={editingMetricId ? "编辑指标" : "新增指标"}
+        onClose={() => {
+          setIsModalOpen(false);
+          setEditMetric(null);
+          setTargetClassSearch("");
+          setDimensionText("");
+          setRequiredDimensionText("");
+        }}
+        title={editMetric?.id ? "编辑指标" : "新增指标"}
         footer={
           <>
-            <button onClick={closeModal} className="btn-outline">
+            <button
+              onClick={() => {
+                setIsModalOpen(false);
+                setEditMetric(null);
+                setTargetClassSearch("");
+                setDimensionText("");
+                setRequiredDimensionText("");
+              }}
+              className="btn-outline"
+            >
               取消
             </button>
             <button onClick={save} className="btn-primary">
@@ -599,37 +620,49 @@ export default function MetricManager() {
         }
       >
         <div className="space-y-4">
-          <div>
-            <label className="text-xs text-slate-500 font-medium block mb-1.5">
-              指标 ID
-            </label>
-            <input
-              value={editMetric?.id || ""}
-              disabled={!!editingMetricId}
-              onChange={(e) =>
-                setEditMetric({ ...editMetric!, id: e.target.value })
-              }
-              className="w-full font-mono disabled:bg-slate-50 disabled:text-slate-400"
-              placeholder="total_sales_amount"
-            />
+          <div className="grid gap-4 md:grid-cols-[minmax(0,2fr)_minmax(180px,1fr)]">
+            <div>
+              <label
+                htmlFor="metric-field-1"
+                className="mb-1.5 block text-xs font-medium text-slate-500"
+              >
+                名称
+              </label>
+              <input
+                id="metric-field-1"
+                value={editMetric?.name || ""}
+                onChange={(e) =>
+                  setEditMetric({ ...editMetric!, name: e.target.value })
+                }
+                className="w-full"
+              />
+            </div>
+            <div>
+              <label
+                htmlFor="metric-field-3"
+                className="mb-1.5 block text-xs font-medium text-slate-500"
+              >
+                分类
+              </label>
+              <input
+                id="metric-field-3"
+                value={editMetric?.category || ""}
+                onChange={(e) =>
+                  setEditMetric({ ...editMetric!, category: e.target.value })
+                }
+                className="w-full"
+              />
+            </div>
           </div>
           <div>
-            <label className="text-xs text-slate-500 font-medium block mb-1.5">
-              名称
-            </label>
-            <input
-              value={editMetric?.name || ""}
-              onChange={(e) =>
-                setEditMetric({ ...editMetric!, name: e.target.value })
-              }
-              className="w-full"
-            />
-          </div>
-          <div>
-            <label className="text-xs text-slate-500 font-medium block mb-1.5">
+            <label
+              htmlFor="metric-field-2"
+              className="mb-1.5 block text-xs font-medium text-slate-500"
+            >
               描述
             </label>
             <textarea
+              id="metric-field-2"
               value={editMetric?.description || ""}
               onChange={(e) =>
                 setEditMetric({ ...editMetric!, description: e.target.value })
@@ -638,67 +671,136 @@ export default function MetricManager() {
               rows={2}
             />
           </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="text-xs text-slate-500 font-medium block mb-1.5">
-                分类
-              </label>
-              <input
-                value={editMetric?.category || ""}
-                onChange={(e) =>
-                  setEditMetric({ ...editMetric!, category: e.target.value })
-                }
-                className="w-full"
-              />
+          <div>
+            <label className="mb-1.5 block text-xs font-medium text-slate-500">
+              目标类
+            </label>
+            <div className="rounded border border-slate-200 bg-slate-50/80 p-2.5">
+              <div className="mb-2 flex min-h-9 flex-wrap items-center gap-2">
+                {metricTargetClasses(editMetric).length ? (
+                  metricTargetClasses(editMetric).map((targetClass) => (
+                    <span
+                      key={targetClass}
+                      className={[
+                        "inline-flex max-w-full items-center gap-1 rounded-full",
+                        "border border-sky-200 bg-sky-50 px-2.5 py-1",
+                        "text-xs font-medium text-sky-700",
+                      ].join(" ")}
+                    >
+                      <span className="truncate">
+                        {targetClassLabel(targetClass)}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => removeTargetClass(targetClass)}
+                        className="rounded-full p-0.5 text-sky-500 hover:bg-sky-100 hover:text-sky-800"
+                        aria-label={`移除 ${targetClass}`}
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </span>
+                  ))
+                ) : (
+                  <span className="text-xs text-slate-400">未选择目标类</span>
+                )}
+              </div>
+              <div className="mb-2 flex items-center gap-2 border-t border-slate-200 pt-2">
+                <input
+                  value={targetClassSearch}
+                  onChange={(event) => setTargetClassSearch(event.target.value)}
+                  className="h-8 min-w-0 flex-1 bg-white text-xs"
+                  placeholder="搜索目标类名称、ID 或描述"
+                />
+                <span className="whitespace-nowrap text-xs text-slate-400">
+                  {availableTargetClassOptions.length} 个可选
+                </span>
+                {targetClassSearch && (
+                  <button
+                    type="button"
+                    onClick={() => setTargetClassSearch("")}
+                    className={[
+                      "inline-flex h-8 items-center gap-1 rounded border",
+                      "border-slate-200 bg-white px-2 text-xs text-slate-500",
+                      "hover:bg-slate-100",
+                    ].join(" ")}
+                  >
+                    <X className="h-3 w-3" />
+                    清空
+                  </button>
+                )}
+              </div>
+              <div className="flex max-h-28 flex-wrap gap-1.5 overflow-y-auto border-t border-slate-200 pt-2">
+                {availableTargetClassOptions.length ? (
+                  availableTargetClassOptions.map((schemaClass) => (
+                    <button
+                      key={schemaClass.id}
+                      type="button"
+                      onClick={() => addTargetClass(schemaClass.id)}
+                      className={[
+                        "inline-flex max-w-full items-center gap-1 rounded-full",
+                        "border border-slate-200 bg-white px-2.5 py-1 text-xs",
+                        "text-slate-600 transition-colors hover:border-sky-300",
+                        "hover:bg-sky-50 hover:text-sky-700",
+                      ].join(" ")}
+                    >
+                      <Plus className="h-3 w-3 shrink-0" />
+                      <span className="truncate">
+                        {schemaClassLabel(schemaClass)}
+                      </span>
+                    </button>
+                  ))
+                ) : (
+                  <span className="py-1 text-xs text-slate-400">
+                    没有匹配的目标类
+                  </span>
+                )}
+              </div>
             </div>
-            <div>
-              <label className="text-xs text-slate-500 font-medium block mb-1.5">
-                目标类
-              </label>
-              <input
-                value={editMetric?.target_class || ""}
-                onChange={(e) =>
-                  setEditMetric({
-                    ...editMetric!,
-                    target_class: e.target.value,
-                  })
-                }
-                className="w-full"
-              />
-            </div>
+          </div>
+          <div>
+            <label
+              htmlFor="metric-field-5"
+              className="mb-1.5 block text-xs font-medium text-slate-500"
+            >
+              计算方式
+            </label>
+            <textarea
+              id="metric-field-5"
+              value={editMetric?.calculation || ""}
+              onChange={(e) =>
+                setEditMetric({ ...editMetric!, calculation: e.target.value })
+              }
+              className="w-full"
+              rows={2}
+            />
+          </div>
+          <div>
+            <label
+              htmlFor="metric-field-6"
+              className="mb-1.5 block text-xs font-medium text-slate-500"
+            >
+              公式
+            </label>
+            <textarea
+              id="metric-field-6"
+              value={editMetric?.formula || ""}
+              onChange={(e) =>
+                setEditMetric({ ...editMetric!, formula: e.target.value })
+              }
+              className="w-full font-mono text-xs"
+              rows={2}
+            />
           </div>
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="text-xs text-slate-500 font-medium block mb-1.5">
-                计算方式
-              </label>
-              <input
-                value={editMetric?.calculation || ""}
-                onChange={(e) =>
-                  setEditMetric({ ...editMetric!, calculation: e.target.value })
-                }
-                className="w-full"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-slate-500 font-medium block mb-1.5">
-                公式
-              </label>
-              <input
-                value={editMetric?.formula || ""}
-                onChange={(e) =>
-                  setEditMetric({ ...editMetric!, formula: e.target.value })
-                }
-                className="w-full"
-              />
-            </div>
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="text-xs text-slate-500 font-medium block mb-1.5">
+              <label
+                htmlFor="metric-field-7"
+                className="mb-1.5 block text-xs font-medium text-slate-500"
+              >
                 图表类型
               </label>
               <select
+                id="metric-field-7"
                 value={editMetric?.chart_type || "bar"}
                 onChange={(e) =>
                   setEditMetric({ ...editMetric!, chart_type: e.target.value })
@@ -713,10 +815,14 @@ export default function MetricManager() {
               </select>
             </div>
             <div>
-              <label className="text-xs text-slate-500 font-medium block mb-1.5">
+              <label
+                htmlFor="metric-field-8"
+                className="mb-1.5 block text-xs font-medium text-slate-500"
+              >
                 排序
               </label>
               <input
+                id="metric-field-8"
                 type="number"
                 value={editMetric?.sort_order || 0}
                 onChange={(e) =>
@@ -730,47 +836,43 @@ export default function MetricManager() {
             </div>
           </div>
           <div>
-            <label className="text-xs text-slate-500 font-medium block mb-1.5">
+            <label
+              htmlFor="metric-field-9"
+              className="mb-1.5 block text-xs font-medium text-slate-500"
+            >
               维度 (逗号分隔)
             </label>
             <input
-              value={(editMetric?.dimensions || []).join(", ")}
-              onChange={(e) =>
-                setEditMetric({
-                  ...editMetric!,
-                  dimensions: e.target.value
-                    .split(",")
-                    .map((s) => s.trim())
-                    .filter(Boolean),
-                })
-              }
+              id="metric-field-9"
+              value={dimensionText}
+              onChange={(e) => setDimensionText(e.target.value)}
               className="w-full"
               placeholder="region, category"
             />
           </div>
           <div>
-            <label className="text-xs text-slate-500 font-medium block mb-1.5">
+            <label
+              htmlFor="metric-field-10"
+              className="mb-1.5 block text-xs font-medium text-slate-500"
+            >
               必要维度 (逗号分隔)
             </label>
             <input
-              value={(editMetric?.required_dimensions || []).join(", ")}
-              onChange={(e) =>
-                setEditMetric({
-                  ...editMetric!,
-                  required_dimensions: e.target.value
-                    .split(",")
-                    .map((s) => s.trim())
-                    .filter(Boolean),
-                })
-              }
+              id="metric-field-10"
+              value={requiredDimensionText}
+              onChange={(e) => setRequiredDimensionText(e.target.value)}
               className="w-full"
             />
           </div>
           <div>
-            <label className="text-xs text-slate-500 font-medium block mb-1.5">
+            <label
+              htmlFor="metric-field-11"
+              className="mb-1.5 block text-xs font-medium text-slate-500"
+            >
               筛选提示
             </label>
             <input
+              id="metric-field-11"
               value={editMetric?.filters_hint || ""}
               onChange={(e) =>
                 setEditMetric({ ...editMetric!, filters_hint: e.target.value })
@@ -779,23 +881,22 @@ export default function MetricManager() {
             />
           </div>
           <div>
-            <label className="text-xs text-slate-500 font-medium block mb-1.5">
+            <label className="mb-1.5 block text-xs font-medium text-slate-500">
               人工审核
             </label>
             <select
-              value={getReviewStatus(editMetric)}
+              value={normalizeReviewStatus(editMetric?.is_reviewed)}
               onChange={(e) =>
                 setEditMetric({
                   ...editMetric!,
-                  review_status: e.target.value as Metric["review_status"],
-                  is_reviewed: e.target.value === "approved",
+                  is_reviewed: Number(e.target.value) as ReviewStatus,
                 })
               }
-              className="w-40"
+              className="w-full text-sm"
             >
-              <option value="pending">待审</option>
-              <option value="approved">通过</option>
-              <option value="rejected">不通过</option>
+              <option value={0}>待审核</option>
+              <option value={1}>已通过</option>
+              <option value={-1}>不通过</option>
             </select>
           </div>
         </div>
@@ -808,19 +909,10 @@ export default function MetricManager() {
         onConfirm={() => {
           if (deleteTarget) {
             remove(deleteTarget);
-            setSelectedIds((prev) => prev.filter((id) => id !== deleteTarget));
             setDeleteTarget(null);
           }
         }}
         onCancel={() => setDeleteTarget(null)}
-      />
-      <ConfirmDialog
-        isOpen={isBulkDeleteOpen}
-        title="批量删除指标"
-        message={`确定要删除选中的 ${selectedIds.length} 个指标吗？此操作不可撤销。`}
-        confirmText="批量删除"
-        onConfirm={removeSelected}
-        onCancel={() => setIsBulkDeleteOpen(false)}
       />
     </div>
   );

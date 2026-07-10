@@ -1,0 +1,1021 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Data Query Chat v3 Stream Demo</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #172033;
+      --muted: #647086;
+      --line: #d8dde8;
+      --primary: #1769e0;
+      --primary-dark: #1056bb;
+      --danger: #b42318;
+      --ok: #157347;
+      --code: #101828;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 24px;
+      font-weight: 700;
+    }
+
+    .subtitle {
+      margin: 0 0 18px;
+      color: var(--muted);
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(320px, 420px) 1fr;
+      gap: 16px;
+      align-items: start;
+    }
+
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+
+    label {
+      display: block;
+      margin: 12px 0 6px;
+      font-weight: 600;
+    }
+
+    input,
+    textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 11px;
+      color: var(--text);
+      background: #fff;
+      font: inherit;
+      outline: none;
+    }
+
+    textarea {
+      min-height: 132px;
+      resize: vertical;
+    }
+
+    input:focus,
+    textarea:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(23, 105, 224, 0.12);
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    button {
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button.primary {
+      background: var(--primary);
+      color: #fff;
+    }
+
+    button.primary:hover { background: var(--primary-dark); }
+
+    button.secondary {
+      background: #fff;
+      border-color: var(--line);
+      color: var(--text);
+    }
+
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      min-height: 32px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: #eef2f7;
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .status.running { color: var(--primary); }
+    .status.done { color: var(--ok); }
+    .status.error { color: var(--danger); }
+
+    .output-grid {
+      display: grid;
+      gap: 12px;
+    }
+
+    .box-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+      font-weight: 700;
+    }
+
+    .title-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .duration-pill {
+      display: none;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #f8fafc;
+      color: var(--muted);
+      padding: 3px 8px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    pre {
+      margin: 0;
+      min-height: 120px;
+      max-height: 360px;
+      overflow: auto;
+      border-radius: 6px;
+      background: var(--code);
+      color: #e8edf7;
+      padding: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font: 12px/1.55 Consolas, "SFMono-Regular", Menlo, monospace;
+    }
+
+    #events {
+      display: grid;
+      gap: 10px;
+    }
+
+    .event-card {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      overflow: hidden;
+    }
+
+    .event-card summary {
+      display: grid;
+      grid-template-columns: auto minmax(120px, 180px) 1fr auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 12px;
+      cursor: pointer;
+      list-style: none;
+    }
+
+    .event-card summary::-webkit-details-marker { display: none; }
+
+    .event-card summary::before {
+      content: "▸";
+      color: var(--muted);
+      width: 12px;
+    }
+
+    .event-card[open] summary::before { content: "▾"; }
+
+    .event-name {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      font-weight: 800;
+      color: var(--text);
+    }
+
+    .event-name span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .event-description {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+    }
+
+    .event-duration {
+      justify-self: end;
+      border-radius: 999px;
+      background: #eef2f7;
+      color: var(--muted);
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .event-body {
+      border-top: 1px solid var(--line);
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .detail-block strong {
+      display: block;
+      margin-bottom: 5px;
+    }
+
+    .detail-block pre {
+      min-height: 0;
+      max-height: 260px;
+    }
+
+    .analysis-tree {
+      display: grid;
+      gap: 10px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .analysis-node {
+      position: relative;
+      border-left: 2px solid var(--primary);
+      padding-left: 12px;
+    }
+
+    .analysis-node-title {
+      font-weight: 800;
+      margin-bottom: 4px;
+    }
+
+    .analysis-node-meta {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 6px;
+    }
+
+    .analysis-node ul {
+      margin: 6px 0 0;
+      padding-left: 18px;
+    }
+
+    #finalAnswer {
+      min-height: 160px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 12px;
+      background: #fff;
+    }
+
+    #finalAnswer :first-child { margin-top: 0; }
+    #finalAnswer :last-child { margin-bottom: 0; }
+
+    #finalAnswer h1,
+    #finalAnswer h2,
+    #finalAnswer h3 {
+      margin: 14px 0 8px;
+      line-height: 1.25;
+    }
+
+    #finalAnswer h1 { font-size: 22px; }
+    #finalAnswer h2 { font-size: 18px; }
+    #finalAnswer h3 { font-size: 16px; }
+
+    #finalAnswer p,
+    #finalAnswer ul,
+    #finalAnswer ol {
+      margin: 8px 0;
+    }
+
+    #finalAnswer code {
+      border-radius: 4px;
+      background: #eef2f7;
+      padding: 1px 4px;
+      font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+      font-size: 12px;
+    }
+
+    #finalAnswer pre {
+      min-height: 0;
+      max-height: none;
+      margin: 10px 0;
+    }
+
+    #datasets {
+      display: grid;
+      gap: 12px;
+    }
+
+    .dataset-card {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    .dataset-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+      background: #f8fafc;
+      padding: 9px 11px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .dataset-meta strong {
+      color: var(--text);
+      font-size: 13px;
+    }
+
+    .table-wrap {
+      max-height: 420px;
+      overflow: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      border-right: 1px solid var(--line);
+      padding: 7px 8px;
+      text-align: left;
+      vertical-align: top;
+      white-space: nowrap;
+    }
+
+    th:last-child,
+    td:last-child { border-right: 0; }
+
+    th {
+      position: sticky;
+      top: 0;
+      background: #eef2f7;
+      color: #344054;
+      z-index: 1;
+    }
+
+    td {
+      max-width: 260px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .empty {
+      border: 1px dashed var(--line);
+      border-radius: 6px;
+      padding: 12px;
+      color: var(--muted);
+      background: #fff;
+    }
+
+    .hint {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .notice {
+      margin: 0 0 14px;
+      border: 1px solid #ffd28a;
+      border-radius: 6px;
+      background: #fff8e6;
+      color: #674300;
+      padding: 10px 12px;
+      display: none;
+    }
+
+    @media (max-width: 860px) {
+      main { padding: 16px; }
+      .layout { grid-template-columns: 1fr; }
+      .row { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Data Query Chat v3 Stream Demo</h1>
+    <p class="subtitle">POST 对接 <code>/api/v2/chat_test</code>，实时读取 Server-Sent Events。</p>
+    <div id="notice" class="notice"></div>
+
+    <div class="layout">
+      <section>
+        <label for="endpoint">接口地址</label>
+        <input id="endpoint" value="http://localhost:8050/api/v2/chat_test" />
+
+        <div class="row">
+          <div>
+            <label for="agentId">agent_id</label>
+            <input id="agentId" value="pfizer" />
+          </div>
+          <div>
+            <label for="language">language</label>
+            <input id="language" value="zh-CN" />
+          </div>
+        </div>
+
+        <label for="sessionId">session_id</label>
+        <input id="sessionId" value="sess_Fgrqp87E6dTP7ZgwYPtVrh"/>
+
+        <label for="token">Bearer Token / JWT（可选）</label>
+        <input id="token" type="password" placeholder="如果已通过 cookie 登录，可留空" />
+
+        <label for="message">message</label>
+        <textarea id="message">浙江 200mg 希必可 2026 AP05 销量</textarea>
+
+        <div class="actions">
+          <button id="sendBtn" class="primary" type="button">开始流式请求</button>
+          <button id="stopBtn" class="secondary" type="button" disabled>停止</button>
+          <span id="status" class="status">idle</span>
+        </div>
+
+        <p class="hint">提示：如果从本地文件打开遇到 CORS 或认证问题，可把 endpoint 改成同源相对路径，或用后端静态服务托管此 HTML。</p>
+      </section>
+
+      <section class="output-grid">
+        <div>
+          <div class="box-title">
+            <span>最终回答</span>
+            <div class="title-actions">
+              <span id="duration" class="duration-pill"></span>
+              <button id="clearBtn" class="secondary" type="button">清空</button>
+            </div>
+          </div>
+          <div id="finalAnswer"></div>
+        </div>
+
+        <div>
+          <div class="box-title"><span>支撑数据表</span></div>
+          <div id="datasets" class="empty">暂无数据</div>
+        </div>
+
+        <div>
+          <div class="box-title"><span>SSE 事件</span></div>
+          <div id="events" class="empty">暂无事件</div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const endpointInput = document.getElementById('endpoint');
+    const agentIdInput = document.getElementById('agentId');
+    const languageInput = document.getElementById('language');
+    const sessionIdInput = document.getElementById('sessionId');
+    const tokenInput = document.getElementById('token');
+    const messageInput = document.getElementById('message');
+    const sendBtn = document.getElementById('sendBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const statusEl = document.getElementById('status');
+    const eventsEl = document.getElementById('events');
+    const finalAnswerEl = document.getElementById('finalAnswer');
+    const datasetsEl = document.getElementById('datasets');
+    const durationEl = document.getElementById('duration');
+    const noticeEl = document.getElementById('notice');
+
+    let controller = null;
+
+    function randomId(prefix) {
+      return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    }
+
+    function setStatus(text, state) {
+      statusEl.textContent = text;
+      statusEl.className = `status ${state || ''}`.trim();
+    }
+
+    function appendPre(el, value) {
+      el.textContent += value;
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function renderDuration(durationMs) {
+      if (typeof durationMs !== 'number' || !Number.isFinite(durationMs)) {
+        durationEl.textContent = '';
+        durationEl.style.display = 'none';
+        return;
+      }
+      durationEl.textContent = durationMs >= 1000 ? `总耗时 ${(durationMs / 1000).toFixed(2)}s` : `总耗时 ${durationMs}ms`;
+      durationEl.style.display = 'inline-flex';
+    }
+
+    function formatDuration(value) {
+      if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
+      return value >= 1000 ? `${(value / 1000).toFixed(2)}s` : `${Math.round(value)}ms`;
+    }
+
+    function showNotice(message) {
+      noticeEl.textContent = message;
+      noticeEl.style.display = message ? 'block' : 'none';
+    }
+
+    function explainNetworkFailure(error) {
+      const endpoint = endpointInput.value.trim();
+      const openedFromFile = window.location.protocol === 'file:';
+      const lines = [String(error)];
+
+      if (openedFromFile) {
+        lines.push('当前页面是 file:// 打开的，浏览器跨域 POST 到后端时很容易被 CORS 拦截并显示 net::ERR_FAILED。');
+        lines.push('推荐在此目录启动静态服务：python -m http.server 3000，然后打开 http://localhost:3000/chat_test_demo.html。');
+      }
+
+      if (endpoint.startsWith('http://localhost:8000') || endpoint.startsWith('http://127.0.0.1:8000')) {
+        lines.push('请确认后端正在 8000 端口运行，并且 CORS_ORIGINS 包含当前页面来源。当前后端默认允许 http://localhost:3000 和 http://127.0.0.1:3000。');
+      }
+
+      return lines.join('\n');
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function renderInlineMarkdown(text) {
+      return escapeHtml(text)
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    }
+
+    function normalizeMarkdownText(markdown) {
+      return String(markdown || '')
+        .replace(/\r\n/g, '\n')
+        .replace(/\\r\\n|\\n|\\r/g, '\n')
+        .replace(/\\t/g, '  ');
+    }
+
+    function normalizeInlineMarkdownTables(markdown) {
+      return normalizeMarkdownText(markdown).replace(/((?:\|[^\n|]+)+\|[ \t]*\|[-: \t|]+\|(?:[ \t]*\|[^\n|]+)+\|)/g, (block) => {
+        const cells = block
+          .split('|')
+          .map((cell) => cell.trim())
+          .filter(Boolean);
+        if (cells.length < 6) return block;
+
+        const separatorIndex = cells.findIndex((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s+/g, '')));
+        if (separatorIndex <= 0) return block;
+
+        const columnCount = separatorIndex;
+        if (cells.length < columnCount * 3 || cells.length % columnCount !== 0) return block;
+
+        const rows = [];
+        for (let index = 0; index < cells.length; index += columnCount) {
+          rows.push(`| ${cells.slice(index, index + columnCount).join(' | ')} |`);
+        }
+        return `\n${rows.join('\n')}\n`;
+      });
+    }
+
+    function isTableSeparator(line) {
+      const cells = line.trim().split('|').slice(1, -1).map((cell) => cell.trim());
+      return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s+/g, '')));
+    }
+
+    function splitTableRow(line) {
+      return line.trim().split('|').slice(1, -1).map((cell) => cell.trim());
+    }
+
+    function renderMarkdownTable(rows) {
+      const header = splitTableRow(rows[0]);
+      const bodyRows = rows.slice(2).map(splitTableRow).filter((row) => row.length === header.length);
+      if (!header.length || !bodyRows.length) return '';
+      return `<div class="table-wrap"><table><thead><tr>${header.map((cell) => `<th>${renderInlineMarkdown(cell)}</th>`).join('')}</tr></thead><tbody>${bodyRows.map((row) => `<tr>${row.map((cell) => `<td>${renderInlineMarkdown(cell)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+    }
+
+    function markdownToHtml(markdown) {
+      const lines = normalizeInlineMarkdownTables(markdown).split('\n');
+      const html = [];
+      let paragraph = [];
+      let listType = '';
+      let inCode = false;
+      let codeLines = [];
+      let tableRows = [];
+
+      function flushParagraph() {
+        if (!paragraph.length) return;
+        html.push(`<p>${renderInlineMarkdown(paragraph.join(' '))}</p>`);
+        paragraph = [];
+      }
+
+      function flushList() {
+        if (!listType) return;
+        html.push(`</${listType}>`);
+        listType = '';
+      }
+
+      function flushTable() {
+        if (!tableRows.length) return;
+        const table = tableRows.length >= 3 && isTableSeparator(tableRows[1]) ? renderMarkdownTable(tableRows) : '';
+        html.push(table || `<p>${renderInlineMarkdown(tableRows.join(' '))}</p>`);
+        tableRows = [];
+      }
+
+      for (const line of lines) {
+        if (line.trim().startsWith('```')) {
+          if (inCode) {
+            html.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`);
+            codeLines = [];
+            inCode = false;
+          } else {
+            flushParagraph();
+            flushList();
+            flushTable();
+            inCode = true;
+          }
+          continue;
+        }
+
+        if (inCode) {
+          codeLines.push(line);
+          continue;
+        }
+
+        const trimmed = line.trim();
+        if (!trimmed) {
+          flushTable();
+          flushParagraph();
+          flushList();
+          continue;
+        }
+
+        if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
+          flushParagraph();
+          flushList();
+          tableRows.push(trimmed);
+          continue;
+        }
+
+        flushTable();
+
+        const heading = trimmed.match(/^(#{1,3})\s+(.+)$/);
+        if (heading) {
+          flushParagraph();
+          flushList();
+          html.push(`<h${heading[1].length}>${renderInlineMarkdown(heading[2])}</h${heading[1].length}>`);
+          continue;
+        }
+
+        const unordered = trimmed.match(/^[-*]\s+(.+)$/);
+        const ordered = trimmed.match(/^\d+[.)]\s+(.+)$/);
+        if (unordered || ordered) {
+          flushParagraph();
+          const type = unordered ? 'ul' : 'ol';
+          if (listType && listType !== type) flushList();
+          if (!listType) {
+            listType = type;
+            html.push(`<${type}>`);
+          }
+          html.push(`<li>${renderInlineMarkdown((unordered || ordered)[1])}</li>`);
+          continue;
+        }
+
+        paragraph.push(trimmed);
+      }
+
+      if (inCode) html.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`);
+      flushTable();
+      flushParagraph();
+      flushList();
+      return html.join('\n') || '<p></p>';
+    }
+
+    function valueForCell(value) {
+      if (value === null || value === undefined) return '';
+      if (typeof value === 'object') return JSON.stringify(value);
+      return String(value);
+    }
+
+    function renderSupportingDatasets(datasets) {
+      if (!Array.isArray(datasets) || !datasets.length) {
+        datasetsEl.className = 'empty';
+        datasetsEl.textContent = '暂无数据';
+        return;
+      }
+
+      datasetsEl.className = '';
+      datasetsEl.innerHTML = datasets.map((dataset, index) => {
+        const rows = Array.isArray(dataset.rows) ? dataset.rows : [];
+        const columns = Array.isArray(dataset.columns) && dataset.columns.length
+          ? dataset.columns
+          : Array.from(rows.reduce((keys, row) => {
+              if (row && typeof row === 'object' && !Array.isArray(row)) {
+                Object.keys(row).forEach((key) => keys.add(key));
+              }
+              return keys;
+            }, new Set()));
+        const title = dataset.target_class || dataset.source_tool || `dataset_${index + 1}`;
+        const rowCount = dataset.row_count ?? rows.length;
+        const sql = dataset.sql ? `<details><summary>SQL</summary><pre><code>${escapeHtml(dataset.sql)}</code></pre></details>` : '';
+        const table = rows.length && columns.length
+          ? `<div class="table-wrap"><table><thead><tr>${columns.map((column) => `<th>${escapeHtml(column)}</th>`).join('')}</tr></thead><tbody>${rows.map((row) => `<tr>${columns.map((column) => `<td title="${escapeHtml(valueForCell(row?.[column]))}">${escapeHtml(valueForCell(row?.[column]))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`
+          : '<div class="empty">该数据集没有 rows</div>';
+
+        return `<div class="dataset-card">
+          <div class="dataset-meta">
+            <strong>${escapeHtml(title)}</strong>
+            <span>rows: ${escapeHtml(rowCount)}</span>
+            <span>dataset: ${escapeHtml(dataset.dataset_index ?? index)}</span>
+          </div>
+          ${table}
+          ${sql}
+        </div>`;
+      }).join('');
+    }
+
+    function eventDurationMs(event) {
+      if (typeof event.duration_ms === 'number') return event.duration_ms;
+      if (typeof event.duration === 'number') return event.duration * 1000;
+      if (event.final_answer && typeof event.final_answer.duration_ms === 'number') return event.final_answer.duration_ms;
+      return null;
+    }
+
+    function eventSummary(event) {
+      if (event.type === 'tools') {
+        return {
+          name: event.tool_name || 'tool',
+          description: event.description || '工具执行完成',
+          durationMs: eventDurationMs(event),
+        };
+      }
+      if (event.type === 'analysis') {
+        return {
+          name: 'analysis',
+          description: `分析过程 ${Array.isArray(event.payload) ? event.payload.length : 0} 步`,
+          durationMs: eventDurationMs(event),
+        };
+      }
+      if (event.type === 'done') {
+        return {
+          name: 'done',
+          description: '最终回答生成完成',
+          durationMs: eventDurationMs(event),
+        };
+      }
+      return {
+        name: event.type || 'event',
+        description: event.content || event.status || event.query_id || '',
+        durationMs: eventDurationMs(event),
+      };
+    }
+
+    function block(title, value) {
+      if (value === undefined || value === null || value === '') return '';
+      return `<div class="detail-block"><strong>${escapeHtml(title)}</strong><pre><code>${escapeHtml(typeof value === 'string' ? value : JSON.stringify(value, null, 2))}</code></pre></div>`;
+    }
+
+    function analysisTree(payload) {
+      if (!Array.isArray(payload) || !payload.length) return '<div class="empty">暂无分析步骤</div>';
+      return `<ul class="analysis-tree">${payload.map((item, index) => {
+        const targetClass = Array.isArray(item.target_class) ? item.target_class.join(', ') : '';
+        const reasoning = Array.isArray(item.reasoning_process) ? item.reasoning_process : [];
+        return `<li class="analysis-node">
+          <div class="analysis-node-title">${escapeHtml(index + 1)}. ${escapeHtml(item.tool_name || 'analysis')}</div>
+          <div class="analysis-node-meta">${escapeHtml(item.question || '')}${targetClass ? ` · target: ${escapeHtml(targetClass)}` : ''}</div>
+          ${reasoning.length ? `<ul>${reasoning.map((step) => `<li>${escapeHtml(step)}</li>`).join('')}</ul>` : ''}
+        </li>`;
+      }).join('')}</ul>`;
+    }
+
+    function eventDetails(event) {
+      if (event.type === 'analysis') {
+        return analysisTree(event.payload) + block('Raw event', event);
+      }
+
+      const payload = event.payload && typeof event.payload === 'object' ? event.payload : null;
+      const args = event.arguments || payload?.arguments;
+      const sql = event.sql || payload?.sql || event.final_answer?.sql;
+      const details = [
+        block('Arguments', args),
+        block('SQL', sql),
+        block('Payload', event.payload),
+        block('Final answer metadata', event.final_answer ? { ...event.final_answer, final_answer: undefined, supporting_datasets: undefined } : null),
+        block('Raw event', event),
+      ].filter(Boolean);
+      return details.join('') || '<div class="empty">无更多详情</div>';
+    }
+
+    function renderSseEventCard(event) {
+      if (eventsEl.classList.contains('empty')) {
+        eventsEl.className = '';
+        eventsEl.innerHTML = '';
+      }
+      const summary = eventSummary(event);
+      const card = document.createElement('details');
+      card.className = 'event-card';
+      card.innerHTML = `<summary>
+        <span class="event-name"><span>${escapeHtml(summary.name)}</span></span>
+        <span class="event-description">${escapeHtml(summary.description)}</span>
+        <span class="event-duration">${escapeHtml(formatDuration(summary.durationMs))}</span>
+      </summary>
+      <div class="event-body">${eventDetails(event)}</div>`;
+      eventsEl.appendChild(card);
+    }
+
+    function renderParseError(payload, error) {
+      if (eventsEl.classList.contains('empty')) {
+        eventsEl.className = '';
+        eventsEl.innerHTML = '';
+      }
+      const card = document.createElement('details');
+      card.className = 'event-card';
+      card.open = true;
+      card.innerHTML = `<summary>
+        <span class="event-name"><span>parse_error</span></span>
+        <span class="event-description">SSE 事件 JSON 解析失败</span>
+        <span class="event-duration">—</span>
+      </summary>
+      <div class="event-body">${block('Payload', payload)}${block('Error', String(error))}</div>`;
+      eventsEl.appendChild(card);
+    }
+
+    function renderEvent(event) {
+      renderSseEventCard(event);
+
+      if (event.type === 'done' && event.final_answer) {
+        const finalAnswer = event.final_answer;
+        const answerMarkdown = finalAnswer.final_answer || finalAnswer.plain_text_summary || JSON.stringify(finalAnswer, null, 2);
+        finalAnswerEl.innerHTML = markdownToHtml(answerMarkdown);
+        renderDuration(event.total_duration_ms ?? event.duration_ms);
+        renderSupportingDatasets(finalAnswer.supporting_datasets || event.supporting_datasets);
+      }
+
+      if (event.type === 'error') {
+        finalAnswerEl.innerHTML = markdownToHtml(event.content || JSON.stringify(event, null, 2));
+        setStatus('error', 'error');
+      }
+    }
+
+    function parseSseBlock(block) {
+      const dataLines = block
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trimStart());
+
+      if (!dataLines.length) return;
+      const payload = dataLines.join('\n').trim();
+      if (!payload) return;
+
+      try {
+        renderEvent(JSON.parse(payload));
+      } catch (error) {
+        renderParseError(payload, error);
+      }
+    }
+
+    async function readSseStream(response) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        buffer += chunk;
+
+        const blocks = buffer.split(/\r?\n\r?\n/);
+        buffer = blocks.pop() || '';
+        for (const block of blocks) parseSseBlock(block);
+      }
+
+      const tail = buffer + decoder.decode();
+      if (tail.trim()) parseSseBlock(tail);
+    }
+
+    function buildPayload() {
+      const sessionId = sessionIdInput.value.trim() || randomId('demo_session');
+      sessionIdInput.value = sessionId;
+      return {
+        session_id: sessionId,
+        agent_id: agentIdInput.value.trim() || 'pfizer',
+        message: messageInput.value.trim(),
+        language: languageInput.value.trim() || 'zh-CN',
+        options: { source: 'single_html_demo' },
+      };
+    }
+
+    async function sendRequest() {
+      const payload = buildPayload();
+      if (!payload.message) {
+        setStatus('message required', 'error');
+        return;
+      }
+
+      controller = new AbortController();
+      sendBtn.disabled = true;
+      stopBtn.disabled = false;
+      setStatus('running', 'running');
+      finalAnswerEl.innerHTML = '';
+      renderDuration(null);
+      renderSupportingDatasets([]);
+      eventsEl.className = 'empty';
+      eventsEl.textContent = '暂无事件';
+
+      const headers = { 'Content-Type': 'application/json', Accept: 'text/event-stream' };
+      const token = tokenInput.value.trim();
+      if (token) headers.Authorization = token.startsWith('Bearer ') ? token : `Bearer ${token}`;
+
+      try {
+        const response = await fetch(endpointInput.value.trim(), {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+          credentials: 'include',
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`HTTP ${response.status}: ${errorText}`);
+        }
+
+        await readSseStream(response);
+        setStatus('done', 'done');
+      } catch (error) {
+        if (error.name === 'AbortError') {
+          setStatus('stopped', 'error');
+        } else {
+          finalAnswerEl.innerHTML = markdownToHtml(explainNetworkFailure(error));
+          setStatus('error', 'error');
+        }
+      } finally {
+        controller = null;
+        sendBtn.disabled = false;
+        stopBtn.disabled = true;
+      }
+    }
+
+    sendBtn.addEventListener('click', sendRequest);
+    stopBtn.addEventListener('click', () => controller && controller.abort());
+    clearBtn.addEventListener('click', () => {
+      finalAnswerEl.innerHTML = '';
+      renderDuration(null);
+      renderSupportingDatasets([]);
+      eventsEl.className = 'empty';
+      eventsEl.textContent = '暂无事件';
+      setStatus('idle', '');
+    });
+
+    if (window.location.protocol === 'file:') {
+      showNotice('当前是 file:// 打开。若请求出现 net::ERR_FAILED，请在本文件目录运行 python -m http.server 3000，并访问 http://localhost:3000/chat_test_demo.html。');
+    } else if (window.location.origin === 'http://localhost:3000' || window.location.origin === 'http://127.0.0.1:3000') {
+      showNotice('当前来源已匹配后端默认 CORS 白名单，可直接请求 http://localhost:8000/api/v2/chat_test。');
+    }
+  </script>
+</body>
+</html>

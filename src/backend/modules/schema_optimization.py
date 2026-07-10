@@ -9,6 +9,7 @@ from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 from core.db.db import get_db
+from core.models.models import SchemaOptimizationRequest
 
 from core.ontology.schema_optimizer import SchemaOptimizer
 
@@ -83,12 +84,14 @@ def _to_http_error(exc: Exception):
     return HTTPException(500, str(exc))
 
 
-@router.get("/api/admin/scenarios/{scenario_id}/schema-optimization/files")
+@router.get("/api/scenarios/{scenario_id}/schema-optimization/files")
+@router.get("/api/admin/scenarios/{scenario_id}/schema-optimization/files", include_in_schema=False)
 async def api_list_optimization_files(scenario_id: str):
     return list_optimization_files(scenario_id)
 
 
-@router.post("/api/admin/scenarios/{scenario_id}/schema-optimization/files")
+@router.post("/api/scenarios/{scenario_id}/schema-optimization/files")
+@router.post("/api/admin/scenarios/{scenario_id}/schema-optimization/files", include_in_schema=False)
 async def api_upload_optimization_files(scenario_id: str, files: list[UploadFile] = File(...)):
     try:
         return await save_optimization_files(scenario_id, files)
@@ -96,7 +99,8 @@ async def api_upload_optimization_files(scenario_id: str, files: list[UploadFile
         raise _to_http_error(exc) from exc
 
 
-@router.delete("/api/admin/scenarios/{scenario_id}/schema-optimization/files/{file_id}")
+@router.delete("/api/scenarios/{scenario_id}/schema-optimization/files/{file_id}")
+@router.delete("/api/admin/scenarios/{scenario_id}/schema-optimization/files/{file_id}", include_in_schema=False)
 async def api_delete_optimization_file(scenario_id: str, file_id: str):
     try:
         return delete_optimization_file(scenario_id, file_id)
@@ -104,18 +108,23 @@ async def api_delete_optimization_file(scenario_id: str, file_id: str):
         raise _to_http_error(exc) from exc
 
 
-@router.get("/api/admin/scenarios/{scenario_id}/schema-optimization/runs")
+@router.get("/api/scenarios/{scenario_id}/schema-optimization/runs")
+@router.get("/api/admin/scenarios/{scenario_id}/schema-optimization/runs", include_in_schema=False)
 async def api_list_optimization_runs(scenario_id: str):
     return list_optimization_runs(scenario_id)
 
 
-@router.post("/api/admin/scenarios/{scenario_id}/schema-optimization/optimize")
-async def api_run_schema_optimization(scenario_id: str, background_tasks: BackgroundTasks, body: dict | None = None):
-    body = body or {}
-    file_ids = body.get("file_ids") or []
-    incremental = body.get("incremental", True)
-    target_class_ids = body.get("target_class_ids") or None
-    enable_quality_assessment = body.get("enable_quality_assessment", True)
+@router.post("/api/scenarios/{scenario_id}/schema-optimization/optimize")
+@router.post("/api/admin/scenarios/{scenario_id}/schema-optimization/optimize", include_in_schema=False)
+async def api_run_schema_optimization(
+    scenario_id: str,
+    background_tasks: BackgroundTasks,
+    request: SchemaOptimizationRequest,
+):
+    file_ids = request.file_ids
+    incremental = request.incremental
+    target_class_ids = request.target_class_ids
+    enable_quality_assessment = request.enable_quality_assessment
     try:
         run_id = create_optimization_run(scenario_id, file_ids)
     except Exception as exc:
@@ -215,7 +224,7 @@ def create_optimization_run(scenario_id: str, file_ids: list[str]) -> str:
     run_id = str(uuid.uuid4())[:8]
     conn = get_db()
     conn.execute(
-        """INSERT INTO schema_optimization_runs (id, scenario_id, file_ids, status, created_at)
+        """INSERT INTO schema_optimization_runs (id, scenario_id, file_ids, status, started_at)
            VALUES (?, ?, ?, 'running', CURRENT_TIMESTAMP)""",
         (run_id, scenario_id, json.dumps(file_ids, ensure_ascii=False)),
     )
@@ -320,7 +329,7 @@ def delete_optimization_file(scenario_id: str, file_id: str) -> dict:
 def list_optimization_runs(scenario_id: str) -> list[dict]:
     conn = get_db()
     rows = conn.execute(
-        """SELECT id, scenario_id, file_ids, status, summary, changes_json, error, created_at, finished_at
+        """SELECT id, scenario_id, file_ids, status, summary, changes_json, error, started_at, finished_at
            FROM schema_optimization_runs
            WHERE scenario_id=?
            ORDER BY created_at DESC""",
@@ -351,7 +360,8 @@ def _get_document_paths(scenario_id: str, file_ids: list[str]) -> list[str]:
     return [by_id[file_id]["file_path"] for file_id in file_ids]
 
 
-@router.get("/api/admin/scenarios/{scenario_id}/schema-optimization/stream/{run_id}")
+@router.get("/api/scenarios/{scenario_id}/schema-optimization/stream/{run_id}")
+@router.get("/api/admin/scenarios/{scenario_id}/schema-optimization/stream/{run_id}", include_in_schema=False)
 async def api_stream_schema_optimization(scenario_id: str, run_id: str):
     async def generate():
         last_status = None

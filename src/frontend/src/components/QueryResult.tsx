@@ -122,10 +122,11 @@ export default function QueryResult({ data, chartConfig, onDrilldown }: Props) {
       : [];
   const class_name = data.class_name || data.class_id || "查询结果";
   const total = typeof data.total === "number" ? data.total : rows.length;
+  const sql = typeof data.sql === "string" ? data.sql.trim() : "";
   const { aggregated, dimensions } = data;
   const displayCols = columns.slice(0, 10);
 
-  if (rows.length === 0 || columns.length === 0) {
+  if ((rows.length === 0 || columns.length === 0) && !sql) {
     return null;
   }
 
@@ -168,60 +169,73 @@ export default function QueryResult({ data, chartConfig, onDrilldown }: Props) {
       )}
 
       {/* 数据表格 */}
-      <div className="rounded-lg border border-slate-200/60 dark:border-slate-700/40 bg-white/80 dark:bg-slate-800/60 overflow-hidden">
-        <div className="flex items-center gap-2 px-4 py-2 border-b border-slate-100 dark:border-slate-700/30">
-          <span className="font-semibold text-sm" style={{ color: "var(--text-primary)" }}>
-            {aggregated ? "数据明细" : class_name}
-          </span>
-          <span className="text-xs ml-auto" style={{ color: "var(--text-muted)" }}>
-            {total} 条
-          </span>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b" style={{ borderColor: "var(--border)" }}>
-                {displayCols.map((col) => (
-                  <th key={col} className="text-left px-3 py-2 font-medium text-xs whitespace-nowrap" style={{ color: "var(--text-muted)" }}>
-                    {col}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.slice(0, 20).map((r, i) => (
-                <tr
-                  key={i}
-                  className="border-b hover:bg-slate-50/50 dark:hover:bg-slate-700/20 cursor-pointer transition-colors"
-                  style={{ borderColor: "var(--border)" }}
-                  onClick={() => {
-                    // 点击行触发下钻
-                    if (onDrilldown && dimCols.length > 0) {
-                      const dim = dimCols[0];
-                      const val = String(r[dim] ?? "");
-                      if (val) onDrilldown(dim, val);
-                    }
-                  }}
-                >
-                  {displayCols.map((col) => {
-                    const v = r[col];
-                    const isNum = typeof v === "number";
-                    return (
-                      <td
-                        key={col}
-                        className={"px-3 py-2 whitespace-nowrap text-xs " + (isNum ? "text-right font-medium" : "")}
-                        style={{ color: isNum ? "var(--warning)" : "var(--text-secondary)" }}
-                      >
-                        {isNum ? (v as number) >= 100 ? (v as number).toLocaleString() : String(v) : String(v ?? "")}
-                      </td>
-                    );
-                  })}
+      {rows.length > 0 && columns.length > 0 && (
+        <div className="rounded-lg border border-slate-200/60 dark:border-slate-700/40 bg-white/80 dark:bg-slate-800/60 overflow-hidden">
+          <div className="flex items-center gap-2 px-4 py-2 border-b border-slate-100 dark:border-slate-700/30">
+            <span className="font-semibold text-sm" style={{ color: "var(--text-primary)" }}>
+              {aggregated ? "数据明细" : class_name}
+            </span>
+            <span className="text-xs ml-auto" style={{ color: "var(--text-muted)" }}>
+              {total} 条
+            </span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b" style={{ borderColor: "var(--border)" }}>
+                  {displayCols.map((col) => (
+                    <th key={col} className="text-left px-3 py-2 font-medium text-xs whitespace-nowrap" style={{ color: "var(--text-muted)" }}>
+                      {col}
+                    </th>
+                  ))}
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {rows.slice(0, 20).map((r, i) => (
+                  <tr
+                    key={i}
+                    className="border-b hover:bg-slate-50/50 dark:hover:bg-slate-700/20 cursor-pointer transition-colors"
+                    style={{ borderColor: "var(--border)" }}
+                    onClick={() => {
+                      // 点击行触发下钻
+                      if (onDrilldown && dimCols.length > 0) {
+                        const dim = dimCols[0];
+                        const val = String(r[dim] ?? "");
+                        if (val) onDrilldown(dim, val);
+                      }
+                    }}
+                  >
+                    {displayCols.map((col) => {
+                      const v = r[col];
+                      const isNum = typeof v === "number";
+                      return (
+                        <td
+                          key={col}
+                          className={"px-3 py-2 whitespace-nowrap text-xs " + (isNum ? "text-right font-medium" : "")}
+                          style={{ color: isNum ? "var(--warning)" : "var(--text-secondary)" }}
+                        >
+                          {isNum ? (v as number) >= 100 ? (v as number).toLocaleString() : String(v) : String(v ?? "")}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
-      </div>
+      )}
+
+      {sql && (
+        <details className="rounded-lg border border-slate-200/60 bg-slate-950 text-slate-100 dark:border-slate-700/40">
+          <summary className="cursor-pointer select-none px-4 py-2 text-xs font-medium text-slate-300 hover:text-white">
+            查看最终执行 SQL
+          </summary>
+          <pre className="max-h-64 overflow-auto border-t border-slate-700 px-4 py-3 text-xs leading-relaxed whitespace-pre-wrap break-words">
+            <code>{sql}</code>
+          </pre>
+        </details>
+      )}
     </div>
   );
 }
