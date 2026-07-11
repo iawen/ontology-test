@@ -46,7 +46,7 @@ function normalizeQueryResult(value: any): QueryResultData | undefined {
 
 function normalizeAnswerDatasets(value: any): AnswerDataset[] {
   if (!Array.isArray(value)) return [];
-  return value
+  const datasets = value
     .map((item, index) => {
       const data = normalizeQueryResult(item?.data || item?.result || item);
       if (!data) return undefined;
@@ -62,6 +62,22 @@ function normalizeAnswerDatasets(value: any): AnswerDataset[] {
       } satisfies AnswerDataset;
     })
     .filter(Boolean) as AnswerDataset[];
+
+  // SSE/persisted payloads can contain the same completed query more than once.
+  // Preserve distinct Plan-Execute evidence, but collapse byte-for-byte duplicate
+  // datasets so the answer does not repeat identical charts and tables.
+  const seen = new Set<string>();
+  return datasets.filter((dataset) => {
+    const signature = JSON.stringify({
+      targetClass: dataset.data.class_id,
+      columns: dataset.data.columns,
+      rows: dataset.data.rows,
+      sql: dataset.data.sql || "",
+    });
+    if (seen.has(signature)) return false;
+    seen.add(signature);
+    return true;
+  });
 }
 
 function parseSseEvent(raw: string): any {
@@ -478,6 +494,17 @@ function AppContent() {
                 break;
 
               case "tools": {
+                if (event.step && typeof event.step === "object") {
+                  currentSteps = [...currentSteps, event.step as ToolStep];
+                  setMessages((prev) =>
+                    prev.map((m) =>
+                      m.id === aiMsgId
+                        ? { ...m, steps: [...currentSteps], isLoading: false }
+                        : m,
+                    ),
+                  );
+                  break;
+                }
                 const result = parseToolPayload(event.payload);
                 const startedAt = parseEventTimestamp(event.begin_time);
                 const durationMs = Math.round(Number(event.duration || 0) * 1000);
@@ -544,6 +571,9 @@ function AppContent() {
                 break;
 
               case "done":
+                if (Array.isArray(event.steps)) {
+                  currentSteps = event.steps as ToolStep[];
+                }
                 const finalAnswer = event.final_answer || {};
                 const finalAnswerContent =
                   typeof finalAnswer === "string"
@@ -639,19 +669,24 @@ function AppContent() {
 
           {msg.isLoading && !msg.content && (!msg.steps || msg.steps.length === 0) && (
             <div 
-              className="flex items-center gap-3 px-3 py-2.5 rounded-lg border max-w-sm text-xs shadow-sm"
-              style={{
-                borderColor: "var(--border)",
-                background: "var(--bg-card)",
-                color: "var(--text-muted)"
-              }}
+              className="flex w-full max-w-md items-center gap-3 rounded-xl border border-indigo-200 bg-gradient-to-br from-indigo-50 via-white to-slate-50 px-4 py-3 shadow-sm dark:border-indigo-400/35 dark:from-indigo-500/25 dark:via-slate-900 dark:to-slate-950 dark:shadow-indigo-950/30"
             >
-              <div className="flex gap-1">
-                <span className="typing-dot"></span>
-                <span className="typing-dot"></span>
-                <span className="typing-dot"></span>
+              <div className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-indigo-700 dark:bg-indigo-400/25 dark:text-indigo-100">
+                <span className="absolute inset-0 animate-ping rounded-full bg-indigo-400/30 dark:bg-indigo-300/25" />
+                <svg className="relative h-4 w-4 animate-pulse" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M12 3v3m0 12v3M4.22 4.22l2.12 2.12m11.32 11.32 2.12 2.12M3 12h3m12 0h3M4.22 19.78l2.12-2.12M17.66 6.34l2.12-2.12" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                  <circle cx="12" cy="12" r="3.2" stroke="currentColor" strokeWidth="1.8" />
+                </svg>
               </div>
-              <span>正在分析问题并准备上下文...</span>
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-slate-800 dark:text-white">正在理解你的问题</div>
+                <div className="mt-0.5 text-xs font-medium text-slate-600 dark:text-indigo-100">正在匹配业务术语并准备分析上下文</div>
+              </div>
+              <div className="ml-auto flex shrink-0 gap-1.5 pt-4" aria-label="处理中">
+                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-indigo-500 dark:bg-indigo-200 [animation-delay:-0.3s]" />
+                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-indigo-500 dark:bg-indigo-200 [animation-delay:-0.15s]" />
+                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-indigo-500 dark:bg-indigo-200" />
+              </div>
             </div>
           )}
 

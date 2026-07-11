@@ -60,7 +60,13 @@ class OntologyAgent:
             feedback,
             session_id,
         )
-        return self.validate_query_plan(payload, query_scope, ontology_engine, query_engine)
+        return self.validate_query_plan(
+            payload,
+            query_scope,
+            metric_candidates,
+            ontology_engine,
+            query_engine,
+        )
 
     async def _request_planning_json(self, stage: str, instruction: str, feedback: str, session_id: str) -> dict:
         if self.client is None:
@@ -128,7 +134,7 @@ class OntologyAgent:
         return {"valid": True, "target_class": target_class, "join_classes": join_classes, "join_paths": join_paths}
 
     @staticmethod
-    def validate_query_plan(payload: dict, scope: dict, engine, query_engine) -> dict:
+    def validate_query_plan(payload: dict, scope: dict, metric_candidates: list[str], engine, query_engine) -> dict:
         target_class = str(scope.get("target_class") or "")
         query_mode = str(payload.get("query_mode") or "aggregate").lower()
         if query_mode not in {"aggregate", "detail"}:
@@ -147,9 +153,90 @@ class OntologyAgent:
         if not all(isinstance(item, dict) and item.get("field") and item.get("operator") for item in all_conditions):
             return {"valid": False, "error": "filters 和 having 每项都必须包含 field、operator"}
 
+        available_metrics = OntologyAgent._target_class_metrics(scope, engine, metric_candidates)
+        available_metric_ids = {str(metric.get("id") or "") for metric in available_metrics}
         join_classes = list(scope.get("join_classes") or [])
         join_paths = dict(scope.get("join_paths") or {})
         allowed_classes = [target_class, *join_classes]
+
+        def is_scope_field(field_name: str) -> bool:
+            return any(field_name in engine.get_field_map(class_id) for class_id in allowed_classes)
+
+        def infer_metric_from_field(field_name: str) -> dict | None:
+            field_map = engine.get_field_map(target_class)
+            physical_field = field_map.get(field_name, field_name)
+            if physical_field not in field_map.values():
+                return None
+            pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(physical_field)}(?![A-Za-z0-9_])", re.IGNORECASE)
+            matched_metrics = [
+                metric
+                for metric in available_metrics
+                if pattern.search(str(metric.get("formula") or ""))
+                or pattern.search(str(metric.get("calculation") or ""))
+            ]
+            return matched_metrics[0] if len(matched_metrics) == 1 else None
+
+        def validate_candidate_metric(metric_name: str, source: str) -> tuple[dict | None, str]:
+            metric_info = engine.get_metric_info(metric_name)
+            if metric_info and str(metric_info.get("id") or "") in available_metric_ids:
+                return None, metric_name
+            inferred_metric = infer_metric_from_field(metric_name)
+            if inferred_metric:
+                resolved_metric = str(inferred_metric.get("id") or inferred_metric.get("name") or metric_name)
+                logger.info(
+                    "Query metric inferred from Class field: target_class=%s source=%s field=%s metric=%s",
+                    target_class,
+                    source,
+                    metric_name,
+                    resolved_metric,
+                )
+                return None, resolved_metric
+            if not metric_info:
+                return {
+                    "valid": False,
+                    "error": f"{source} 必须从当前 Class 的 Metrics 列表中选择，且字段无法反推唯一 Metric：{metric_name}",
+                }, metric_name
+            return {
+                "valid": False,
+                "error": f"{source} 不属于当前 Class 的 Metrics 列表：{metric_name}",
+            }, metric_name
+
+        resolved_metrics = []
+        for metric in metrics:
+            error, resolved_metric = validate_candidate_metric(metric, "metrics")
+            if error:
+                return error
+            resolved_metrics.append(resolved_metric)
+        metrics = resolved_metrics
+        for item in having:
+            field = str(item.get("field") or "").strip()
+            error, resolved_metric = validate_candidate_metric(field, "having.field")
+            if error:
+                logger.warning(
+                    "Preserving invalid HAVING metric for downstream handling: target_class=%s field=%s error=%s",
+                    target_class,
+                    field,
+                    error["error"],
+                )
+                continue
+            item["field"] = resolved_metric
+
+        for field in dimensions:
+            if not is_scope_field(field):
+                logger.warning(
+                    "Preserving invalid dimension field for downstream handling: target_class=%s field=%s",
+                    target_class,
+                    field,
+                )
+
+        for item in filters:
+            field = str(item.get("field") or "").strip()
+            if engine.get_metric_info(field) or not is_scope_field(field):
+                logger.warning(
+                    "Preserving invalid filter field for downstream handling: target_class=%s field=%s",
+                    target_class,
+                    field,
+                )
 
         def add_dependency(class_id: str, source: str) -> str | None:
             if not class_id or class_id == target_class or class_id in allowed_classes:
@@ -162,10 +249,6 @@ class OntologyAgent:
             join_paths[class_id] = path
             return None
 
-        for item in filters:
-            if engine.get_metric_info(str(item.get("field") or "")):
-                return {"valid": False, "error": f"指标条件必须放入 having：{item['field']}"}
-
         for metric in metrics:
             metric_info = engine.get_metric_info(metric)
             if metric_info:
@@ -174,26 +257,6 @@ class OntologyAgent:
                         return {"valid": False, "error": error}
             elif not any(query_engine.field_available_in_class(class_id, metric) for class_id in allowed_classes):
                 return {"valid": False, "error": f"指标或字段不存在于当前 Schema Scope：{metric}"}
-
-        sources = (("维度", dimensions, False), ("过滤字段", filters, False), ("HAVING", having, True))
-        for source, items, is_metric in sources:
-            for item in items:
-                field = str(item.get("field") if isinstance(item, dict) else item).strip()
-                metric_info = engine.get_metric_info(field)
-                if metric_info and (is_metric or source == "维度"):
-                    for class_id in metric_target_classes(metric_info):
-                        if error := add_dependency(class_id, f"{source} {field}"):
-                            return {"valid": False, "error": error}
-                    continue
-                candidates = [
-                    class_id for class_id in allowed_classes if query_engine.field_available_in_class(class_id, field)
-                ]
-                if not candidates:
-                    external = query_engine.candidate_field_classes(field, target_class)
-                    if not external:
-                        return {"valid": False, "error": f"{source} 不存在：{field}"}
-                    if error := add_dependency(external[0], f"{source} {field}"):
-                        return {"valid": False, "error": error}
 
         return {
             "valid": True,
@@ -216,29 +279,47 @@ class OntologyAgent:
                 continue
             info = engine.get_class_info(class_id)
             field_types = engine.get_field_types(class_id)
-            fields = [f"{name}({field_types.get(name, 'text')})" for name in engine.get_field_map(class_id)]
+            fields = [
+                f"{logical}(表字段={physical}; {field_types.get(logical, 'text')})"
+                for logical, physical in engine.get_field_map(class_id).items()
+            ]
             class_blocks.append(
                 f"- {class_id}: {info.get('name_cn', '')}\n"
                 f"  说明: {info.get('description', '')}\n"
                 f"  字段: {', '.join(fields[:80])}"
             )
         metric_blocks = []
-        scope_set = {class_id for class_id in scope_classes if class_id}
-        metrics = engine.list_metrics()
-        metric_by_id = {str(metric.get("id") or ""): metric for metric in metrics}
-        candidate_metrics = [
-            metric_by_id[metric_id] for metric_id in metric_candidates or [] if metric_id in metric_by_id
+        target_metrics = OntologyAgent._target_class_metrics(scope, engine, metric_candidates or [])
+        for metric in target_metrics:
+            metric_blocks.append(
+                f"- {metric.get('name') or metric.get('id')}: id={metric.get('id', '')}; "
+                f"formula={metric.get('formula') or metric.get('calculation', '')}; "
+                f"description={metric.get('description', '')}"
+            )
+        logger.info(
+            "Query detail scope context built: target_class=%s class_count=%d metric_count=%d",
+            scope.get("target_class"),
+            len(class_blocks),
+            len(target_metrics),
+        )
+        return (
+            "## Class\n"
+            + "\n".join(class_blocks)
+            + "\n\n## Metrics（当前 target_class 可用指标；metrics/having.field 只能从此列表选择）\n"
+            + "\n".join(metric_blocks or ["（当前 target_class 未配置可用 Metric）"])
+        )
+
+    @staticmethod
+    def _target_class_metrics(scope: dict, engine, preferred_metric_ids: list[str]) -> list[dict]:
+        """Return every Metric owned by target_class, ordering retrieval candidates first."""
+        target_class = str(scope.get("target_class") or "")
+        preferred = {str(metric_id) for metric_id in preferred_metric_ids}
+        metrics = [
+            metric
+            for metric in engine.list_metrics()
+            if target_class in metric_target_classes(metric)
         ]
-        scoped_candidates = [metric for metric in candidate_metrics if set(metric_target_classes(metric)) & scope_set]
-        for metric in scoped_candidates:
-            metric_classes = set(metric_target_classes(metric))
-            if metric_classes & scope_set:
-                metric_blocks.append(
-                    f"- {metric.get('name') or metric.get('id')}: target={','.join(metric_classes)}; "
-                    f"formula={metric.get('formula') or metric.get('calculation', '')}; "
-                    f"description={metric.get('description', '')}"
-                )
-        return "## Class\n" + "\n".join(class_blocks) + "\n\n## Metrics\n" + "\n".join(metric_blocks[:120])
+        return sorted(metrics, key=lambda metric: 0 if str(metric.get("id") or "") in preferred else 1)
 
     @staticmethod
     def _json_dumps(value) -> str:

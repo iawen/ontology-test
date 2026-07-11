@@ -18,6 +18,7 @@ class State(StrEnum):
 
     INIT = "init"
     CONTEXT_PREP = "context_prep"
+    METRIC_PLAN_EXECUTE = "metric_plan_execute"
     SCHEMA_PLAN = "schema_plan"
     QUERY_PLAN = "query_plan"
     LLM_CALL = "llm_call"
@@ -80,6 +81,16 @@ class AgentState:
     planned_query_args: dict | None = None
     query_executed: bool = False
 
+    # Metrics Plan-Execute：复杂指标问题的受控多证据执行账本
+    execution_mode: str = "single_query"
+    metric_plan: dict = field(default_factory=dict)
+    metric_plan_phase: str = ""
+    metric_plan_iteration: int = 0
+    metric_subquestions: list[dict] = field(default_factory=list)
+    metric_plan_judgments: list[dict] = field(default_factory=list)
+    metric_plan_terminal_reason: str = ""
+    metric_query_attempts: int = 0
+
     # 工具执行
     pending_tool_calls: list[ChatCompletionMessageToolCall] = field(default_factory=list)  # LLM 返回的 tool_calls
     tool_call_records: list[ToolCallRecord] = field(default_factory=list)
@@ -118,6 +129,12 @@ class AgentState:
             "query_plan": self.query_plan,
             "scope_validation": self.scope_validation,
             "plan_validation": self.plan_validation,
+            "execution_mode": self.execution_mode,
+            "metric_plan_iteration": self.metric_plan_iteration,
+            "metric_plan_phase": self.metric_plan_phase,
+            "metric_subquestions_count": len(self.metric_subquestions),
+            "metric_query_attempts": self.metric_query_attempts,
+            "metric_plan_terminal_reason": self.metric_plan_terminal_reason,
             "transition_log": self.transition_log,
             "error": self.error,
         }

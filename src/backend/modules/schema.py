@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 from configs.global_config import Cfg
 from core.db.db import get_db
 from core.models.models import SchemaClassEdit, SchemaRelationEdit
+from tools.logger import logger
 
 
 router = APIRouter()
@@ -155,27 +156,101 @@ async def admin_create_class(scenario_id: str, req: SchemaClassEdit):
 @router.put("/api/scenarios/{scenario_id}/schema/classes/{class_id}")
 @router.put("/api/admin/scenarios/{scenario_id}/schema/classes/{class_id}", include_in_schema=False)
 async def admin_update_class(scenario_id: str, class_id: str, req: SchemaClassEdit):
-    """管理面板：更新 Schema 类"""
+    """管理面板：更新 Schema 类；ID 变更时原子同步其引用。"""
     conn = get_db()
     fields = _normalize_fields(req.fields)
     properties = req.properties or _field_names(fields)
     review_status = _review_status(req.review_status, req.is_reviewed)
-    conn.execute(
-        """UPDATE schema_classes
-                  SET name_cn=?, description=?, properties=?, fields=?, csv_file=?, primary_key=?, is_reviewed=?, review_status=?, updated_at=CURRENT_TIMESTAMP
-           WHERE id=? AND scenario_id=?""",
-        (req.name_cn, req.description,
-         json.dumps(properties, ensure_ascii=False),
-         json.dumps(fields, ensure_ascii=False),
-            req.csv_file, req.primary_key, _is_reviewed_status(review_status), review_status,
-         class_id, scenario_id),
-    )
-    conn.commit()
-    conn.close()
+    new_class_id = req.id.strip()
+    if not new_class_id:
+        conn.close()
+        raise HTTPException(400, "类 ID 不能为空")
+    try:
+        current = conn.execute(
+            "SELECT id FROM schema_classes WHERE id=? AND scenario_id=?",
+            (class_id, scenario_id),
+        ).fetchone()
+        if current is None:
+            raise HTTPException(404, "待更新的类不存在")
+        if new_class_id != class_id:
+            duplicate = conn.execute(
+                "SELECT id FROM schema_classes WHERE id=? AND scenario_id=?",
+                (new_class_id, scenario_id),
+            ).fetchone()
+            if duplicate is not None:
+                raise HTTPException(400, f"类 ID 已存在：{new_class_id}")
+
+        conn.execute(
+            """UPDATE schema_classes
+                      SET id=?, name_cn=?, description=?, properties=?, fields=?, csv_file=?, primary_key=?, is_reviewed=?, review_status=?, updated_at=CURRENT_TIMESTAMP
+               WHERE id=? AND scenario_id=?""",
+            (new_class_id, req.name_cn, req.description,
+             json.dumps(properties, ensure_ascii=False),
+             json.dumps(fields, ensure_ascii=False),
+             req.csv_file, req.primary_key, _is_reviewed_status(review_status), review_status,
+             class_id, scenario_id),
+        )
+        if new_class_id != class_id:
+            conn.execute(
+                "UPDATE schema_relationships SET source=?, updated_at=CURRENT_TIMESTAMP WHERE scenario_id=? AND source=?",
+                (new_class_id, scenario_id, class_id),
+            )
+            conn.execute(
+                "UPDATE schema_relationships SET target=?, updated_at=CURRENT_TIMESTAMP WHERE scenario_id=? AND target=?",
+                (new_class_id, scenario_id, class_id),
+            )
+            _rename_metric_class_references(conn, scenario_id, class_id, new_class_id)
+            conn.execute(
+                "UPDATE concepts SET related_class=?, updated_at=CURRENT_TIMESTAMP WHERE scenario_id=? AND related_class=?",
+                (new_class_id, scenario_id, class_id),
+            )
+            conn.execute(
+                "UPDATE alert_rules SET target_class=? WHERE scenario_id=? AND target_class=?",
+                (new_class_id, scenario_id, class_id),
+            )
+            logger.info(
+                "Schema class renamed: scenario_id=%s old_id=%s new_id=%s; synchronized relationships, metrics, concepts, and alert rules",
+                scenario_id,
+                class_id,
+                new_class_id,
+            )
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(400, f"更新失败: {exc}")
+    finally:
+        conn.close()
 
     # 同步到 schema.json 文件
     _sync_schema_files(scenario_id)
-    return {"status": "ok"}
+    return {"status": "ok", "id": new_class_id, "renamed": new_class_id != class_id}
+
+
+def _rename_metric_class_references(conn, scenario_id: str, old_class_id: str, new_class_id: str) -> None:
+    """Replace exact class IDs in both legacy target_class and multi-class target_classes fields."""
+    metric_rows = conn.execute(
+        "SELECT id, target_class, target_classes FROM metrics WHERE scenario_id=?",
+        (scenario_id,),
+    ).fetchall()
+    for row in metric_rows:
+        metric = dict(row)
+        target_classes = _json_list(metric.get("target_classes"))
+        if not target_classes and metric.get("target_class"):
+            target_classes = [metric["target_class"]]
+        renamed_classes = [new_class_id if value == old_class_id else value for value in target_classes]
+        renamed_classes = list(dict.fromkeys(renamed_classes))
+        target_class = new_class_id if metric.get("target_class") == old_class_id else metric.get("target_class", "")
+        if renamed_classes:
+            target_class = renamed_classes[0]
+        if renamed_classes != target_classes or target_class != metric.get("target_class", ""):
+            conn.execute(
+                """UPDATE metrics SET target_class=?, target_classes=?, updated_at=CURRENT_TIMESTAMP
+                   WHERE id=? AND scenario_id=?""",
+                (target_class, json.dumps(renamed_classes, ensure_ascii=False), metric["id"], scenario_id),
+            )
 
 
 @router.delete("/api/scenarios/{scenario_id}/schema/classes/{class_id}")

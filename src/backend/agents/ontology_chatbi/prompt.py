@@ -26,7 +26,16 @@ from core.db.db import get_db
 from core.ontology.ontology_engine import OntologyEngine
 from core.ontology.data_query import DataQueryEngine
 
-__COMMON_KG = """"""
+__COMMON_KG = """AP：A special notation of months. Coding rule is 1-month rolling.
+For example, 2025AP01 means Dec 2024, 2025AP02 means Jan 2025, so on and so forth.
+
+Quarter：业务季度字段是 quarter_cd，格式为 "YYYYQn"，如：2026Q1、2026Q2。
+当用户明确说 2026Q1、Q1/Q2/Q3/Q4、第一季度、二季度等季度表达时，必须优先使用 quarter_cd 过滤，
+例如 {{"field": "quarter_cd", "operator": "=", "value": "2026Q1"}}。
+若用户只说 Q1/Q2/Q3/Q4 或“一季度”且没有给年份，默认结合今天日期推断为当前年份的季度。
+不要把季度表达拆成 apmonth 的 IN/BETWEEN，除非用户明确要求按月展开或逐月分析。
+apmonth 只用于用户明确说 AP 月、月份、月度区间、2026AP03 这类 AP 月编码时。
+AP 月份和季度按 AP 编码自然分组：AP01-AP03=Q1，AP04-AP06=Q2，AP07-AP09=Q3，AP10-AP12=Q4。"""
 
 FINAL_ANSWER_PROMPT = f"""你是一个严谨、简洁的数据分析答复生成器。只基于用户问题和已给数据作答。
 今天是{datetime.now().strftime("%Y年%m月%d日")}。
@@ -43,6 +52,44 @@ FINAL_ANSWER_PROMPT = f"""你是一个严谨、简洁的数据分析答复生成
 
 
 ONTOLOGY_PLANNING_SYSTEM_PROMPT = "严格只输出一个 JSON 对象，不要 Markdown 或解释。"
+
+
+def get_query_mode_routing_prompt(
+        user_message: str,
+        schema_context: str,
+        metric_context: str,
+        glossary_matches: str,
+) -> str:
+        """Build a constrained semantic router prompt for single-query versus Plan-Execute."""
+        return f"""你是企业数据查询路由器。判断用户问题能否由一条受控聚合查询完整回答，还是必须拆为多份独立数据证据。
+不得输出 SQL、字段名、表名、class ID、metric ID、公式或查询参数。
+
+用户问题：{user_message}
+
+术语匹配：
+{glossary_matches}
+
+相关 Schema 摘要：
+{schema_context}
+
+候选 Metric 摘要：
+{metric_context}
+
+只输出 JSON：
+{{
+    "mode":"single_query | plan_execute",
+    "reason":"简短业务原因",
+    "single_query_sufficient":true,
+    "required_evidence":["回答问题必须获得的一项独立业务证据"],
+    "confidence":"high | medium | low"
+}}
+
+规则：
+1. 判定标准是“单条受控查询能否覆盖全部必要业务证据”，不是问题字面长度或是否含特定关键词。
+2. 仅需同一业务对象、同一指标口径和可在同一聚合结果中获得的维度/筛选/对比时，mode=single_query 且 single_query_sufficient=true。
+3. 只有确实需要至少两项互补、不可由同一查询安全覆盖的独立证据时，mode=plan_execute 且 single_query_sufficient=false，并列出至少两项不重复的 required_evidence。
+4. 对于“同比、环比、对比、变化”等问题，必须列出当前期间和对比期间两项业务证据，并选择 plan_execute；由执行引擎分别验证，避免遗漏对比期间或口径不一致。
+5. 原因、归因、诊断、驱动、构成等问题如果需要分别验证多项业务证据，才选择 plan_execute。"""
 
 
 def get_schema_scope_planning_prompt(user_message: str, schema_context: str, glossary_matches: str) -> str:
@@ -84,8 +131,87 @@ def get_query_details_planning_prompt(user_message: str, scope_context: str) -> 
   "order_by":"逻辑字段名 DESC 或空字符串"
 }}
 
-规则：聚合指标条件只能放 having；filters 只能放明细字段。除非用户明确要求明细，
+规则：
+1. metrics 和 having.field 只能从上方 “Metrics（当前 target_class 可用指标）” 列表中选择指标逻辑名或 id；绝不能把 “Class” 中的字段名填入 metrics 或 having.field。
+2. dimensions、filters.field、order_by 只能使用 “Class” 中的逻辑字段名。Class 字段展示为“逻辑字段名(表字段=物理列名; 类型)”，JSON 中必须填逻辑字段名，不能填写表字段/物理列名。
+3. 聚合指标条件只能放 having；filters 只能放明细字段。除非用户明确要求明细，
 query_mode 必须是 aggregate 且至少选择一个 metrics 或 dimensions。"""
+
+
+def get_metric_plan_prompt(
+        user_message: str,
+        glossary_matches: str,
+        metric_context: str,
+        iteration: int = 0,
+        evidence_gap: str = "",
+) -> str:
+        """Build a business-evidence-only decomposition prompt for complex metric questions."""
+        gap_instruction = f"\n当前证据缺口：{evidence_gap}\n" if evidence_gap else ""
+        return f"""你是企业指标分析的计划器。把复杂问题拆为少量、互补的数据证据子问题。
+你必须严格使用术语匹配中的标准业务口径，避免把企业内部术语扩展为无关概念。
+不得输出 SQL、表名、字段名、class ID、metric ID、公式、JOIN 或查询参数；这些由后续受控规划器处理。
+
+原始用户问题：{user_message}
+
+企业术语匹配（优先遵循其中的 standard_name 和 description）：
+{glossary_matches}
+
+相关候选指标摘要：
+{metric_context}
+
+当前迭代：{iteration}
+{gap_instruction}
+只输出 JSON：
+{{
+    "objective":"本轮要回答的业务目标",
+    "coverage_requirements":["最终回答必须具备的证据"],
+    "subquestions":[
+        {{"id":"sq-简短唯一标识","intent":"自然语言业务子问题","expected_evidence":"该问题补充的证据","priority":1}}
+    ]
+}}
+
+规则：
+1. 最多 3 个子问题，按 priority 从小到大排序。
+2. 每个子问题只问一个清晰、可查询的业务事实，必须服务于原始问题。
+3. 子问题必须与术语匹配和候选指标口径一致；术语不支持的推测不要扩展。
+4. 子问题之间不可重复。"""
+
+
+def get_metric_evidence_judge_prompt(
+        user_message: str,
+        metric_plan: str,
+        evidence_packet: str,
+        iteration: int,
+        can_expand: bool,
+) -> str:
+        """Build a bounded evidence sufficiency decision prompt."""
+        return f"""你是企业指标分析的证据充分性审核器。只基于已提供的计划与证据判断能否回答，不能编造数据。
+不得输出 SQL、表名、字段名、class ID、metric ID、公式、JOIN 或查询参数。
+
+用户问题：{user_message}
+
+计划：
+{metric_plan}
+
+已获得证据：
+{evidence_packet}
+
+当前迭代：{iteration}；是否允许追加一轮：{str(can_expand).lower()}
+
+只输出 JSON：
+{{
+    "decision":"sufficient | add | limited",
+    "coverage":[{{"requirement":"计划中的证据要求","status":"covered | missing","evidence_ids":["sq-id"]}}],
+    "missing_evidence":["尚未覆盖的业务证据"],
+    "additional_subquestions":[{{"id":"sq-简短唯一标识","intent":"自然语言业务子问题","expected_evidence":"补充的证据","priority":1}}],
+    "limitation":"数据不足或无法安全补齐时的说明"
+}}
+
+规则：
+1. 已足够回答时 decision=sufficient，additional_subquestions 必须为空。
+2. 只有确有明确且可查询的缺口，且允许追加时才 decision=add；最多 2 个追加子问题。
+3. 追加子问题只能是自然语言业务问题，必须直接对应 missing_evidence，不能与已有证据重复。
+4. 不允许追加或无法安全补齐时 decision=limited，并明确 limitation。"""
 
 
 def get_ontology_planning_feedback_prompt(feedback: str) -> str:
@@ -127,6 +253,8 @@ def _build_ontology_context(engine: OntologyEngine, scenario_id: str) -> str:
 
     return f"""
 # 本体知识库（Ontology）
+
+{__COMMON_KG}
 
 ## 一、Data + Logic（数据层与指标层）— 实体、字段与实体内指标
 

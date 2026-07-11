@@ -11,6 +11,7 @@ from agents.ontology_chatbi.constants import (
 from agents.ontology_chatbi.helper import metric_target_classes
 from tools.logger import logger
 from core.llm.chat_model import get_async_client, get_model_name
+from agents.ontology_chatbi.helper import ap_month_to_quarter, current_quarter_ap_months, valid_ap_month
 
 # ============================================================
 # 实体消歧 Agent
@@ -453,6 +454,14 @@ class EntityDisambiguatorAgent:
         value = item.get("value")
         if isinstance(value, str):
             return cls._normalize_quarter_value(value)
+        if operator == "IN" and isinstance(value, list):
+            return cls._quarter_from_ap_month_values(value)
+        if operator == "BETWEEN" and isinstance(value, list) and len(value) == 2:
+            start, end = [str(item).strip().upper() for item in value]
+            if valid_ap_month(start) and valid_ap_month(end):
+                quarter_months = current_quarter_ap_months(start)
+                if [start, end] == [quarter_months[0], quarter_months[-1]]:
+                    return cls._quarter_from_ap_month_values(quarter_months)
         return ""
 
     @staticmethod
@@ -895,3 +904,14 @@ class EntityDisambiguatorAgent:
             seen.add(item)
             result.append(item)
         return result
+
+    @staticmethod
+    def _quarter_from_ap_month_values(values: list) -> str:
+        months = [str(value).strip().upper() for value in values]
+        if len(months) != 3 or any(not valid_ap_month(month) for month in months):
+            return ""
+        quarter = ap_month_to_quarter(months[0])
+        expected_months = current_quarter_ap_months(months[0])
+        if sorted(months) == sorted(expected_months) and all(ap_month_to_quarter(month) == quarter for month in months):
+            return quarter
+        return ""

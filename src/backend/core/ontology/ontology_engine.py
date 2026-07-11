@@ -39,7 +39,65 @@ class OntologyEngine:
                 self.relationships = self._normalize_relationships(
                     self.mapping.get("relationships", [])
                 )
-        self.metrics = self.schema.get("metrics", [])
+        class_statuses = {
+            str(schema_class.get("id") or ""): self._review_status(schema_class)
+            for schema_class in self.schema.get("classes", [])
+        }
+        rejected_class_ids = {
+            class_id for class_id, review_status in class_statuses.items() if review_status == "rejected"
+        }
+        self.classes = {
+            class_id: class_info
+            for class_id, class_info in self.classes.items()
+            if class_id not in rejected_class_ids
+        }
+        self.relationships = [
+            relationship
+            for relationship in self.relationships
+            if relationship.get("source") not in rejected_class_ids
+            and relationship.get("target") not in rejected_class_ids
+        ]
+        self.metrics = [
+            metric
+            for metric in self.schema.get("metrics", [])
+            if self._metric_is_available(metric, class_statuses)
+        ]
+
+    @staticmethod
+    def _review_status(item: dict) -> str:
+        """Normalize current and legacy review fields without depending on API modules."""
+        review_status = str(item.get("review_status") or "").lower()
+        is_reviewed = item.get("is_reviewed", 0)
+        if review_status == "rejected" or is_reviewed == -1 or str(is_reviewed).lower() == "rejected":
+            return "rejected"
+        if review_status == "approved" or is_reviewed == 1 or str(is_reviewed).lower() in {"true", "yes", "y"}:
+            return "approved"
+        return "pending"
+
+    @staticmethod
+    def _metric_target_classes(metric: dict) -> list[str]:
+        """Read target_classes with backward-compatible scalar fallbacks."""
+        raw_targets = metric.get("target_classes")
+        if isinstance(raw_targets, str):
+            try:
+                raw_targets = json.loads(raw_targets)
+            except json.JSONDecodeError:
+                raw_targets = []
+        if not isinstance(raw_targets, list):
+            raw_targets = []
+        if not raw_targets:
+            raw_targets = [metric.get("target_class") or metric.get("class_id")]
+        return list(dict.fromkeys(str(target).strip() for target in raw_targets if str(target or "").strip()))
+
+    @classmethod
+    def _metric_is_available(cls, metric: dict, class_statuses: dict[str, str]) -> bool:
+        """Keep pending/approved Metrics unless the Metric itself or a target Class is rejected."""
+        if cls._review_status(metric) == "rejected":
+            return False
+        target_classes = cls._metric_target_classes(metric)
+        return bool(target_classes) and all(
+            class_statuses.get(class_id) != "rejected" for class_id in target_classes
+        )
 
     # ──────────────────────────────────────────────────────────
     # 关系规范化：兼容旧版 join_key，升级为 source_key/target_key
@@ -215,7 +273,11 @@ class OntologyEngine:
     # 列表查询
     # ──────────────────────────────────────────────────────────
     def list_classes(self) -> list:
-        return self.schema.get("classes", [])
+        return [
+            schema_class
+            for schema_class in self.schema.get("classes", [])
+            if self._review_status(schema_class) != "rejected"
+        ]
 
     def list_metrics(self) -> list:
         return self.metrics

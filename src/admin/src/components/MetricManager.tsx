@@ -120,6 +120,8 @@ export default function MetricManager() {
   const [requiredDimensionText, setRequiredDimensionText] = useState("");
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [selectedMetricIds, setSelectedMetricIds] = useState<string[]>([]);
+  const [isBatchDeleteOpen, setIsBatchDeleteOpen] = useState(false);
   const [sort, setSort] = useState<{
     key: SortKey;
     direction: SortDirection;
@@ -172,6 +174,7 @@ export default function MetricManager() {
 
   useEffect(() => {
     if (activeScenario) {
+      setSelectedMetricIds([]);
       load();
       loadSchemaClasses();
     }
@@ -227,6 +230,34 @@ export default function MetricManager() {
     }
   };
 
+  const toggleMetricSelection = (id: string) => {
+    setSelectedMetricIds((current) =>
+      current.includes(id)
+        ? current.filter((selectedId) => selectedId !== id)
+        : [...current, id],
+    );
+  };
+
+  const removeSelected = async () => {
+    if (!selectedMetricIds.length) return;
+    try {
+      const result = await api(
+        `/api/scenarios/${activeScenario}/metrics/batch-delete`,
+        {
+          method: "POST",
+          body: JSON.stringify({ ids: selectedMetricIds }),
+        },
+      );
+      addToast("success", `已删除 ${result?.deleted ?? selectedMetricIds.length} 个指标`);
+      setSelectedMetricIds([]);
+      setIsBatchDeleteOpen(false);
+      invalidateCache(cacheKey);
+      load(true);
+    } catch (e: any) {
+      addToast("error", e.message || "批量删除失败");
+    }
+  };
+
   const categories = useMemo(
     () => [...new Set(metrics.map((m) => m.category).filter(Boolean))],
     [metrics],
@@ -263,6 +294,7 @@ export default function MetricManager() {
 
     return schemaClassOptions.filter((schemaClass) => {
       if (selected.has(schemaClass.id)) return false;
+      if (normalizeReviewStatus(schemaClass.is_reviewed) === -1) return false;
       if (!keyword) return true;
       return [schemaClass.id, schemaClass.name_cn, schemaClass.description]
         .filter(Boolean)
@@ -486,6 +518,28 @@ export default function MetricManager() {
         </button>
       </div>
 
+      {selectedMetricIds.length > 0 && (
+        <div className="mb-4 flex items-center justify-between rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          <span>已选择 {selectedMetricIds.length} 个指标</span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setSelectedMetricIds([])}
+              className="rounded px-2 py-1 text-xs text-red-600 hover:bg-red-100"
+            >
+              取消选择
+            </button>
+            <button
+              type="button"
+              onClick={() => setIsBatchDeleteOpen(true)}
+              className="rounded bg-red-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-red-700"
+            >
+              删除所选
+            </button>
+          </div>
+        </div>
+      )}
+
       {loading && <LoadingSpinner />}
       {!loading && sortedMetrics.length === 0 && (
         <EmptyState
@@ -499,6 +553,7 @@ export default function MetricManager() {
           <div className="overflow-x-auto">
             <table className="data-table min-w-[900px] table-fixed">
               <colgroup>
+                <col className="w-10" />
                 <col className="w-60" />
                 <col className="w-24" />
                 <col className="w-56" />
@@ -508,6 +563,25 @@ export default function MetricManager() {
               </colgroup>
               <thead>
                 <tr>
+                  <th className="text-center">
+                    <input
+                      type="checkbox"
+                      checked={
+                        sortedMetrics.length > 0 &&
+                        sortedMetrics.every((metric) => selectedMetricIds.includes(metric.id))
+                      }
+                      onChange={() => {
+                        const visibleIds = sortedMetrics.map((metric) => metric.id);
+                        const allVisibleSelected = visibleIds.every((id) => selectedMetricIds.includes(id));
+                        setSelectedMetricIds((current) =>
+                          allVisibleSelected
+                            ? current.filter((id) => !visibleIds.includes(id))
+                            : [...new Set([...current, ...visibleIds])],
+                        );
+                      }}
+                      aria-label="全选当前筛选结果"
+                    />
+                  </th>
                   {SORTABLE_COLUMNS.map((column) =>
                     renderSortableHeader(column.key, column.label),
                   )}
@@ -517,6 +591,14 @@ export default function MetricManager() {
               <tbody>
                 {sortedMetrics.map((m) => (
                   <tr key={m.id}>
+                    <td className="text-center">
+                      <input
+                        type="checkbox"
+                        checked={selectedMetricIds.includes(m.id)}
+                        onChange={() => toggleMetricSelection(m.id)}
+                        aria-label={`选择指标 ${m.name}`}
+                      />
+                    </td>
                     <td
                       className="whitespace-normal break-words font-medium leading-relaxed text-slate-700"
                       title={
@@ -913,6 +995,13 @@ export default function MetricManager() {
           }
         }}
         onCancel={() => setDeleteTarget(null)}
+      />
+      <ConfirmDialog
+        isOpen={isBatchDeleteOpen}
+        title="批量删除指标"
+        message={`确定要删除已选择的 ${selectedMetricIds.length} 个指标吗？此操作不可撤销。`}
+        onConfirm={removeSelected}
+        onCancel={() => setIsBatchDeleteOpen(false)}
       />
     </div>
   );

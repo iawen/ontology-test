@@ -19,6 +19,15 @@ FINAL_AFTER_TOOL_MAX_ROWS = 100
 FINAL_ANSWER_SAMPLE_HEAD_ROWS = 30
 FINAL_ANSWER_SAMPLE_TAIL_ROWS = 5
 FINAL_ANSWER_MAX_CONTEXT_CHARS = 24000
+METRIC_PLAN_MAX_INITIAL_SUBQUESTIONS = 3
+METRIC_PLAN_MAX_ITERATIONS = 1
+METRIC_PLAN_MAX_QUERY_ATTEMPTS = 5
+METRIC_PLAN_MAX_SUBQUESTION_CHARS = 300
+METRIC_PLAN_COMPLEX_KEYWORDS = (
+    "为什么", "原因", "归因", "驱动", "影响因素", "导致", "拆解", "构成",
+    "贡献", "健康度", "诊断", "综合", "同比", "环比", "对比", "变化",
+    "why", "reason", "driver", "contribution", "diagnosis", "yoy", "mom",
+)
 
 COMPARISON_QUERY_KEYWORDS = (
     "相比",

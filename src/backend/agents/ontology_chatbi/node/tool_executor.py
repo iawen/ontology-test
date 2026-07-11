@@ -132,6 +132,7 @@ class ToolExecutor:
                 order_by=args.get("order_by", ""),
                 limit=None,
                 having=args.get("having", []),
+                user_question=str(args.get("user_question") or ""),
             )
 
         elif name == "python_analyze":

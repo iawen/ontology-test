@@ -151,6 +151,7 @@ export default function SchemaManager() {
   const [relationships, setRelationships] = useState<SchemaRelationship[]>([]);
   const [loading, setLoading] = useState(false);
   const [editClass, setEditClass] = useState<Partial<SchemaClass> | null>(null);
+  const [originalClassId, setOriginalClassId] = useState<string | null>(null);
   const [isClassModalOpen, setIsClassModalOpen] = useState(false);
   const emptyRelationship = (): Partial<SchemaRelationship> => ({
     source: "",
@@ -165,8 +166,10 @@ export default function SchemaManager() {
   const [isRelModalOpen, setIsRelModalOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<{
     type: "class" | "rel";
-    id: string | number;
+    ids: Array<string | number>;
   } | null>(null);
+  const [selectedClassIds, setSelectedClassIds] = useState<Set<string>>(new Set());
+  const [selectedRelationshipIds, setSelectedRelationshipIds] = useState<Set<number>>(new Set());
   const [viewMode, setViewMode] = useState<"graph" | "table">("graph");
   const [graphNodePositions, setGraphNodePositions] = useState<
     Record<string, { x: number; y: number }>
@@ -213,6 +216,7 @@ export default function SchemaManager() {
   };
 
   const openClassEditor = (schemaClass: SchemaClass) => {
+    setOriginalClassId(schemaClass.id);
     setEditClass({
       ...schemaClass,
       fields: (schemaClass.fields || []).map((field) =>
@@ -361,7 +365,7 @@ export default function SchemaManager() {
       addToast("warning", "ID和中文名必填");
       return;
     }
-    const isEdit = classes.some((c) => c.id === editClass.id);
+    const isEdit = originalClassId !== null;
     const fields = (editClass.fields || [])
       .filter((field) => field.name || field.physical_name)
       .map((field) => {
@@ -380,12 +384,13 @@ export default function SchemaManager() {
     };
     try {
       await api(
-        `/api/scenarios/${activeScenario}/schema/classes${isEdit ? `/${editClass.id}` : ""}`,
+        `/api/scenarios/${activeScenario}/schema/classes${isEdit ? `/${originalClassId}` : ""}`,
         { method: isEdit ? "PUT" : "POST", body: JSON.stringify(payload) },
       );
-      addToast("success", isEdit ? "类已更新" : "类已创建");
+      addToast("success", isEdit ? "类已更新，相关引用已同步" : "类已创建");
       setIsClassModalOpen(false);
       setEditClass(null);
+      setOriginalClassId(null);
       invalidateCache(cacheKey);
       load(true);
     } catch (e: any) {
@@ -393,17 +398,16 @@ export default function SchemaManager() {
     }
   };
 
-  const deleteClass = async (id: string) => {
-    try {
-      await api(`/api/scenarios/${activeScenario}/schema/classes/${id}`, {
-        method: "DELETE",
-      });
-      addToast("success", "类已删除");
+  const deleteClasses = async (ids: string[]) => {
+    const results = await Promise.allSettled(ids.map((id) => api(`/api/scenarios/${activeScenario}/schema/classes/${id}`, { method: "DELETE" })));
+    const succeeded = results.filter((result) => result.status === "fulfilled").length;
+    if (succeeded) {
+      addToast("success", `已删除 ${succeeded} 个类`);
+      setSelectedClassIds(new Set());
       invalidateCache(cacheKey);
       load(true);
-    } catch (e: any) {
-      addToast("error", e.message || "删除失败");
     }
+    if (succeeded !== ids.length) addToast("error", `${ids.length - succeeded} 个类删除失败`);
   };
 
   const saveRelationship = async () => {
@@ -437,18 +441,16 @@ export default function SchemaManager() {
     }
   };
 
-  const deleteRelationship = async (id: number) => {
-    try {
-      await api(
-        `/api/scenarios/${activeScenario}/schema/relationships/${id}`,
-        { method: "DELETE" },
-      );
-      addToast("success", "关系已删除");
+  const deleteRelationships = async (ids: number[]) => {
+    const results = await Promise.allSettled(ids.map((id) => api(`/api/scenarios/${activeScenario}/schema/relationships/${id}`, { method: "DELETE" })));
+    const succeeded = results.filter((result) => result.status === "fulfilled").length;
+    if (succeeded) {
+      addToast("success", `已删除 ${succeeded} 条关系`);
+      setSelectedRelationshipIds(new Set());
       invalidateCache(cacheKey);
       load(true);
-    } catch (e: any) {
-      addToast("error", e.message || "删除失败");
     }
+    if (succeeded !== ids.length) addToast("error", `${ids.length - succeeded} 条关系删除失败`);
   };
 
   const classById = new Map(
@@ -805,6 +807,7 @@ export default function SchemaManager() {
           </div>
           <button
             onClick={() => {
+              setOriginalClassId(null);
               setEditClass({
                 scenario_id: activeScenario,
                 properties: [],
@@ -930,17 +933,21 @@ export default function SchemaManager() {
               <h3 className="text-sm font-semibold text-slate-700">
                 类 ({sortedClasses.length}/{classes.length})
               </h3>
-              <div className="w-full sm:w-72">
+              <div className="flex w-full items-center gap-3 sm:w-auto">
+                {selectedClassIds.size > 0 && <button onClick={() => setDeleteTarget({ type: "class", ids: [...selectedClassIds] })} className="btn-ghost whitespace-nowrap text-xs text-red-500">删除已选 ({selectedClassIds.size})</button>}
+                <div className="w-full sm:w-72">
                 <SearchInput
                   value={classSearch}
                   onChange={setClassSearch}
                   placeholder="搜索类、字段..."
                 />
+                </div>
               </div>
             </div>
             <div className="overflow-x-auto">
               <table className="data-table min-w-[980px] table-fixed">
                 <colgroup>
+                  <col className="w-10" />
                   <col className="w-28" />
                   <col className="w-20" />
                   <col className="w-40" />
@@ -950,6 +957,7 @@ export default function SchemaManager() {
                 </colgroup>
                 <thead>
                   <tr>
+                    <th className="w-10 text-center"><input aria-label="全选类" type="checkbox" checked={sortedClasses.length > 0 && sortedClasses.every((item) => selectedClassIds.has(item.id))} onChange={(event) => setSelectedClassIds((current) => { const next = new Set(current); sortedClasses.forEach((item) => event.target.checked ? next.add(item.id) : next.delete(item.id)); return next; })} /></th>
                     {CLASS_SORT_COLUMNS.map((column) =>
                       renderSortHeader(
                         column.key,
@@ -972,6 +980,7 @@ export default function SchemaManager() {
                   )}
                   {sortedClasses.map((c) => (
                     <tr key={c.id}>
+                      <td className="text-center"><input aria-label={`选择类 ${c.id}`} type="checkbox" checked={selectedClassIds.has(c.id)} onChange={() => setSelectedClassIds((current) => { const next = new Set(current); next.has(c.id) ? next.delete(c.id) : next.add(c.id); return next; })} /></td>
                       <td
                         className="whitespace-normal break-words font-mono text-xs leading-relaxed"
                         title={c.id}
@@ -1013,7 +1022,7 @@ export default function SchemaManager() {
                         </button>
                         <button
                           onClick={() =>
-                            setDeleteTarget({ type: "class", id: c.id })
+                            setDeleteTarget({ type: "class", ids: [c.id] })
                           }
                           className="btn-ghost text-xs text-red-500"
                         >
@@ -1031,17 +1040,21 @@ export default function SchemaManager() {
               <h3 className="text-sm font-semibold text-slate-700">
                 关系 ({sortedRelationships.length}/{relationships.length})
               </h3>
-              <div className="w-full sm:w-72">
+              <div className="flex w-full items-center gap-3 sm:w-auto">
+                {selectedRelationshipIds.size > 0 && <button onClick={() => setDeleteTarget({ type: "rel", ids: [...selectedRelationshipIds] })} className="btn-ghost whitespace-nowrap text-xs text-red-500">删除已选 ({selectedRelationshipIds.size})</button>}
+                <div className="w-full sm:w-72">
                 <SearchInput
                   value={relationshipSearch}
                   onChange={setRelationshipSearch}
                   placeholder="搜索关系..."
                 />
+                </div>
               </div>
             </div>
             <table className="data-table">
               <thead>
                 <tr>
+                  <th className="w-10 text-center"><input aria-label="全选关系" type="checkbox" checked={sortedRelationships.length > 0 && sortedRelationships.every((item) => selectedRelationshipIds.has(item.id))} onChange={(event) => setSelectedRelationshipIds((current) => { const next = new Set(current); sortedRelationships.forEach((item) => event.target.checked ? next.add(item.id) : next.delete(item.id)); return next; })} /></th>
                   {RELATIONSHIP_SORT_COLUMNS.map((column) =>
                     renderSortHeader(
                       column.key,
@@ -1064,6 +1077,7 @@ export default function SchemaManager() {
                 )}
                 {sortedRelationships.map((r) => (
                   <tr key={r.id}>
+                    <td className="text-center"><input aria-label={`选择关系 ${r.id}`} type="checkbox" checked={selectedRelationshipIds.has(r.id)} onChange={() => setSelectedRelationshipIds((current) => { const next = new Set(current); next.has(r.id) ? next.delete(r.id) : next.add(r.id); return next; })} /></td>
                     <td className="whitespace-normal break-words font-mono text-xs leading-relaxed">
                       {r.source}
                     </td>
@@ -1102,7 +1116,7 @@ export default function SchemaManager() {
                       </button>
                       <button
                         onClick={() =>
-                          setDeleteTarget({ type: "rel", id: r.id })
+                          setDeleteTarget({ type: "rel", ids: [r.id] })
                         }
                         className="btn-ghost text-xs text-red-500"
                       >
@@ -1123,11 +1137,10 @@ export default function SchemaManager() {
         onClose={() => {
           setIsClassModalOpen(false);
           setEditClass(null);
+          setOriginalClassId(null);
         }}
         title={
-          editClass?.id && classes.some((c) => c.id === editClass.id)
-            ? "编辑类"
-            : "新增类"
+          originalClassId ? "编辑类" : "新增类"
         }
         width="max-w-6xl"
         footer={
@@ -1136,6 +1149,7 @@ export default function SchemaManager() {
               onClick={() => {
                 setIsClassModalOpen(false);
                 setEditClass(null);
+                setOriginalClassId(null);
               }}
               className="btn-outline"
             >
@@ -1556,14 +1570,14 @@ export default function SchemaManager() {
         title={deleteTarget?.type === "class" ? "删除类" : "删除关系"}
         message={
           deleteTarget?.type === "class"
-            ? "确定要删除此类吗？关联的关系也将被删除。"
-            : "确定要删除此关系吗？"
+            ? `确定要删除选中的 ${deleteTarget.ids.length} 个类吗？关联的关系也将被删除。`
+            : `确定要删除选中的 ${deleteTarget?.ids.length || 0} 条关系吗？`
         }
         onConfirm={() => {
           if (deleteTarget?.type === "class")
-            deleteClass(deleteTarget.id as string);
+            deleteClasses(deleteTarget.ids.map(String));
           else if (deleteTarget?.type === "rel")
-            deleteRelationship(deleteTarget.id as number);
+            deleteRelationships(deleteTarget.ids.map(Number));
           setDeleteTarget(null);
         }}
         onCancel={() => setDeleteTarget(null)}

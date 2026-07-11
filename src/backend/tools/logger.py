@@ -17,10 +17,10 @@ class Logger(object):
     logger = logging.getLogger(f"{Cfg.project_name} {Cfg.log_name}")
     logger.propagate = False
 
-    # 控制台输出 - 只显示 WARNING 及以上（过滤掉规则详情）
+    # 控制台输出：与文件保持一致，显示 INFO 及以上日志。
     __stream_handler = logging.StreamHandler()
     __stream_handler.setFormatter(__formatter)
-    __stream_handler.setLevel(logging.WARNING)
+    __stream_handler.setLevel(logging.INFO)
     logger.addHandler(__stream_handler)
 
     # 文件输出（按天轮转，保留30天）- 显示所有日志
@@ -45,12 +45,8 @@ class Logger(object):
     # 进度日志 - 同时输出到控制台和文件
     def progress(self, msg, *args, **kwargs):
         """进度日志：同时输出到控制台和文件"""
-        import datetime
         formatted_msg = self.replace_blank(msg, *args, **kwargs)
-        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        # 输出到控制台（带颜色）
-        print(f"{timestamp} {self.logger.name} INFO {formatted_msg}")
-        # 同时写入文件
+        # INFO handler 会同步写入控制台与按日轮转文件，避免 print 造成重复输出。
         self.logger.info(formatted_msg)
 
     def __init__(self, cls):

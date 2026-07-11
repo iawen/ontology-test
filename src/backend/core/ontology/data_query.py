@@ -19,7 +19,11 @@ import pandas as pd
 from pathlib import Path
 from typing import Optional, Any, Dict, List
 
+from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
+
 from core.db.db_connector import create_db_engine
+from core.harness.harness_sql import HarnessSQL
 from core.ontology.ontology_engine import OntologyEngine
 from tools.logger import logger
 
@@ -30,12 +34,15 @@ class DataQueryEngine:
         self._registered_tables: set = set()
         self.db_connection_url = db_connection_url
         self._db_engine = None
+        self._sql_harness: HarnessSQL | None = None
+        self._sqlite_harness_engine = None
         self._resolved_table_names: dict[str, str] = {}
         self._actual_table_columns_cache: dict[str, set[str]] = {}
 
         if self.db_connection_url:
             try:
                 self._db_engine = create_db_engine(self.db_connection_url)
+                self._sql_harness = HarnessSQL(self._db_engine)
                 logger.info("DataQuery engine initialized with external db connection")
             except ImportError:
                 logger.warning("sqlalchemy not installed, falling back to SQLite")
@@ -135,6 +142,20 @@ class DataQueryEngine:
             self._conn = sqlite3.connect(":memory:")
             self._conn.row_factory = sqlite3.Row
         return self._conn
+
+    def _get_sql_harness(self) -> HarnessSQL:
+        """Return a HarnessSQL instance for either the external DB or the in-memory CSV SQLite database."""
+        if self._sql_harness is not None:
+            return self._sql_harness
+        connection = self._get_connection()
+        self._sqlite_harness_engine = create_engine(
+            "sqlite://",
+            creator=lambda: connection,
+            poolclass=StaticPool,
+        )
+        self._sql_harness = HarnessSQL(self._sqlite_harness_engine)
+        logger.info("DataQuery HarnessSQL initialized for in-memory CSV SQLite connection")
+        return self._sql_harness
 
     def field_available_in_class(self, class_id: str, field_name: str) -> bool:
         """Return whether a logical or physical field belongs to a Schema class."""
@@ -443,7 +464,7 @@ class DataQueryEngine:
                 depth += 1
             elif ch == ")" and depth > 0:
                 depth -= 1
-            elif ch == "," and depth == 0:
+            elif ch in {",", ";"} and depth == 0:
                 part = text[start:index].strip()
                 if part:
                     parts.append(part)
@@ -457,34 +478,44 @@ class DataQueryEngine:
 
     def _split_formula_alias(self, formula: str) -> tuple[str, str]:
         text = str(formula or "").strip()
-        match = re.match(r"(?is)^(.*?)\s+AS\s+([A-Za-z_][\w]*)\s*$", text)
+        match = re.match(r"(?is)^(.*?)\s+AS\s+([^\s]+)\s*$", text)
         if match:
             return match.group(1).strip(), match.group(2).strip()
-        match = re.match(r"(?is)^(.*\))\s+([A-Za-z_][\w]*)\s*$", text)
+        match = re.match(r"(?is)^(.*\))\s+([^\s]+)\s*$", text)
         if match:
             return match.group(1).strip(), match.group(2).strip()
         return text, ""
 
     def _extract_simple_formula(self, formula: str) -> tuple[str, str] | None:
         match = re.fullmatch(
-            r"\s*(SUM|AVG|MIN|MAX|COUNT)\s*\(\s*(DISTINCT\s+)?([A-Za-z_][\w]*)\s*\)\s*",
+            r"\s*(SUM|AVG|MIN|MAX|COUNT)\s*\(\s*(DISTINCT\s+)?([^\s(),;]+)\s*\)\s*",
             formula or "",
             re.IGNORECASE,
         )
-        if not match:
-            return None
-        agg = match.group(1).upper()
-        distinct = "DISTINCT " if match.group(2) else ""
-        field = match.group(3)
-        return agg + "|" + distinct, field
+        if match:
+            agg = match.group(1).upper()
+            distinct = "DISTINCT " if match.group(2) else ""
+            return agg + "|" + distinct, match.group(3)
+        bare_field = re.fullmatch(r"\s*([^\s(),;]+)\s*", formula or "")
+        return ("SUM|", bare_field.group(1)) if bare_field else None
 
-    def _formula_alias(self, metric_name: str, formula: str, index: int, total: int) -> str:
+    def _formula_alias(
+        self,
+        metric_info: dict,
+        metric_name: str,
+        default_class: str,
+        formula: str,
+        index: int,
+        total: int,
+    ) -> str:
         expr, explicit_alias = self._split_formula_alias(formula)
         if explicit_alias:
             return explicit_alias
         simple = self._extract_simple_formula(expr)
         if total > 1 and simple:
-            return simple[1]
+            metric_class = self._metric_class(metric_info, default_class)
+            physical_field = self.oe.map_field(metric_class, simple[1])
+            return self.oe.reverse_map_field(metric_class, physical_field)
         return metric_name if index == 0 else f"{metric_name}_{index + 1}"
 
     def _unique_alias(self, alias_name: str, used_aliases: set[str]) -> str:
@@ -533,7 +564,7 @@ class DataQueryEngine:
             return [
                 (
                     self._metric_expr_for_formula(metric_info, metric_name, default_class, alias_map, part),
-                    self._formula_alias(metric_name, part, index, total),
+                    self._formula_alias(metric_info, metric_name, default_class, part, index, total),
                 )
                 for index, part in enumerate(formula_parts)
             ]
@@ -639,6 +670,7 @@ class DataQueryEngine:
         order_by: str = "",
         limit: int = None,
         having: list = None,
+        user_question: str = "",
     ) -> dict:
         metrics = metrics or []
         dimensions = dimensions or []
@@ -1049,6 +1081,41 @@ class DataQueryEngine:
             limit,
             sql,
         )
+
+        schema_context = {
+            "target_class": target_class,
+            "metrics": metrics,
+            "dimensions": dimensions,
+            "filters": filters,
+            "having": having,
+            "metric_definitions": [
+                self.oe.get_metric_info(metric) for metric in metrics if self.oe.get_metric_info(metric)
+            ],
+        }
+        harness_result = self._get_sql_harness().prepare(
+            sql,
+            user_question=user_question,
+            schema_context=schema_context,
+        )
+        if not harness_result.passed:
+            error = "; ".join(harness_result.errors) or "SQL Harness 校验未通过"
+            logger.warning("DataQuery SQL blocked by HarnessSQL: query_id=%s errors=%s", query_id, error)
+            return {
+                "type": "query_result",
+                "columns": [],
+                "rows": [],
+                "row_count": 0,
+                "error": error,
+                "sql": sql,
+                "harness": harness_result.to_dict(),
+            }
+        sql = harness_result.sql
+        logger.info(
+            "DataQuery SQL passed HarnessSQL: query_id=%s actions=%s warnings=%s",
+            query_id,
+            harness_result.actions,
+            harness_result.warnings,
+        )
         
         try:
             rows = self._execute_sql(sql)
@@ -1064,6 +1131,7 @@ class DataQueryEngine:
                 "row_count": len(rows),
                 "sql": sql,
                 "target_class": target_class,
+                "harness": harness_result.to_dict() if harness_result else None,
             }
         except Exception as e:
             logger.exception(

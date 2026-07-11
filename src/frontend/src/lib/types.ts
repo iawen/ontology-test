@@ -138,7 +138,7 @@ export interface PlanData {
 
 /** Chart 配置数据 */
 export interface ChartConfigData {
-  chart_type: "bar" | "line" | "pie" | "scatter" | "gauge" | "table";
+  chart_type: "bar" | "line" | "pie" | "scatter" | "gauge" | "kpi" | "table";
   title: string;
   x_field?: string;
   y_fields?: string[];

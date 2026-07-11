@@ -1,15 +1,16 @@
 """Shared helpers for data query agents."""
 
 import json
+from datetime import UTC, datetime
 
 from core.db.db import get_db
 from core.llm.chat_model import get_async_client, get_model_name
+from tools.logger import logger
 
 from .constants import (
     TOOL_DISPLAY_NAMES,
     TOOL_PURPOSES,
 )
-
 
 def metric_target_classes(metric: dict) -> list[str]:
     raw_value = metric.get("target_classes") or metric.get("target_class") or metric.get("class_id")
@@ -74,6 +75,12 @@ def match_glossary_terms(scenario_id: str, user_message: str) -> list[dict]:
                     "category": r["category"],
                 })
                 break  # 一个条目只匹配一次
+    logger.info(
+        "Glossary matched: scenario_id=%s count=%d terms=%s",
+        scenario_id,
+        len(matched),
+        [item["standard_name"] or item["term"] for item in matched],
+    )
     return matched
 
 
@@ -203,3 +210,171 @@ async def route_skills(scenario_id: str, user_message: str, conversation_history
             })
 
     return matched_skills
+
+
+
+
+
+def now_utc() -> datetime:
+    """返回当前 UTC 时间。"""
+    return datetime.now(UTC)
+
+
+def now_timestamp() -> float:
+    """返回当前本地 Unix 时间戳，单位为秒。"""
+    return datetime.now().timestamp()
+
+
+def safe_timestamp(value: datetime | None) -> float | None:
+    """将 datetime 转为 Unix 时间戳；输入为空时返回 None。"""
+    if value is None:
+        return None
+    return value.timestamp()
+
+
+def elapsed_seconds(value1: datetime | None, value2: datetime | None) -> float | None:
+    """计算两个时间的间隔秒数（value2 - value1）；任一输入为空时返回 None。"""
+    ts1 = safe_timestamp(value1)
+    ts2 = safe_timestamp(value2)
+    if ts1 is None or ts2 is None:
+        return None
+    return ts2 - ts1
+
+
+def valid_ap_month(ap_month: str) -> bool:
+    """验证字符串是否为有效的 AP 月格式（例如 "2023AP05"）。"""
+    try:
+        year_text, month_text = ap_month.upper().split("AP", maxsplit=1)
+        year = int(year_text)
+        month = int(month_text)
+        return year > 1000 and year < 3000 and month >= 1 and month <= 12
+    except ValueError:
+        return False
+
+
+def parse_ap_month(ap_month: str) -> tuple[int, int]:
+    """将 AP 月解析为年份和月份。"""
+    if not valid_ap_month(ap_month):
+        raise ValueError(f"Invalid AP month: {ap_month}")
+
+    year_text, month_text = ap_month.upper().split("AP", maxsplit=1)
+    return int(year_text), int(month_text)
+
+
+def recent_ap_months(ap_month: str, max_num: int) -> list[str]:
+    """获取当前 AP 月及之前 max_num - 1 个 AP 月字符串。"""
+    if not valid_ap_month(ap_month):
+        raise ValueError(f"Invalid AP month: {ap_month}")
+
+    year_text, month_text = ap_month.upper().split("AP", maxsplit=1)
+    year = int(year_text)
+    month = int(month_text)
+    base_month_index = year * 12 + month - 2
+
+    ap_months: list[str] = []
+    for offset in range(-(max_num - 1), 1):
+        month_index = base_month_index + offset
+        calendar_year = month_index // 12
+        calendar_month = month_index % 12 + 1
+        if calendar_month == 12:
+            ap_months.append(f"{calendar_year + 1}AP01")
+        else:
+            ap_months.append(f"{calendar_year}AP{calendar_month + 1:02d}")
+    return ap_months
+
+
+def shift_ap_month(ap_month: str, month_offset: int) -> str:
+    """将 AP 月按偏移量前后推移指定月数。"""
+    if not valid_ap_month(ap_month):
+        raise ValueError(f"Invalid AP month: {ap_month}")
+
+    year_text, month_text = ap_month.upper().split("AP", maxsplit=1)
+    year = int(year_text)
+    month_num = int(month_text) + month_offset
+
+    while month_num <= 0:
+        month_num += 12
+        year -= 1
+    while month_num > 12:
+        month_num -= 12
+        year += 1
+
+    return f"{year}AP{month_num:02d}"
+
+
+def ap_month_to_quarter(ap_month: str) -> str:
+    """将 AP 月转换为季度字符串，例如 2026AP05 -> 2026Q2。"""
+    if not valid_ap_month(ap_month):
+        raise ValueError(f"Invalid AP month: {ap_month}")
+
+    normalized = ap_month.upper()
+    year = normalized[:4]
+    quarter_num = ((int(normalized[-2:]) - 1) // 3) + 1
+    return f"{year}Q{quarter_num}"
+
+
+def previous_quarter(ap_month: str) -> str:
+    """返回给定 AP 月所在季度的上一个季度。"""
+    current_quarter = ap_month_to_quarter(ap_month)
+    year = int(current_quarter[:4])
+    quarter_num = int(current_quarter[-1])
+    if quarter_num == 1:
+        return f"{year - 1}Q4"
+    return f"{year}Q{quarter_num - 1}"
+
+
+def current_quarter_ap_months(ap_month: str) -> list[str]:
+    """返回给定 AP 月所在季度的三个 AP 月。"""
+    if not valid_ap_month(ap_month):
+        raise ValueError(f"Invalid AP month: {ap_month}")
+
+    normalized = ap_month.upper()
+    year = int(normalized[:4])
+    month_num = int(normalized[-2:])
+    quarter_start_month = ((month_num - 1) // 3) * 3 + 1
+    return [f"{year}AP{quarter_start_month + offset:02d}" for offset in range(3)]
+
+
+def current_quarter_ap_month_tuple(ap_month: str) -> tuple[str, str, str]:
+    """返回给定 AP 月所在季度的三个 AP 月元组。"""
+    months = current_quarter_ap_months(ap_month)
+    return months[0], months[1], months[2]
+
+
+def ap_month_quarter_position(ap_month: str) -> str:
+    """返回给定 AP 月在所属季度中的位置：first/second/third。"""
+    if not valid_ap_month(ap_month):
+        raise ValueError(f"Invalid AP month: {ap_month}")
+
+    position = (int(ap_month.upper()[-2:]) - 1) % 3
+    if position == 0:
+        return "first"
+    if position == 1:
+        return "second"
+    return "third"
+
+
+def recent_quarters_from_ap_month(ap_month: str, count: int = 3) -> list[str]:
+    """返回给定 AP 月所在季度及之前 count-1 个季度，按时间升序排列。"""
+    if not valid_ap_month(ap_month):
+        raise ValueError(f"Invalid AP month: {ap_month}")
+    if count < 1:
+        raise ValueError(f"Invalid quarter count: {count}")
+
+    month_num = int(ap_month.upper()[-2:])
+    quarter_num = ((month_num - 1) // 3) + 1
+    quarter_value = int(ap_month[:4]) * 4 + (quarter_num - 1)
+    quarters: list[str] = []
+    for offset in range(count - 1, -1, -1):
+        current_value = quarter_value - offset
+        year = current_value // 4
+        quarter = current_value % 4 + 1
+        quarters.append(f"{year}Q{quarter}")
+    return quarters
+
+
+def to_short_ap_month(ap_month: str) -> str:
+    """转换为短格式 AP 月字符串，例如 "2023AP05" 转为 "23AP05"。"""
+    if not valid_ap_month(ap_month):
+        raise ValueError(f"Invalid AP month: {ap_month}")
+    return f"{ap_month[2:4]}AP{ap_month[6:]}"

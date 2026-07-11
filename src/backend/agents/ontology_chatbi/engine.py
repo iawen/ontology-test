@@ -38,6 +38,10 @@ from .constants import (
     FINAL_ANSWER_MAX_CONTEXT_CHARS,
     FINAL_ANSWER_SAMPLE_HEAD_ROWS,
     FINAL_ANSWER_SAMPLE_TAIL_ROWS,
+    METRIC_PLAN_MAX_INITIAL_SUBQUESTIONS,
+    METRIC_PLAN_MAX_ITERATIONS,
+    METRIC_PLAN_MAX_QUERY_ATTEMPTS,
+    METRIC_PLAN_MAX_SUBQUESTION_CHARS,
     PYTHON_ANALYZE_COMPLEX_PATTERNS,
     RATIO_EVIDENCE_KEYWORDS,
     RATIO_QUERY_KEYWORDS,
@@ -52,6 +56,7 @@ from .node import (
     EntityDisambiguatorAgent,
     GlossaryMatcherAgent,
     OntologyAgent,
+    PlanExecuteAgent,
     SchemaRetrieverAgent,
     ToolExecutor,
 )
@@ -78,6 +83,7 @@ class ChatEngineV3:
         self.compressor_agent = ContextCompressorAgent()
         self.entity_agent = EntityDisambiguatorAgent()
         self.ontology_agent = OntologyAgent(self.client, self.model_name)
+        self.plan_execute_agent = PlanExecuteAgent(self.client, self.model_name)
         self.analysis_tool = AnalysisOrganizerTool(self.client, self.model_name)
 
     async def stream_chat(self, req: ChatRequest) -> AsyncGenerator[str, None]:
@@ -108,6 +114,7 @@ class ChatEngineV3:
         handlers = {
             State.INIT: self._handle_init,
             State.CONTEXT_PREP: self._handle_context_prep,
+            State.METRIC_PLAN_EXECUTE: self._handle_metric_plan_execute,
             State.SCHEMA_PLAN: self._handle_schema_plan,
             State.QUERY_PLAN: self._handle_query_plan,
             State.LLM_CALL: self._handle_llm_call,
@@ -177,6 +184,7 @@ class ChatEngineV3:
             state.sse_events.clear()
 
             supporting_datasets = self._build_supporting_datasets(state)
+            persisted_steps = self._build_persisted_tool_steps(state.all_tool_results)
             final_answer = self._build_final_answer(
                 state.assistant_content,
                 supporting_datasets=supporting_datasets,
@@ -187,6 +195,7 @@ class ChatEngineV3:
                 "query_id": state.query_id,
                 "final_answer": final_answer,
                 "total_duration_ms": int((time.time() - start_time) * 1000),
+                "steps": persisted_steps,
                 # "tool_results": state.all_tool_results,
             }
             self._persist_conversation_message(
@@ -195,7 +204,7 @@ class ChatEngineV3:
                 state.assistant_content,
                 answer_datasets=self._build_persisted_answer_datasets(supporting_datasets),
                 visualization=self._build_persisted_visualization(supporting_datasets),
-                steps=self._build_persisted_tool_steps(state.all_tool_results),
+                steps=persisted_steps,
                 action_confirm=state.action_confirm,
             )
             yield await self._format_sse_event(state.query_id, done_event)
@@ -261,7 +270,196 @@ class ChatEngineV3:
             len(state.schema_context),
             len(state.metric_context),
         )
+        try:
+            routing = await self.plan_execute_agent.decide_execution_mode(
+                state.user_message,
+                state.schema_context,
+                state.metric_context,
+                state.glossary_matches,
+                has_metric_evidence=bool(state.metric_context.strip() or state.metric_candidates or engine.list_metrics()),
+                session_id=state.session_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Query mode routing failed; falling back to single query: session_id=%s error=%s",
+                state.session_id,
+                str(exc),
+            )
+            routing = {
+                "mode": "single_query",
+                "reason": "路由判定异常，降级为单任务查询。",
+                "single_query_sufficient": True,
+                "required_evidence": [],
+                "confidence": "low",
+                "decision_source": "fallback",
+                "matched_rule": "",
+            }
+        state.execution_mode = "metric_plan_execute" if routing.get("mode") == "plan_execute" else "single_query"
+        self._emit_execution_mode_routing_event(state, routing)
+        if state.execution_mode == "metric_plan_execute":
+            logger.info(
+                "Metric Plan-Execute selected: session_id=%s glossary_matches=%d metric_candidates=%d routing=%s",
+                state.session_id,
+                len(state.glossary_matches),
+                len(state.metric_candidates),
+                self._json_dumps(routing),
+            )
+            return State.METRIC_PLAN_EXECUTE
+        logger.info("Single-query route selected: session_id=%s routing=%s", state.session_id, self._json_dumps(routing))
         return State.SCHEMA_PLAN
+
+    async def _handle_metric_plan_execute(self, state: AgentState) -> State:
+        """Bounded multi-evidence orchestration for glossary-grounded complex metric questions."""
+        engine = get_engine(state.agent_id)
+        query_engine = get_query_engine(state.agent_id)
+        executor = ToolExecutor(state.agent_id, self.entity_agent)
+
+        if not state.metric_plan:
+            state.metric_plan_phase = "planning"
+            logger.info(
+                "Metric Plan-Execute planning started: session_id=%s glossary_terms=%s candidate_metrics=%s",
+                state.session_id,
+                self._json_dumps([item.get("standard_name") or item.get("term") for item in state.glossary_matches]),
+                self._json_dumps(state.metric_candidates),
+            )
+            initial_plan = await self.plan_execute_agent.plan_metric_subquestions(
+                state.user_message,
+                state.glossary_matches,
+                state.metric_context,
+                session_id=state.session_id,
+            )
+            accepted = self._accept_metric_subquestions(initial_plan.get("subquestions"), state)
+            if not accepted:
+                logger.info(
+                    "Metric plan did not yield valid subquestions; falling back to single query: session_id=%s",
+                    state.session_id,
+                )
+                state.execution_mode = "single_query"
+                return State.SCHEMA_PLAN
+
+            state.metric_plan = {
+                "plan_id": f"metric-plan-{shortuuid.random()}",
+                "objective": str(initial_plan.get("objective") or state.user_message),
+                "coverage_requirements": self._string_list(initial_plan.get("coverage_requirements")),
+            }
+            state.metric_subquestions.extend(accepted)
+            logger.info(
+                "Metric plan accepted: session_id=%s plan_id=%s subquestions=%s coverage=%s",
+                state.session_id,
+                state.metric_plan["plan_id"],
+                self._json_dumps([item["intent"] for item in accepted]),
+                self._json_dumps(state.metric_plan["coverage_requirements"]),
+            )
+            self._append_metric_plan_step(state, "metric_plan", "已基于企业术语与候选指标生成数据证据计划。", {
+                "plan": state.metric_plan,
+                "subquestions": accepted,
+            })
+            return State.METRIC_PLAN_EXECUTE
+
+        pending = next((item for item in state.metric_subquestions if item.get("status") == "pending"), None)
+        if pending:
+            if state.metric_query_attempts >= METRIC_PLAN_MAX_QUERY_ATTEMPTS:
+                pending["status"] = "skipped"
+                pending["error"] = "已达到 Plan-Execute 查询次数上限。"
+                self._append_metric_plan_step(state, "subquestion_query_plan", "已达到查询次数上限，子问题未执行。", pending)
+                logger.warning(
+                    "Metric subquestion skipped by query budget: session_id=%s subquestion_id=%s attempts=%d limit=%d",
+                    state.session_id,
+                    pending.get("id"),
+                    state.metric_query_attempts,
+                    METRIC_PLAN_MAX_QUERY_ATTEMPTS,
+                )
+            else:
+                state.metric_plan_phase = "executing"
+                logger.info(
+                    "Metric subquestion execution started: session_id=%s plan_id=%s iteration=%d subquestion_id=%s intent=%s",
+                    state.session_id,
+                    state.metric_plan.get("plan_id"),
+                    state.metric_plan_iteration,
+                    pending.get("id"),
+                    pending.get("intent"),
+                )
+                await self._execute_metric_subquestion(state, pending, executor, query_engine, engine)
+            return State.METRIC_PLAN_EXECUTE
+
+        state.metric_plan_phase = "judging"
+        evidence_packet = self._build_metric_evidence_packet(state)
+        can_expand = state.metric_plan_iteration < METRIC_PLAN_MAX_ITERATIONS and (
+            state.metric_query_attempts < METRIC_PLAN_MAX_QUERY_ATTEMPTS
+        )
+        judgment = await self.plan_execute_agent.judge_metric_evidence(
+            state.user_message,
+            state.metric_plan,
+            evidence_packet,
+            state.metric_plan_iteration,
+            can_expand,
+            session_id=state.session_id,
+        )
+        decision = str(judgment.get("decision") or "limited").lower()
+        if decision not in {"sufficient", "add", "limited"}:
+            decision = "limited"
+            judgment["limitation"] = "证据充分性判定返回了无效决策。"
+        judgment["decision"] = decision
+        state.metric_plan_judgments.append(judgment)
+        logger.info(
+            "Metric evidence judgment: session_id=%s plan_id=%s iteration=%d decision=%s can_expand=%s missing=%s",
+            state.session_id,
+            state.metric_plan.get("plan_id"),
+            state.metric_plan_iteration,
+            decision,
+            can_expand,
+            self._json_dumps(judgment.get("missing_evidence", [])),
+        )
+        self._append_metric_plan_step(state, "evidence_judgment", "已审核当前数据证据覆盖情况。", judgment)
+
+        if decision == "add" and can_expand:
+            additions = self._accept_metric_subquestions(judgment.get("additional_subquestions"), state, limit=2)
+            if additions:
+                state.metric_plan_iteration += 1
+                for item in additions:
+                    item["added_reason"] = self._string_list(judgment.get("missing_evidence"))
+                    item["iteration"] = state.metric_plan_iteration
+                state.metric_subquestions.extend(additions)
+                logger.info(
+                    "Metric plan expanded: session_id=%s plan_id=%s iteration=%d additions=%s",
+                    state.session_id,
+                    state.metric_plan.get("plan_id"),
+                    state.metric_plan_iteration,
+                    self._json_dumps([item["intent"] for item in additions]),
+                )
+                self._append_metric_plan_step(
+                    state,
+                    "metric_plan",
+                    "当前证据不足，已追加补充数据子问题。",
+                    {"iteration": state.metric_plan_iteration, "subquestions": additions, "gaps": judgment.get("missing_evidence", [])},
+                )
+                return State.METRIC_PLAN_EXECUTE
+
+        state.metric_plan_phase = "completed"
+        state.metric_plan_terminal_reason = (
+            "sufficient" if decision == "sufficient" else ("budget_exhausted" if not can_expand else "limited")
+        )
+        logger.info(
+            "Metric Plan-Execute completed: session_id=%s plan_id=%s terminal_reason=%s subquestions=%d query_attempts=%d",
+            state.session_id,
+            state.metric_plan.get("plan_id"),
+            state.metric_plan_terminal_reason,
+            len(state.metric_subquestions),
+            state.metric_query_attempts,
+        )
+        self._append_metric_plan_step(
+            state,
+            "metric_plan_complete",
+            "指标证据计划已结束。",
+            {
+                "terminal_reason": state.metric_plan_terminal_reason,
+                "coverage": judgment.get("coverage", []),
+                "limitation": judgment.get("limitation", ""),
+            },
+        )
+        state.final_reason = f"metric_plan_{state.metric_plan_terminal_reason}"
+        state.assistant_content = "已完成多证据指标分析，正在基于已验证数据生成答复。"
+        return State.FINAL_STREAM
 
     async def _handle_schema_plan(self, state: AgentState) -> State:
         """第一阶段：只识别主实体与显式关联实体，禁止执行查询。"""
@@ -357,6 +555,286 @@ class ChatEngineV3:
             self._json_dumps(state.planned_query_args.get("join_classes", [])),
         )
         return State.TOOL_EXECUTE
+
+    async def _execute_metric_subquestion(self, state: AgentState, subquestion: dict, executor, query_engine, engine) -> None:
+        """Run one business subquestion through the existing retrieve -> validate -> execute boundary."""
+        subquestion["status"] = "planning"
+        intent = str(subquestion.get("intent") or "").strip()
+        focused_question = f"原始问题：{state.user_message}\n\n本次需补充的业务证据：{intent}"
+        schema_result = await self.schema_agent.retrieve(focused_question, engine)
+        schema_context = str(schema_result.get("schema_context") or "")
+        metric_candidates = [
+            str(metric_id)
+            for metric_id in schema_result.get("relevant_metrics", [])
+            if isinstance(metric_id, str) and metric_id
+        ]
+        logger.info(
+            "Metric subquestion retrieval completed: session_id=%s subquestion_id=%s relevant_classes=%s metric_candidates=%s",
+            state.session_id,
+            subquestion.get("id"),
+            self._json_dumps(schema_result.get("relevant_classes", [])),
+            self._json_dumps(metric_candidates),
+        )
+
+        scope_validation: dict = {}
+        for attempt in range(2):
+            scope_validation = await self.ontology_agent.plan_schema_scope(
+                focused_question,
+                schema_context,
+                state.glossary_matches,
+                engine,
+                feedback=str(scope_validation.get("error") or ""),
+                session_id=state.session_id,
+            )
+            if scope_validation.get("valid"):
+                break
+        if not scope_validation.get("valid"):
+            subquestion.update(status="failed", error=str(scope_validation.get("error") or "无法确定 Schema 范围"))
+            self._append_metric_plan_step(state, "subquestion_scope", "子问题 Schema 范围校验失败。", subquestion)
+            return
+        logger.info(
+            "Metric subquestion scope validated: session_id=%s subquestion_id=%s target_class=%s join_classes=%s",
+            state.session_id,
+            subquestion.get("id"),
+            scope_validation["target_class"],
+            self._json_dumps(scope_validation["join_classes"]),
+        )
+        self._append_metric_plan_step(
+            state,
+            "subquestion_scope",
+            "子问题 Schema 范围已验证。",
+            {
+                "subquestion_id": subquestion.get("id"),
+                "intent": intent,
+                "query_scope": {
+                    "target_class": scope_validation["target_class"],
+                    "join_classes": scope_validation["join_classes"],
+                },
+            },
+        )
+
+        query_validation: dict = {}
+        for attempt in range(2):
+            query_validation = await self.ontology_agent.plan_query_details(
+                focused_question,
+                {
+                    "target_class": scope_validation["target_class"],
+                    "join_classes": scope_validation["join_classes"],
+                    "join_paths": scope_validation["join_paths"],
+                },
+                metric_candidates,
+                engine,
+                query_engine,
+                feedback=str(query_validation.get("error") or ""),
+                session_id=state.session_id,
+            )
+            if query_validation.get("valid"):
+                break
+        if not query_validation.get("valid"):
+            subquestion.update(status="failed", error=str(query_validation.get("error") or "无法确定查询参数"))
+            self._append_metric_plan_step(state, "subquestion_query_plan", "子问题查询参数校验失败。", subquestion)
+            return
+        logger.info(
+            "Metric subquestion query plan validated: session_id=%s subquestion_id=%s metrics=%s dimensions=%s filters=%d",
+            state.session_id,
+            subquestion.get("id"),
+            self._json_dumps(query_validation["query_plan"].get("metrics", [])),
+            self._json_dumps(query_validation["query_plan"].get("dimensions", [])),
+            len(query_validation["query_plan"].get("filters", [])),
+        )
+        self._append_metric_plan_step(
+            state,
+            "subquestion_query_plan",
+            "子问题查询参数已验证。",
+            {
+                "subquestion_id": subquestion.get("id"),
+                "intent": intent,
+                "query_plan": query_validation["query_plan"],
+            },
+        )
+
+        arguments = self._with_query_context(
+            "query_ontology_data",
+            {
+                "target_class": query_validation["query_scope"]["target_class"],
+                "join_classes": query_validation["query_scope"]["join_classes"],
+                **query_validation["query_plan"],
+            },
+            focused_question,
+            state.glossary_matches,
+        )
+        fingerprint = self._metric_query_fingerprint(arguments)
+        if any(item.get("query_fingerprint") == fingerprint for item in state.metric_subquestions if item is not subquestion):
+            subquestion.update(status="skipped", error="受控查询参数与已有子问题重复。", query_fingerprint=fingerprint)
+            self._append_metric_plan_step(state, "subquestion_query_plan", "子问题与已有查询重复，已跳过。", subquestion)
+            return
+
+        subquestion.update(
+            status="executing",
+            query_scope=query_validation["query_scope"],
+            query_plan=query_validation["query_plan"],
+            arguments=arguments,
+            query_fingerprint=fingerprint,
+        )
+        state.metric_query_attempts += 1
+        started_at = int(time.time() * 1000)
+        result = self._make_json_safe(await executor.execute("query_ontology_data", arguments, query_engine, engine))
+        finished_at = int(time.time() * 1000)
+        result_error = result.get("error") if isinstance(result, dict) else "查询返回了无效结果"
+        logger.info(
+            "Metric subquestion query completed: session_id=%s subquestion_id=%s status=%s row_count=%s duration_ms=%d",
+            state.session_id,
+            subquestion.get("id"),
+            "error" if result_error else "success",
+            result.get("row_count") if isinstance(result, dict) else None,
+            finished_at - started_at,
+        )
+        subquestion.update(
+            status="failed" if result_error else "completed",
+            error=str(result_error) if result_error else "",
+            result=result,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+        recorded_arguments = {
+            **arguments,
+            "_metric_plan": {
+                "plan_id": state.metric_plan.get("plan_id"),
+                "subquestion_id": subquestion.get("id"),
+                "iteration": subquestion.get("iteration", 0),
+                "intent": intent,
+            },
+        }
+        state.tool_call_records.append(
+            ToolCallRecord(
+                tool_name="query_ontology_data",
+                arguments=recorded_arguments,
+                result=result if not result_error else None,
+                error=str(result_error) if result_error else None,
+                retry_count=1 if result_error else 0,
+            )
+        )
+        state.all_tool_results.append(
+            {
+                "name": "query_ontology_data",
+                "description": f"子问题：{intent}",
+                "arguments": recorded_arguments,
+                "result": result,
+                "started_at": started_at,
+                "planning_finished_at": started_at,
+                "planning_duration_ms": 0,
+                "execution_started_at": started_at,
+                "execution_duration_ms": finished_at - started_at,
+                "finished_at": finished_at,
+                "duration_ms": finished_at - started_at,
+            }
+        )
+        state.sse_events.append(
+            {
+                "type": "tools",
+                "tool_name": get_tool_display_name("query_ontology_data"),
+                "description": f"子问题：{intent}",
+                "begin_time": self._format_event_time(started_at),
+                "payload": result,
+                "duration": round((finished_at - started_at) / 1000, 3),
+                "step": self._build_persisted_tool_steps(state.all_tool_results)[-1],
+            }
+        )
+
+    @staticmethod
+    def _string_list(value) -> list[str]:
+        return [str(item).strip() for item in value if isinstance(item, str) and item.strip()] if isinstance(value, list) else []
+
+    def _accept_metric_subquestions(self, raw_subquestions, state: AgentState, limit: int = METRIC_PLAN_MAX_INITIAL_SUBQUESTIONS) -> list[dict]:
+        if not isinstance(raw_subquestions, list):
+            return []
+        accepted = []
+        known_intents = {str(item.get("intent") or "").strip().lower() for item in state.metric_subquestions}
+        for index, raw in enumerate(raw_subquestions):
+            if len(accepted) >= limit or not isinstance(raw, dict):
+                break
+            intent = str(raw.get("intent") or "").strip()
+            if not intent or len(intent) > METRIC_PLAN_MAX_SUBQUESTION_CHARS or intent.lower() in known_intents:
+                continue
+            if re.search(r"\b(select|insert|update|delete|from|join)\b|[;{}]", intent, re.IGNORECASE):
+                continue
+            subquestion_id = str(raw.get("id") or f"sq-{len(state.metric_subquestions) + len(accepted) + 1}").strip()
+            accepted.append(
+                {
+                    "id": subquestion_id,
+                    "intent": intent,
+                    "expected_evidence": str(raw.get("expected_evidence") or ""),
+                    "priority": int(raw.get("priority") or index + 1),
+                    "iteration": state.metric_plan_iteration,
+                    "status": "pending",
+                }
+            )
+            known_intents.add(intent.lower())
+        return accepted
+
+    @staticmethod
+    def _metric_query_fingerprint(arguments: dict) -> str:
+        return json.dumps(
+            {
+                key: arguments.get(key)
+                for key in ("target_class", "join_classes", "metrics", "dimensions", "filters", "having", "order_by")
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+
+    def _build_metric_evidence_packet(self, state: AgentState) -> list[dict]:
+        evidence = []
+        for item in state.metric_subquestions:
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            evidence.append(
+                {
+                    "subquestion_id": item.get("id"),
+                    "intent": item.get("intent"),
+                    "expected_evidence": item.get("expected_evidence"),
+                    "status": item.get("status"),
+                    "error": item.get("error") or "",
+                    "query_scope": item.get("query_scope") or {},
+                    "query_plan": item.get("query_plan") or {},
+                    "result": self._compact_result_payload(result) if result else {},
+                }
+            )
+        return evidence
+
+    def _append_metric_plan_step(self, state: AgentState, name: str, description: str, result: dict) -> None:
+        now_ms = int(time.time() * 1000)
+        arguments = {
+            "plan_id": state.metric_plan.get("plan_id"),
+            "iteration": state.metric_plan_iteration,
+            "execution_mode": state.execution_mode,
+        }
+        state.all_tool_results.append(
+            {
+                "name": name,
+                "description": description,
+                "arguments": arguments,
+                "result": self._make_json_safe(result),
+                "started_at": now_ms,
+                "planning_finished_at": now_ms,
+                "planning_duration_ms": 0,
+                "execution_started_at": now_ms,
+                "execution_duration_ms": 0,
+                "finished_at": now_ms,
+                "duration_ms": 0,
+            }
+        )
+        state.sse_events.append(
+            {
+                "type": "tools",
+                "tool_name": name,
+                "description": description,
+                "begin_time": self._format_event_time(now_ms),
+                "payload": result,
+                "duration": 0,
+                "step": self._build_persisted_tool_steps(state.all_tool_results)[-1],
+            }
+        )
 
     async def _handle_llm_call(self, state: AgentState) -> State:
         """调用 LLM"""
@@ -547,6 +1025,7 @@ class ChatEngineV3:
                             "begin_time": self._format_event_time(now_ms),
                             "payload": self._json_dumps(direct_result),
                             "duration": 0,
+                            "step": self._build_persisted_tool_steps(state.all_tool_results)[-1],
                         }
                     )
                     logger.info(
@@ -643,6 +1122,7 @@ class ChatEngineV3:
                     "begin_time": self._format_event_time(total_started_at),
                     "payload": result if tool_name == "query_ontology_data" else (result if not result_error else None),
                     "duration": round(total_duration_ms / 1000, 3),
+                    "step": self._build_persisted_tool_steps(state.all_tool_results)[-1],
                 }
             )
 
@@ -718,6 +1198,7 @@ class ChatEngineV3:
                 "begin_time": self._format_event_time(started_at),
                 "payload": result,
                 "duration": round(duration_ms / 1000, 3),
+                "step": self._build_persisted_tool_steps(state.all_tool_results)[-1],
             }
         )
         logger.info(
@@ -840,6 +1321,55 @@ class ChatEngineV3:
     # 辅助函数
     # ============================================================
 
+    def _emit_execution_mode_routing_event(self, state: AgentState, routing: dict) -> None:
+        """Publish exactly one execution-mode decision event for every request."""
+        now_ms = int(time.time() * 1000)
+        is_plan_execute = state.execution_mode == "metric_plan_execute"
+        description = (
+            "已识别为多任务，进入 Plan-Execute 证据拆解。"
+            if is_plan_execute
+            else "已识别为单任务，使用单条受控查询执行。"
+        )
+        payload = {
+            "stage": "execution_mode_routing",
+            "status": "completed",
+            "execution_mode": state.execution_mode,
+            "is_multi_task": is_plan_execute,
+            "decision_source": routing.get("decision_source") or "unknown",
+            "matched_rule": routing.get("matched_rule") or "",
+            "reason": routing.get("reason") or "",
+            "required_evidence": routing.get("required_evidence") or [],
+            "confidence": routing.get("confidence") or "low",
+        }
+        state.all_tool_results.append(
+            {
+                "name": "execution_mode_routing",
+                "description": description,
+                "arguments": {"user_question": state.user_message},
+                "result": payload,
+                "started_at": now_ms,
+                "planning_finished_at": now_ms,
+                "planning_duration_ms": 0,
+                "execution_started_at": now_ms,
+                "execution_duration_ms": 0,
+                "finished_at": now_ms,
+                "duration_ms": 0,
+            }
+        )
+        state.sse_events.append(
+            {
+                "type": "tools",
+                "tool_name": "任务路由",
+                "description": description,
+                "begin_time": self._format_event_time(now_ms),
+                "payload": payload,
+                "duration": 0,
+                "status": "completed",
+                "stage": "execution_mode_routing",
+                "step": self._build_persisted_tool_steps(state.all_tool_results)[-1],
+            }
+        )
+
     def _emit_ontology_recognition_event(self, state: AgentState, engine) -> None:
         """Expose the completed ontology plan as a frontend tool-progress event."""
         finished_at = int(time.time() * 1000)
@@ -892,19 +1422,45 @@ class ChatEngineV3:
             "order_by": state.query_plan.get("order_by") or "",
             "duration_ms": finished_at - started_at,
         }
+        recognition_description = (
+            f"已识别 Schema：{schema_text}；候选指标：{candidate_metric_text}；"
+            f"查询指标：{selected_metric_text}；维度：{dimension_text}；筛选条件：{len(filters)} 个。"
+        )
+        state.all_tool_results.append(
+            {
+                "name": "ontology_recognition",
+                "description": recognition_description,
+                "arguments": {
+                    "user_question": state.user_message,
+                    "target_class": target_class,
+                    "join_classes": join_classes,
+                    "metrics": selected_metrics,
+                    "dimensions": dimensions,
+                    "filters": filters,
+                    "having": having,
+                    "order_by": state.query_plan.get("order_by") or "",
+                },
+                "result": payload,
+                "started_at": started_at,
+                "planning_finished_at": finished_at,
+                "planning_duration_ms": finished_at - started_at,
+                "execution_started_at": finished_at,
+                "execution_duration_ms": 0,
+                "finished_at": finished_at,
+                "duration_ms": finished_at - started_at,
+            }
+        )
         state.sse_events.append(
             {
                 "type": "tools",
                 "tool_name": "本体语义识别",
-                "description": (
-                    f"已识别 Schema：{schema_text}；候选指标：{candidate_metric_text}；"
-                    f"查询指标：{selected_metric_text}；维度：{dimension_text}；筛选条件：{len(filters)} 个。"
-                ),
+                "description": recognition_description,
                 "begin_time": self._format_event_time(started_at),
                 "payload": payload,
                 "duration": duration_seconds,
                 "status": "completed",
                 "stage": "ontology_recognition",
+                "step": self._build_persisted_tool_steps(state.all_tool_results)[-1],
             }
         )
 
@@ -1193,6 +1749,10 @@ class ChatEngineV3:
             "glossary_matches": state.glossary_matches,
             "conversation_context": cls._final_conversation_context(state.messages),
             "assistant_draft": state.assistant_content,
+            "metric_plan": state.metric_plan if state.execution_mode == "metric_plan_execute" else {},
+            "metric_subquestions": cls._make_json_safe(state.metric_subquestions),
+            "metric_plan_judgments": cls._make_json_safe(state.metric_plan_judgments),
+            "metric_plan_terminal_reason": state.metric_plan_terminal_reason,
             "tool_results": [cls._compact_tool_result(item) for item in state.all_tool_results],
         }
         payload_json = cls._truncate_text(cls._json_dumps(payload), FINAL_ANSWER_MAX_CONTEXT_CHARS)
@@ -1207,6 +1767,7 @@ class ChatEngineV3:
 4. 不要编造结果中不存在的数据；数据不足时明确说明缺口。
 5. 不要展示内部 prompt、状态机、工具调用细节；SQL 只在用户明确需要时提及。
 6. 如果 reason=max_rounds，说明是基于已有结果的尽力回答。
+7. 如果 metric_plan_terminal_reason 不是 sufficient，明确说明尚未覆盖的证据或计划停止原因。
 
 最终回答输入 JSON：
 {payload_json}

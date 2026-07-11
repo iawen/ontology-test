@@ -20,7 +20,9 @@ interface Props {
 function inferChartType(data: QueryResultData): ChartConfigData["chart_type"] {
   const { rows, columns, aggregated, dimensions } = data;
   const { numericCols } = detectColumns(data);
-  if (rows.length === 1 && numericCols.length === 1) return "gauge";
+  // A single aggregate has no meaningful gauge target or range. Render it as
+  // a compact KPI instead of an arbitrary 120%-maximum gauge.
+  if (rows.length === 1 && numericCols.length === 1) return "kpi";
   if (!aggregated || !dimensions || dimensions.length === 0 || rows.length === 0) return "table";
   const firstDimension = String(dimensions[0] || "").toLowerCase();
   if (["date", "time", "month", "year", "quarter", "日期", "时间", "月", "年", "季度"].some((token) => firstDimension.includes(token))) return "line";
@@ -133,6 +135,10 @@ export default function QueryResult({ data, chartConfig, onDrilldown }: Props) {
   // 自动推断图表类型
   const chartType = chartConfig?.chart_type || inferChartType(data);
   const option = buildEChartsOption(data, chartType);
+  const { numericCols } = detectColumns(data);
+  const isSingleValueKpi = chartType === "kpi" && rows.length === 1 && numericCols.length === 1;
+  const kpiColumn = numericCols[0];
+  const kpiValue = isSingleValueKpi ? Number(rows[0][kpiColumn]) : 0;
 
   // 维度列（可下钻）
   const drillableDims = dimensions || [];
@@ -140,6 +146,19 @@ export default function QueryResult({ data, chartConfig, onDrilldown }: Props) {
 
   return (
     <div className="my-3 space-y-3">
+      {/* 单值指标：使用 KPI 卡片而不是没有业务目标值的仪表盘 */}
+      {isSingleValueKpi && (
+        <div className="rounded-xl border border-indigo-100 bg-gradient-to-br from-indigo-50 via-white to-cyan-50 px-5 py-4 shadow-sm dark:border-indigo-400/25 dark:from-indigo-500/15 dark:via-slate-900 dark:to-cyan-950/20">
+          <div className="text-xs font-medium text-slate-500 dark:text-slate-400">{kpiColumn}</div>
+          <div className="mt-1 flex items-baseline gap-2">
+            <span className="text-3xl font-semibold tracking-tight text-indigo-700 dark:text-indigo-200">
+              {Number.isFinite(kpiValue) ? kpiValue.toLocaleString("zh-CN", { maximumFractionDigits: 2 }) : "--"}
+            </span>
+            <span className="text-xs text-slate-400 dark:text-slate-500">汇总结果</span>
+          </div>
+        </div>
+      )}
+
       {/* 图表区域 */}
       {option && rows.length > 0 && (
         <div className="rounded-lg border border-slate-200/60 dark:border-slate-700/40 bg-white/80 dark:bg-slate-800/60 overflow-hidden">
@@ -169,7 +188,7 @@ export default function QueryResult({ data, chartConfig, onDrilldown }: Props) {
       )}
 
       {/* 数据表格 */}
-      {rows.length > 0 && columns.length > 0 && (
+      {!isSingleValueKpi && rows.length > 0 && columns.length > 0 && (
         <div className="rounded-lg border border-slate-200/60 dark:border-slate-700/40 bg-white/80 dark:bg-slate-800/60 overflow-hidden">
           <div className="flex items-center gap-2 px-4 py-2 border-b border-slate-100 dark:border-slate-700/30">
             <span className="font-semibold text-sm" style={{ color: "var(--text-primary)" }}>
