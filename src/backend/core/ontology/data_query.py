@@ -177,6 +177,52 @@ class DataQueryEngine:
             candidates.insert(0, preferred_class)
         return candidates
 
+    def _resolve_query_field_class(
+        self,
+        target_class: str,
+        field_name: str,
+        usage: str = "字段",
+        preferred_classes: set[str] | None = None,
+    ) -> str:
+        """Resolve a field to the target or one unambiguously joinable related Class."""
+        field = str(field_name or "").strip()
+        if not field:
+            raise ValueError(f"{usage} 字段名为空")
+
+        if self.field_available_in_class(target_class, field):
+            return target_class
+
+        candidates = self.candidate_field_classes(field)
+        reachable_candidates = [
+            class_id
+            for class_id in candidates
+            if class_id != target_class and self.oe.get_join_path(target_class, class_id)
+        ]
+        if not reachable_candidates:
+            if candidates:
+                raise ValueError(
+                    f"{usage} 字段 {field} 不属于目标 class {target_class}，且候选 class "
+                    f"{', '.join(candidates)} 与目标 class 不存在 JOIN 路径。"
+                )
+            raise ValueError(
+                f"{usage} 字段 {field} 不属于目标 class {target_class} 或任何已配置的关联 class。"
+            )
+
+        preferred_candidates = [
+            class_id
+            for class_id in reachable_candidates
+            if class_id in (preferred_classes or set())
+        ]
+        if len(preferred_candidates) == 1:
+            return preferred_candidates[0]
+        if len(reachable_candidates) == 1:
+            return reachable_candidates[0]
+
+        raise ValueError(
+            f"{usage} 字段 {field} 可属于多个关联 class: {', '.join(reachable_candidates)}。"
+            "请通过 join_classes 明确指定字段所属 class。"
+        )
+
     def get_field_distinct_values(self, class_id: str, field_name: str, limit: int = 200, search: str = "") -> dict:
         """Read distinct non-null values for entity disambiguation from the configured data source."""
         if not self.field_available_in_class(class_id, field_name):
@@ -804,12 +850,38 @@ class DataQueryEngine:
         # ── 1. 自动化依赖推导（核心优化） ──
         # 扫描所有输入的字段，自动判定其归属的语义实体类，免除 LLM 强行指定
         discovered_classes = set(join_classes)
+        explicit_join_classes = set(join_classes)
+        field_class_map: dict[str, str] = {}
+
+        def resolve_field_class(field: str, usage: str) -> str:
+            normalized_field = str(field or "").strip()
+            if normalized_field in field_class_map:
+                return field_class_map[normalized_field]
+            class_id = self._resolve_query_field_class(
+                target_class,
+                normalized_field,
+                usage,
+                explicit_join_classes,
+            )
+            field_class_map[normalized_field] = class_id
+            if class_id != target_class:
+                discovered_classes.add(class_id)
+            logger.debug(
+                "DataQuery field class resolved: query_id=%s usage=%s field=%s target_class=%s resolved_class=%s",
+                query_id,
+                usage,
+                normalized_field,
+                target_class,
+                class_id,
+            )
+            return class_id
         
         for dim in dimensions:
-            cls = self.oe.find_class_by_field(dim)
-            if cls:
-                discovered_classes.add(cls)
-                logger.debug("DataQuery dependency discovered: query_id=%s source=dimension field=%s class=%s", query_id, dim, cls)
+            try:
+                resolve_field_class(dim, "维度")
+            except ValueError as e:
+                logger.warning("DataQuery dimension dependency failed: query_id=%s dimension=%s error=%s", query_id, dim, str(e))
+                return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
 
         for m in metrics:
             m_info = self.oe.get_metric_info(m)
@@ -820,16 +892,18 @@ class DataQueryEngine:
                         discovered_classes.add(metric_class)
                         logger.debug("DataQuery dependency discovered: query_id=%s source=metric metric=%s class=%s", query_id, m, metric_class)
             else:
-                cls = self.oe.find_class_by_field(m)
-                if cls:
-                    discovered_classes.add(cls)
-                    logger.debug("DataQuery dependency discovered: query_id=%s source=metric_field field=%s class=%s", query_id, m, cls)
+                try:
+                    resolve_field_class(m, "指标")
+                except ValueError as e:
+                    logger.warning("DataQuery metric dependency failed: query_id=%s metric=%s error=%s", query_id, m, str(e))
+                    return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
 
         for f in filters:
-            cls = self.oe.find_class_by_field(f.get("field", ""))
-            if cls:
-                discovered_classes.add(cls)
-                logger.debug("DataQuery dependency discovered: query_id=%s source=filter field=%s class=%s", query_id, f.get("field", ""), cls)
+            try:
+                resolve_field_class(f.get("field", ""), "过滤")
+            except ValueError as e:
+                logger.warning("DataQuery filter dependency failed: query_id=%s filter=%s error=%s", query_id, self._log_json(f), str(e))
+                return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
 
         for h in having:
             h_field = h.get("field", "")
@@ -840,10 +914,11 @@ class DataQueryEngine:
                     discovered_classes.add(metric_class)
                     logger.debug("DataQuery dependency discovered: query_id=%s source=having_metric metric=%s class=%s", query_id, h_field, metric_class)
             else:
-                cls = self.oe.find_class_by_field(h_field)
-                if cls:
-                    discovered_classes.add(cls)
-                    logger.debug("DataQuery dependency discovered: query_id=%s source=having field=%s class=%s", query_id, h_field, cls)
+                try:
+                    resolve_field_class(h_field, "HAVING")
+                except ValueError as e:
+                    logger.warning("DataQuery having dependency failed: query_id=%s having=%s error=%s", query_id, self._log_json(h), str(e))
+                    return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
 
         if order_by:
             for ob in order_by.split(","):
@@ -855,10 +930,11 @@ class DataQueryEngine:
                         discovered_classes.add(metric_class)
                         logger.debug("DataQuery dependency discovered: query_id=%s source=order_by_metric metric=%s class=%s", query_id, ob_clean, metric_class)
                 else:
-                    cls = self.oe.find_class_by_field(ob_clean)
-                    if cls:
-                        discovered_classes.add(cls)
-                        logger.debug("DataQuery dependency discovered: query_id=%s source=order_by field=%s class=%s", query_id, ob_clean, cls)
+                    try:
+                        resolve_field_class(ob_clean, "排序")
+                    except ValueError as e:
+                        logger.warning("DataQuery order dependency failed: query_id=%s order_by=%s error=%s", query_id, ob_clean, str(e))
+                        return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
 
         # 移去自身
         discovered_classes.discard(target_class)
@@ -945,7 +1021,7 @@ class DataQueryEngine:
         
         # 维度映射 (自动匹配别名与分组)
         for dim in dimensions:
-            cls = self.oe.find_class_by_field(dim) or target_class
+            cls = field_class_map[str(dim).strip()]
             alias = alias_map.get(cls, "t0")
             try:
                 p_col = self._ensure_query_field(cls, dim, "维度")
@@ -997,7 +1073,7 @@ class DataQueryEngine:
                     )
             else:
                 # 兼容降级逻辑
-                cls = self.oe.find_class_by_field(metric) or target_class
+                cls = field_class_map[str(metric).strip()]
                 alias = alias_map.get(cls, "t0")
                 p_col = self.oe.map_field(cls, metric)
                 try:
@@ -1036,7 +1112,7 @@ class DataQueryEngine:
         where_parts = []
         for f in filters:
             f_field = f.get("field", "")
-            cls = self.oe.find_class_by_field(f_field) or target_class
+            cls = field_class_map[str(f_field).strip()]
             alias = alias_map.get(cls, "t0")
             try:
                 filter_clause = self._build_filter_clause(cls, f, alias)
@@ -1079,7 +1155,7 @@ class DataQueryEngine:
                     return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
                 having_parts.append(having_clause)
             else:
-                cls = self.oe.find_class_by_field(h_field) or target_class
+                cls = field_class_map[str(h_field).strip()]
                 alias = alias_map.get(cls, "t0")
                 try:
                     p_col = self._ensure_query_field(cls, h_field, "HAVING")
@@ -1125,7 +1201,7 @@ class DataQueryEngine:
                         return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
                     order_parts.append(order_part)
                 else:
-                    cls = self.oe.find_class_by_field(ob_clean) or target_class
+                    cls = field_class_map[ob_clean]
                     alias = alias_map.get(cls, "t0")
                     try:
                         p_col = self._ensure_query_field(cls, ob_clean, "排序")
