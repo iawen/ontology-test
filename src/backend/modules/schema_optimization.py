@@ -365,14 +365,20 @@ def _get_document_paths(scenario_id: str, file_ids: list[str]) -> list[str]:
 async def api_stream_schema_optimization(scenario_id: str, run_id: str):
     async def generate():
         last_status = None
+        heartbeat_count = 0
         while True:
-            current_status = optimization_status.get(run_id)
-            if current_status is None:
-                current_status = _load_run_status(scenario_id, run_id)
+            current_status = _current_optimization_status(scenario_id, run_id)
 
             if current_status != last_status:
                 yield f"data: {json.dumps(current_status, ensure_ascii=False)}\n\n"
                 last_status = dict(current_status)
+                heartbeat_count = 0
+            else:
+                heartbeat_count += 1
+                # 保持 SSE 长连接活跃，避免代理因空闲而缓冲或断开流。
+                if heartbeat_count >= 20:
+                    yield ": keepalive\n\n"
+                    heartbeat_count = 0
 
             if not current_status.get("running") and current_status.get("phase") in {"done", "error"}:
                 break
@@ -382,8 +388,20 @@ async def api_stream_schema_optimization(scenario_id: str, run_id: str):
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
+
+
+def _current_optimization_status(scenario_id: str, run_id: str) -> dict:
+    """优先保留内存中的细粒度进度；数据库出现终态后立即以终态为准。"""
+    persisted_status = _load_run_status(scenario_id, run_id)
+    if not persisted_status.get("running"):
+        return persisted_status
+    return optimization_status.get(run_id) or persisted_status
 
 
 def _load_run_status(scenario_id: str, run_id: str) -> dict:

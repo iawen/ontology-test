@@ -76,22 +76,26 @@ class OntologyEngine:
 
     @staticmethod
     def _metric_target_classes(metric: dict) -> list[str]:
-        """Read target_classes with backward-compatible scalar fallbacks."""
-        raw_targets = metric.get("target_classes")
-        if isinstance(raw_targets, str):
+        """Read the Metric anchor and structured input classes."""
+        definition = metric.get("definition", {})
+        if isinstance(definition, str):
             try:
-                raw_targets = json.loads(raw_targets)
+                definition = json.loads(definition or "{}")
             except json.JSONDecodeError:
-                raw_targets = []
-        if not isinstance(raw_targets, list):
-            raw_targets = []
-        if not raw_targets:
-            raw_targets = [metric.get("target_class") or metric.get("class_id")]
-        return list(dict.fromkeys(str(target).strip() for target in raw_targets if str(target or "").strip()))
+                definition = {}
+        definition = definition if isinstance(definition, dict) else {}
+        targets = [definition.get("anchor_class")]
+        targets.extend(
+            item.get("class_id")
+            for item in definition.get("inputs", [])
+            if isinstance(item, dict)
+        )
+        targets.append(metric.get("target_class") or metric.get("class_id"))
+        return list(dict.fromkeys(str(target).strip() for target in targets if str(target or "").strip()))
 
     @classmethod
     def _metric_is_available(cls, metric: dict, class_statuses: dict[str, str]) -> bool:
-        """Keep pending/approved Metrics unless the Metric itself or a target Class is rejected."""
+        """Keep Metrics only when the Metric and every referenced source Class are not rejected."""
         if cls._review_status(metric) == "rejected":
             return False
         target_classes = cls._metric_target_classes(metric)

@@ -30,6 +30,18 @@ def _json_list(value: Any) -> list:
         return []
 
 
+def _json_dict(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
 def _row_to_dict(row) -> dict:
     return {key: row[key] for key in row.keys()} if row else {}
 
@@ -85,7 +97,7 @@ def load_schema_reference_context(
             (scenario_id,),
         ).fetchall()]
         metric_rows = [_row_to_dict(row) for row in conn.execute(
-                """SELECT id, name, description, category, target_class, formula, dimensions, required_dimensions, is_reviewed, review_status
+                """SELECT id, name, description, category, target_class, definition, dimensions, required_dimensions, is_reviewed, review_status
                FROM metrics WHERE scenario_id=?
                ORDER BY is_reviewed DESC, updated_at DESC, id""",
             (scenario_id,),
@@ -189,7 +201,7 @@ def _compact_metric(row: dict) -> dict:
         "name": row.get("name", ""),
         "category": row.get("category", ""),
         "target_class": row.get("target_class", ""),
-        "formula": row.get("formula", ""),
+        "definition": _json_dict(row.get("definition")),
         "dimensions": _json_list(row.get("dimensions"))[:12],
         "required_dimensions": _json_list(row.get("required_dimensions"))[:12],
         "description": _compact_text(row.get("description", "")),

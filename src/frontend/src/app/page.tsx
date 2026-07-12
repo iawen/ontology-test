@@ -130,6 +130,7 @@ function AppContent() {
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const manuallyRenamedConversationIds = useRef(new Set<string>());
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -279,6 +280,26 @@ function AppContent() {
       setMessages([]);
     }
     loadConversations();
+  };
+
+  const renameConversation = async (id: string, title: string) => {
+    const normalizedTitle = title.trim();
+    if (!normalizedTitle) return;
+    manuallyRenamedConversationIds.current.add(id);
+    try {
+      const result = await api(`/api/conversations/${id}`, {
+        method: "PUT",
+        body: JSON.stringify({ title: normalizedTitle }),
+      });
+      if (result?.status !== "ok") throw new Error("会话标题更新失败");
+      setConversations((current) =>
+        current.map((conversation) =>
+          conversation.id === id ? { ...conversation, title: normalizedTitle } : conversation,
+        ),
+      );
+    } catch {
+      manuallyRenamedConversationIds.current.delete(id);
+    }
   };
 
   // SSE 响应引擎
@@ -601,7 +622,7 @@ function AppContent() {
                 );
 
                 // 首问自动更替标题
-                if (messages.length === 0) {
+                if (messages.length === 0 && !manuallyRenamedConversationIds.current.has(convId)) {
                   api(`/api/conversations/${convId}`, {
                     method: "PUT",
                     body: JSON.stringify({ title: text.slice(0, 20) }),
@@ -778,6 +799,7 @@ function AppContent() {
         conversations={conversations}
         activeConvId={activeConvId}
         onSelectConversation={selectConversation}
+        onRenameConversation={renameConversation}
         onDeleteConversation={deleteConversation}
         onNewConversation={newConversation}
         onLogout={handleLogout}

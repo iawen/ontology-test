@@ -43,7 +43,7 @@ export interface SchemaRelationship {
   type: string;
   source_key: string;
   target_key: string;
-  is_reviewed?: ReviewStatus | boolean;
+  is_reviewed?: number | ReviewStatus | boolean;
   created_at?: string;
   updated_at?: string;
 }
@@ -55,17 +55,39 @@ export interface Metric {
   description: string;
   category: string;
   target_class: string;
-  target_classes?: string[];
-  calculation: string;
-  formula: string;
+  definition?: MetricDefinition;
   dimensions: string[];
   required_dimensions: string[];
-  filters_hint: string;
   chart_type: string;
   sort_order: number;
-  is_reviewed?: ReviewStatus | boolean;
+  is_reviewed?: number | ReviewStatus | boolean;
   created_at?: string;
   updated_at?: string;
+}
+
+export type MetricAggregation = "SUM" | "AVG" | "MIN" | "MAX" | "COUNT" | "COUNT_DISTINCT";
+export type MetricExpressionOperator = "ADD" | "SUBTRACT" | "MULTIPLY" | "DIVIDE" | "CONCAT";
+
+export interface MetricInput {
+  id: string;
+  output_name?: string;
+  class_id: string;
+  /** Source-table layout for this individual component; not the Metric anchor. */
+  source_shape?: "wide" | "long";
+  field: string;
+  aggregation: MetricAggregation;
+  filters: Array<{
+    field: string;
+    operator: "=" | "IN" | "!=" | "NOT IN" | "IS NULL" | "IS NOT NULL";
+    value?: string | string[] | null;
+  }>;
+}
+
+export interface MetricDefinition {
+  version: 1;
+  anchor_class: string;
+  expression_operator: MetricExpressionOperator;
+  inputs: MetricInput[];
 }
 
 export interface Concept {

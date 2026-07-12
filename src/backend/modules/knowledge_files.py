@@ -187,6 +187,7 @@ async def stream_extract_status():
     async def generate():
         global extract_status
         last_status = None
+        heartbeat_count = 0
 
         while True:
             current_status = {
@@ -201,6 +202,13 @@ async def stream_extract_status():
             if current_status != last_status:
                 yield f"data: {json.dumps(current_status, ensure_ascii=False)}\n\n"
                 last_status = current_status
+                heartbeat_count = 0
+            else:
+                heartbeat_count += 1
+                # 保持流式连接活跃，避免代理将后续阶段或完成事件缓冲。
+                if heartbeat_count >= 20:
+                    yield ": keepalive\n\n"
+                    heartbeat_count = 0
 
             # 如果已完成或出错，发送最后一条消息后结束
             if not extract_status["running"] and extract_status["phase"] in ("done", "error"):
@@ -212,10 +220,12 @@ async def stream_extract_status():
         generate(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
         }
     )
+
 
 # ============================================================
 # Helper: 同步 schema.json → SQLite
@@ -435,7 +445,8 @@ def _sync_schema_db(scenario_id: str):
     seen_metric_ids = set()
     for c in raw_metrics:
         metric_id = c.get("id")
-        if not metric_id:
+        definition = c.get("definition") if isinstance(c.get("definition"), dict) else {}
+        if not metric_id or definition.get("version") != 1:
             continue
         if metric_id in seen_metric_ids:
             skipped_duplicates["metrics"] += 1
@@ -446,9 +457,9 @@ def _sync_schema_db(scenario_id: str):
             continue
         metrics.append((
             c["id"], scenario_id, c.get("name", c.get("name_cn", c["id"])), c.get("description", ""),
-            c.get("category", ""), c.get("target_class", ""), c.get("calculation", ""),
-            c.get("formula", ""), _json_text(c.get("dimensions")), _json_text(c.get("required_dimensions")),
-            c.get("filters_hint", ""), c.get("chart_type", "bar"), c.get("sort_order", 0),
+            c.get("category", ""), definition.get("anchor_class", ""), _json_text(definition),
+            _json_text(c.get("dimensions")), _json_text(c.get("required_dimensions")),
+            c.get("chart_type", "bar"), c.get("sort_order", 0),
             _reviewed_value(c.get("is_reviewed", False)),
         ))
 
@@ -487,13 +498,13 @@ def _sync_schema_db(scenario_id: str):
         if metric_id in existing_metrics:
             conn.execute(
                 """UPDATE metrics
-                   SET name=?, description=?, category=?, target_class=?, calculation=?, formula=?, dimensions=?, required_dimensions=?, filters_hint=?, chart_type=?, sort_order=?, is_reviewed=?, review_status='pending', updated_at=CURRENT_TIMESTAMP
+                         SET name=?, description=?, category=?, target_class=?, definition=?, dimensions=?, required_dimensions=?, chart_type=?, sort_order=?, is_reviewed=?, review_status='pending', updated_at=CURRENT_TIMESTAMP
                    WHERE id=? AND scenario_id=? AND is_reviewed IS NOT TRUE AND COALESCE(review_status, 'pending') NOT IN ('approved','rejected')""",
-                (item[2], item[3], item[4], item[5], item[6], item[7], item[8], item[9], item[10], item[11], item[12], item[13], metric_id, scenario_id),
+                (item[2], item[3], item[4], item[5], item[6], item[7], item[8], item[9], item[10], item[11], metric_id, scenario_id),
             )
         else:
             conn.execute(
-                "INSERT INTO metrics (id, scenario_id, name, description, category, target_class, calculation, formula, dimensions, required_dimensions, filters_hint, chart_type, sort_order, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO metrics (id, scenario_id, name, description, category, target_class, definition, dimensions, required_dimensions, chart_type, sort_order, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'pending', CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 item,
             )
 
@@ -582,12 +593,22 @@ def _run_extraction(scenario_id:str, business_name: str, batch_size: int,
             reviewed_schema_context=load_schema_reference_context(scenario_id),
         )
 
-        extract_status["running"] = False
-        extract_status["phase"] = "done"
-        extract_status["result"] = result
-
+        extract_status.update({
+            "running": True,
+            "phase": "syncing",
+            "progress": 1,
+            "total": 1,
+            "message": "正在校验并同步提取结果到 Schema 数据库...",
+        })
         sync_stats = _sync_schema_db(scenario_id=scenario_id)
-        extract_status["message"] = _format_sync_summary(sync_stats)
+        extract_status.update({
+            "running": False,
+            "phase": "done",
+            "progress": 1,
+            "total": 1,
+            "message": _format_sync_summary(sync_stats),
+            "result": result,
+        })
         reset_engine(scenario_id)
         if log_id:
             finish_extraction_log(

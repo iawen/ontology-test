@@ -6,7 +6,7 @@ CRUD + lookup_metric（供 Chat 工具链调用）
 
 import json
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from core.db.db import get_db
 from configs.global_config import Cfg
@@ -16,6 +16,67 @@ router = APIRouter()
 
 
 REVIEW_STATUSES = {"pending", "approved", "rejected"}
+SOURCE_SHAPES = {"wide", "long"}
+METRIC_FILTER_OPERATORS = {"=", "!=", "IN", "NOT IN", "IS NULL", "IS NOT NULL"}
+
+def _metric_definition(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _validate_metric_definition(scenario_id: str, definition: dict) -> tuple[str, list[str]]:
+    definition = _metric_definition(definition)
+    if definition.get("version") != 1:
+        raise HTTPException(400, "指标定义版本不受支持")
+    anchor_class = str(definition.get("anchor_class") or "").strip()
+    inputs = definition.get("inputs")
+    if not anchor_class or not isinstance(inputs, list) or not inputs:
+        raise HTTPException(400, "指标定义必须包含锚点类和至少一个组成项")
+    if str(definition.get("expression_operator") or "") not in {"ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "CONCAT"}:
+        raise HTTPException(400, "指标表达式操作符不支持")
+    conn = get_db()
+    rows = conn.execute("SELECT id, fields, properties FROM schema_classes WHERE scenario_id=?", (scenario_id,)).fetchall()
+    conn.close()
+    class_fields = {}
+    for row in rows:
+        try:
+            fields = json.loads(row["fields"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            fields = []
+        class_fields[row["id"]] = {str(item.get("name") or item.get("physical_name") or "").strip() for item in fields if isinstance(item, dict)}
+    if anchor_class not in class_fields:
+        raise HTTPException(400, "锚点类不存在")
+    source_classes = []
+    for item in inputs:
+        if not isinstance(item, dict):
+            raise HTTPException(400, "指标组成项格式无效")
+        class_id = str(item.get("class_id") or "").strip()
+        source_shape = str(item.get("source_shape") or "wide").lower().strip()
+        field = str(item.get("field") or "").strip()
+        aggregation = str(item.get("aggregation") or "").upper()
+        if class_id not in class_fields or not field or field not in class_fields[class_id]:
+            raise HTTPException(400, "指标组成项的来源类或字段无效")
+        if source_shape not in SOURCE_SHAPES:
+            raise HTTPException(400, "指标组成项的 source_shape 仅支持 wide 或 long")
+        if aggregation not in {"SUM", "AVG", "MIN", "MAX", "COUNT", "COUNT_DISTINCT"}:
+            raise HTTPException(400, "指标组成项的聚合方式不支持")
+        filters = item.get("filters", [])
+        if not isinstance(filters, list):
+            raise HTTPException(400, "指标组成项的固定条件必须是数组")
+        if source_shape == "long" and not filters:
+            raise HTTPException(400, "窄表指标组成项必须配置至少一个固定条件")
+        for filter_item in filters:
+            if not isinstance(filter_item, dict):
+                raise HTTPException(400, "指标组成项的固定条件格式无效")
+            filter_field = str(filter_item.get("field") or "").strip()
+            operator = str(filter_item.get("operator") or "").upper().strip()
+            if not filter_field or filter_field not in class_fields[class_id]:
+                raise HTTPException(400, "指标组成项的固定条件字段无效")
+            if operator not in METRIC_FILTER_OPERATORS:
+                raise HTTPException(400, "指标组成项的固定条件操作符不支持")
+            if operator not in {"IS NULL", "IS NOT NULL"} and filter_item.get("value") in (None, "", []):
+                raise HTTPException(400, "指标组成项的固定条件必须包含值")
+        source_classes.append(class_id)
+    return anchor_class, list(dict.fromkeys(source_classes))
 
 
 def _reviewed_value(value) -> bool:
@@ -42,28 +103,13 @@ def _is_reviewed_status(value) -> int:
     return {"rejected": -1, "approved": 1}.get(value, 0)
 
 
-def _target_classes(target_class, target_classes=None) -> list[str]:
-    values = target_classes if target_classes is not None else target_class
-    if isinstance(values, str):
-        values = [values]
-    if not isinstance(values, list):
-        return []
-    return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
-
-
-def _row_target_classes(row: dict) -> list[str]:
-    try:
-        values = json.loads(row.get("target_classes") or "[]")
-    except (TypeError, json.JSONDecodeError):
-        values = []
-    return _target_classes(row.get("target_class", ""), values or None)
-
-
 def _sync_ontology_files(scenario_id: str):
     from modules.schema import _sync_schema_files
+    from prompts.prompt import reset_engine
 
     try:
         _sync_schema_files(scenario_id)
+        reset_engine(scenario_id)
     except Exception as e:
         raise HTTPException(500, f"数据已保存，但同步 schema 文件失败: {e}")
 
@@ -86,8 +132,10 @@ async def list_metrics(scenario_id: str):
         d = dict(r)
         d["dimensions"] = json.loads(d.get("dimensions", "[]"))
         d["required_dimensions"] = json.loads(d.get("required_dimensions", "[]"))
-        d["target_classes"] = _row_target_classes(d)
-        d["target_class"] = d["target_classes"][0] if d["target_classes"] else ""
+        try:
+            d["definition"] = json.loads(d.get("definition") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            d["definition"] = {}
         # chart_type 可能不存在于旧数据库中
         d.setdefault("chart_type", "bar")
         d["review_status"] = _review_status(d.get("review_status"), d.get("is_reviewed", 0))
@@ -96,27 +144,46 @@ async def list_metrics(scenario_id: str):
     return result
 
 
+@router.get("/api/scenarios/{scenario_id}/metrics/field-values")
+async def metric_field_values(
+    scenario_id: str,
+    class_id: str = Query(...),
+    field: str = Query(...),
+    q: str = Query("", max_length=100),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Return bounded DISTINCT values for a configured logical Class field."""
+    try:
+        from prompts.prompt import init_prompt, get_query_engine
+
+        init_prompt(scenario_id)
+        query_engine = get_query_engine(scenario_id)
+        if not query_engine.field_available_in_class(class_id, field):
+            raise HTTPException(400, "字段不属于指定目标类")
+        return query_engine.get_field_distinct_values(class_id, field, limit=limit, search=q)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"加载字段候选值失败: {e}")
+
+
 @router.post("/api/scenarios/{scenario_id}/metrics")
 @router.post("/api/admin/scenarios/{scenario_id}/metrics", include_in_schema=False)
 async def create_metric(scenario_id: str, req: MetricCreate):
     conn = get_db()
     review_status = _review_status(req.review_status, req.is_reviewed)
-    target_classes = _target_classes(req.target_class, req.target_classes)
-    if not target_classes:
-        conn.close()
-        raise HTTPException(400, "目标类必填")
+    anchor_class, _ = _validate_metric_definition(scenario_id, req.definition)
     try:
         conn.execute(
             """INSERT INTO metrics
-                             (id, scenario_id, name, description, category, target_class, target_classes,
-                calculation, formula, dimensions, required_dimensions,
-                                         filters_hint, chart_type, sort_order, is_reviewed, review_status, created_at, updated_at)
-                                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+                             (id, scenario_id, name, description, category, target_class, definition,
+                dimensions, required_dimensions, chart_type, sort_order, is_reviewed, review_status, created_at, updated_at)
+                                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
             (req.id, scenario_id, req.name, req.description, req.category,
-                         target_classes[0], json.dumps(target_classes, ensure_ascii=False), req.calculation, req.formula,
+                         anchor_class, json.dumps(req.definition, ensure_ascii=False),
              json.dumps(req.dimensions, ensure_ascii=False),
              json.dumps(req.required_dimensions, ensure_ascii=False),
-                 req.filters_hint, req.chart_type, req.sort_order, _is_reviewed_status(review_status), review_status),
+                 req.chart_type, req.sort_order, _is_reviewed_status(review_status), review_status),
         )
         conn.commit()
     except Exception as e:
@@ -132,21 +199,23 @@ async def create_metric(scenario_id: str, req: MetricCreate):
 async def update_metric(scenario_id: str, metric_id: str, req: MetricUpdate):
     conn = get_db()
     sets, vals = [], []
+    if req.definition is not None:
+        anchor_class, _ = _validate_metric_definition(scenario_id, req.definition)
+        sets.extend(["definition=?", "target_class=?"])
+        vals.extend([json.dumps(req.definition, ensure_ascii=False), anchor_class])
     for k, v in [("name", req.name), ("description", req.description),
                   ("category", req.category),
-                  ("calculation", req.calculation), ("formula", req.formula),
-                  ("filters_hint", req.filters_hint), ("chart_type", req.chart_type),
+                  ("chart_type", req.chart_type),
                   ("sort_order", req.sort_order)]:
         if v is not None and v != "":
             sets.append(f"{k}=?")
             vals.append(v)
-    if req.target_classes is not None or req.target_class != "":
-        target_classes = _target_classes(req.target_class, req.target_classes)
-        if not target_classes:
+    if req.definition is None and req.target_class:
+        if not req.target_class.strip():
             conn.close()
             raise HTTPException(400, "目标类必填")
-        sets.extend(["target_class=?", "target_classes=?"])
-        vals.extend([target_classes[0], json.dumps(target_classes, ensure_ascii=False)])
+        sets.append("target_class=?")
+        vals.append(req.target_class.strip())
     if req.dimensions is not None:
         sets.append("dimensions=?")
         vals.append(json.dumps(req.dimensions, ensure_ascii=False))
@@ -224,13 +293,10 @@ def lookup_metric(scenario_id: str, metric_name: str) -> dict | None:
                 "description": r["description"],
                 "category": r["category"],
                 "target_class": r["target_class"],
-                "target_classes": _row_target_classes(dict(r)),
-                "calculation": r["calculation"],
-                "formula": r["formula"],
+                "definition": json.loads(r.get("definition") or "{}"),
                 "dimensions": json.loads(r["dimensions"]),
                 "required_dimensions": json.loads(r.get("required_dimensions", "[]")),
                 "chart_type": r.get("chart_type", "bar"),
-                "filters_hint": r["filters_hint"],
             }
     return None
 

@@ -10,7 +10,12 @@ import EmptyState from "@/components/ui/EmptyState";
 import SearchInput from "@/components/ui/SearchInput";
 import LoadingSpinner from "@/components/ui/LoadingSpinner";
 import ScenarioSelector from "@/components/ScenarioSelector";
-import type { Metric, SchemaClass } from "@/lib/types";
+import type {
+  Metric,
+  MetricDefinition,
+  MetricInput,
+  SchemaClass,
+} from "@/lib/types";
 import {
   normalizeReviewStatus,
   reviewStatusClassName,
@@ -60,27 +65,42 @@ function metricIdFromName(name: string) {
   );
 }
 
-function parseDimensionList(value: string) {
+function parseFilterValues(value: string) {
   return value
     .split(/[,，、;；\r\n]+/)
     .map((item) => item.trim())
     .filter(Boolean);
 }
 
+function emptyMetricInput(index: number): MetricInput {
+  return {
+    id: `input_${Date.now()}_${index}`,
+    class_id: "",
+    source_shape: "wide",
+    field: "",
+    aggregation: "SUM",
+    filters: [],
+  };
+}
+
+function emptyMetricDefinition(): MetricDefinition {
+  return {
+    version: 1,
+    anchor_class: "",
+    expression_operator: "ADD",
+    inputs: [emptyMetricInput(0)],
+  };
+}
+
 function normalizeMetric(metric: Metric): Metric {
-  const targetClasses = Array.isArray(metric.target_classes)
-    ? metric.target_classes
-    : metric.target_class
-      ? [metric.target_class]
-      : [];
   return {
     ...metric,
-    target_class: metric.target_class || targetClasses[0] || "",
-    target_classes: targetClasses,
+    target_class: metric.target_class || metric.definition?.anchor_class || "",
     dimensions: Array.isArray(metric.dimensions) ? metric.dimensions : [],
     required_dimensions: Array.isArray(metric.required_dimensions)
       ? metric.required_dimensions
       : [],
+    definition: metric.definition || undefined,
   };
 }
 
@@ -88,14 +108,13 @@ function metricSortValue(metric: Metric, key: SortKey) {
   if (key === "is_reviewed") return normalizeReviewStatus(metric.is_reviewed);
   if (key === "chart_type")
     return CHART_LABELS[metric.chart_type] || metric.chart_type || "";
-  if (key === "target_class") return (metric.target_classes || []).join(",");
+  if (key === "target_class") return metric.target_class || "";
   return String(metric[key] || "");
 }
 
 function metricTargetClasses(metric: Partial<Metric> | null | undefined) {
-  if (!metric) return [];
-  if (Array.isArray(metric.target_classes)) return metric.target_classes;
-  return metric.target_class ? [metric.target_class] : [];
+  const targetClass = metric?.definition?.anchor_class || metric?.target_class;
+  return targetClass ? [targetClass] : [];
 }
 
 function schemaClassLabel(schemaClass: SchemaClass) {
@@ -105,8 +124,8 @@ function schemaClassLabel(schemaClass: SchemaClass) {
 }
 
 export default function MetricManager() {
-  const { activeScenario, addToast } = useApp();
-  const api = useApi();
+  const { activeScenario, addToast, token } = useApp();
+  const api = useApi(token);
   const [metrics, setMetrics] = useState<Metric[]>([]);
   const [schemaClasses, setSchemaClasses] = useState<SchemaClass[]>([]);
   const [loading, setLoading] = useState(false);
@@ -116,8 +135,9 @@ export default function MetricManager() {
   const [filterReviewStatus, setFilterReviewStatus] = useState("");
   const [editMetric, setEditMetric] = useState<Partial<Metric> | null>(null);
   const [targetClassSearch, setTargetClassSearch] = useState("");
-  const [dimensionText, setDimensionText] = useState("");
-  const [requiredDimensionText, setRequiredDimensionText] = useState("");
+  const [metricFilterValueOptions, setMetricFilterValueOptions] = useState<
+    Record<string, string[]>
+  >({});
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [selectedMetricIds, setSelectedMetricIds] = useState<string[]>([]);
@@ -140,9 +160,7 @@ export default function MetricManager() {
     }
 
     try {
-      const data = await api(
-        `/api/scenarios/${activeScenario}/schema/classes`,
-      );
+      const data = await api(`/api/scenarios/${activeScenario}/schema/classes`);
       setSchemaClasses(data || []);
     } catch {
       addToast("error", "加载目标类失败");
@@ -185,18 +203,33 @@ export default function MetricManager() {
       addToast("warning", "名称必填");
       return;
     }
-    if (!metricTargetClasses(editMetric).length) {
-      addToast("warning", "目标类必选");
+    if (!metricDefinition.anchor_class) {
+      addToast("warning", "请选择锚点类");
+      return;
+    }
+    if (
+      !metricDefinition.inputs.length ||
+      metricDefinition.inputs.some((input) => !input.class_id || !input.field)
+    ) {
+      addToast("warning", "请完整配置至少一个指标组成项");
+      return;
+    }
+    if (
+      metricDefinition.inputs.some(
+        (input) => input.source_shape === "long" && !input.filters?.length,
+      )
+    ) {
+      addToast("warning", "窄表指标组成项必须配置至少一个固定条件");
       return;
     }
     const isEdit = !!editMetric.id;
     const payload = {
       ...editMetric,
       id: isEdit ? editMetric.id : metricIdFromName(editMetric.name),
-      target_class: metricTargetClasses(editMetric),
-      target_classes: metricTargetClasses(editMetric),
-      dimensions: parseDimensionList(dimensionText),
-      required_dimensions: parseDimensionList(requiredDimensionText),
+      target_class: metricDefinition.anchor_class,
+      definition: metricDefinition,
+      dimensions: editMetric.dimensions || [],
+      required_dimensions: editMetric.required_dimensions || [],
     };
     try {
       const idSuffix = isEdit ? `/${editMetric.id}` : "";
@@ -208,8 +241,6 @@ export default function MetricManager() {
       setIsModalOpen(false);
       setEditMetric(null);
       setTargetClassSearch("");
-      setDimensionText("");
-      setRequiredDimensionText("");
       invalidateCache(cacheKey);
       load(true);
     } catch (e: any) {
@@ -248,7 +279,10 @@ export default function MetricManager() {
           body: JSON.stringify({ ids: selectedMetricIds }),
         },
       );
-      addToast("success", `已删除 ${result?.deleted ?? selectedMetricIds.length} 个指标`);
+      addToast(
+        "success",
+        `已删除 ${result?.deleted ?? selectedMetricIds.length} 个指标`,
+      );
       setSelectedMetricIds([]);
       setIsBatchDeleteOpen(false);
       invalidateCache(cacheKey);
@@ -288,6 +322,28 @@ export default function MetricManager() {
       ),
     [schemaClassOptions],
   );
+  const semanticSourceClass = useMemo(
+    () => schemaClassById.get(metricTargetClasses(editMetric)[0] || ""),
+    [editMetric, schemaClassById],
+  );
+  const semanticFields = semanticSourceClass?.fields || [];
+  const metricDefinition = useMemo<MetricDefinition>(() => {
+    const definition = editMetric?.definition;
+    if (definition?.version === 1) return definition;
+    return {
+      ...emptyMetricDefinition(),
+      anchor_class: metricTargetClasses(editMetric)[0] || "",
+    };
+  }, [editMetric]);
+  const componentSourceClassOptions = useMemo(() => {
+    const anchorClass = metricDefinition.anchor_class;
+    if (!anchorClass) return schemaClassOptions;
+    return [...schemaClassOptions].sort((left, right) => {
+      if (left.id === anchorClass) return -1;
+      if (right.id === anchorClass) return 1;
+      return 0;
+    });
+  }, [metricDefinition.anchor_class, schemaClassOptions]);
   const availableTargetClassOptions = useMemo(() => {
     const selected = new Set(metricTargetClasses(editMetric));
     const keyword = targetClassSearch.trim().toLowerCase();
@@ -357,24 +413,56 @@ export default function MetricManager() {
       : `${targetClass}（未匹配）`;
   };
 
-  const updateTargetClasses = (targetClasses: string[]) => {
+  const toggleDimension = (field: string, required = false) => {
+    const key = required ? "required_dimensions" : "dimensions";
+    const current = editMetric?.[key] || [];
+    const next = current.includes(field)
+      ? current.filter((item) => item !== field)
+      : [...current, field];
+    setEditMetric({ ...editMetric!, [key]: next });
+  };
+
+  const updateMetricDefinition = (definition: MetricDefinition) => {
     setEditMetric({
       ...editMetric!,
-      target_class: targetClasses[0] || "",
-      target_classes: targetClasses,
+      definition,
+      target_class: definition.anchor_class,
     });
   };
 
-  const addTargetClass = (targetClass: string) => {
-    const current = metricTargetClasses(editMetric);
-    if (current.includes(targetClass)) return;
-    updateTargetClasses([...current, targetClass]);
+  const updateMetricInput = (index: number, changes: Partial<MetricInput>) => {
+    updateMetricDefinition({
+      ...metricDefinition,
+      inputs: metricDefinition.inputs.map((input, inputIndex) =>
+        inputIndex === index ? { ...input, ...changes } : input,
+      ),
+    });
   };
 
-  const removeTargetClass = (targetClass: string) => {
-    updateTargetClasses(
-      metricTargetClasses(editMetric).filter((item) => item !== targetClass),
-    );
+  const updateMetricInputFilters = (
+    inputIndex: number,
+    filters: MetricInput["filters"],
+  ) => updateMetricInput(inputIndex, { filters });
+
+  const metricInputFilterValueKey = (classId: string, field: string) =>
+    `${classId}:${field}`;
+  const loadMetricInputFilterValues = async (
+    classId: string,
+    field: string,
+  ) => {
+    const cacheKey = metricInputFilterValueKey(classId, field);
+    if (!classId || !field || metricFilterValueOptions[cacheKey]) return;
+    try {
+      const result = await api(
+        `/api/scenarios/${activeScenario}/metrics/field-values?class_id=${encodeURIComponent(classId)}&field=${encodeURIComponent(field)}&limit=100`,
+      );
+      setMetricFilterValueOptions((current) => ({
+        ...current,
+        [cacheKey]: (result?.values || []).map(String),
+      }));
+    } catch (error: any) {
+      addToast("warning", error.message || "无法加载字段候选值，可手动输入");
+    }
   };
 
   const renderSortableHeader = (key: SortKey, label: string) => {
@@ -416,19 +504,15 @@ export default function MetricManager() {
               scenario_id: activeScenario,
               category: "",
               target_class: "",
-              target_classes: [],
-              calculation: "",
-              formula: "",
               dimensions: [],
               required_dimensions: [],
-              filters_hint: "",
+              definition: emptyMetricDefinition(),
               chart_type: "bar",
               sort_order: 0,
               is_reviewed: 0,
             });
-            setDimensionText("");
-            setRequiredDimensionText("");
             setTargetClassSearch("");
+            setMetricFilterValueOptions({});
             setIsModalOpen(true);
           }}
           className="btn-primary"
@@ -568,11 +652,17 @@ export default function MetricManager() {
                       type="checkbox"
                       checked={
                         sortedMetrics.length > 0 &&
-                        sortedMetrics.every((metric) => selectedMetricIds.includes(metric.id))
+                        sortedMetrics.every((metric) =>
+                          selectedMetricIds.includes(metric.id),
+                        )
                       }
                       onChange={() => {
-                        const visibleIds = sortedMetrics.map((metric) => metric.id);
-                        const allVisibleSelected = visibleIds.every((id) => selectedMetricIds.includes(id));
+                        const visibleIds = sortedMetrics.map(
+                          (metric) => metric.id,
+                        );
+                        const allVisibleSelected = visibleIds.every((id) =>
+                          selectedMetricIds.includes(id),
+                        );
                         setSelectedMetricIds((current) =>
                           allVisibleSelected
                             ? current.filter((id) => !visibleIds.includes(id))
@@ -645,10 +735,6 @@ export default function MetricManager() {
                       <button
                         onClick={() => {
                           setEditMetric(m);
-                          setDimensionText((m.dimensions || []).join(", "));
-                          setRequiredDimensionText(
-                            (m.required_dimensions || []).join(", "),
-                          );
                           setTargetClassSearch("");
                           setIsModalOpen(true);
                         }}
@@ -677,10 +763,9 @@ export default function MetricManager() {
           setIsModalOpen(false);
           setEditMetric(null);
           setTargetClassSearch("");
-          setDimensionText("");
-          setRequiredDimensionText("");
         }}
         title={editMetric?.id ? "编辑指标" : "新增指标"}
+        width="max-w-6xl"
         footer={
           <>
             <button
@@ -688,8 +773,6 @@ export default function MetricManager() {
                 setIsModalOpen(false);
                 setEditMetric(null);
                 setTargetClassSearch("");
-                setDimensionText("");
-                setRequiredDimensionText("");
               }}
               className="btn-outline"
             >
@@ -753,125 +836,365 @@ export default function MetricManager() {
               rows={2}
             />
           </div>
-          <div>
-            <label className="mb-1.5 block text-xs font-medium text-slate-500">
-              目标类
-            </label>
-            <div className="rounded border border-slate-200 bg-slate-50/80 p-2.5">
-              <div className="mb-2 flex min-h-9 flex-wrap items-center gap-2">
-                {metricTargetClasses(editMetric).length ? (
-                  metricTargetClasses(editMetric).map((targetClass) => (
-                    <span
-                      key={targetClass}
-                      className={[
-                        "inline-flex max-w-full items-center gap-1 rounded-full",
-                        "border border-sky-200 bg-sky-50 px-2.5 py-1",
-                        "text-xs font-medium text-sky-700",
-                      ].join(" ")}
-                    >
-                      <span className="truncate">
-                        {targetClassLabel(targetClass)}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => removeTargetClass(targetClass)}
-                        className="rounded-full p-0.5 text-sky-500 hover:bg-sky-100 hover:text-sky-800"
-                        aria-label={`移除 ${targetClass}`}
-                      >
-                        <X className="h-3 w-3" />
-                      </button>
-                    </span>
-                  ))
-                ) : (
-                  <span className="text-xs text-slate-400">未选择目标类</span>
-                )}
+          <div className="rounded border border-sky-200 bg-sky-50/40 p-4">
+            <h3 className="text-sm font-semibold text-slate-700">
+              指标来源与计算
+            </h3>
+            <p className="mt-1 text-xs text-slate-500">
+              每个组成项可选择不同来源类和字段；同一表多字段、跨表指标均使用同一个表达式模型。
+            </p>
+            <div className="mt-4 grid gap-3 md:grid-cols-3">
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-slate-500">
+                  锚点类
+                </label>
+                <select
+                  value={metricDefinition.anchor_class}
+                  onChange={(event) =>
+                    updateMetricDefinition({
+                      ...metricDefinition,
+                      anchor_class: event.target.value,
+                    })
+                  }
+                  className="w-full"
+                >
+                  <option value="">请选择锚点类</option>
+                  {schemaClassOptions.map((schemaClass) => (
+                    <option key={schemaClass.id} value={schemaClass.id}>
+                      {schemaClassLabel(schemaClass)}
+                    </option>
+                  ))}
+                </select>
               </div>
-              <div className="mb-2 flex items-center gap-2 border-t border-slate-200 pt-2">
-                <input
-                  value={targetClassSearch}
-                  onChange={(event) => setTargetClassSearch(event.target.value)}
-                  className="h-8 min-w-0 flex-1 bg-white text-xs"
-                  placeholder="搜索目标类名称、ID 或描述"
-                />
-                <span className="whitespace-nowrap text-xs text-slate-400">
-                  {availableTargetClassOptions.length} 个可选
-                </span>
-                {targetClassSearch && (
-                  <button
-                    type="button"
-                    onClick={() => setTargetClassSearch("")}
-                    className={[
-                      "inline-flex h-8 items-center gap-1 rounded border",
-                      "border-slate-200 bg-white px-2 text-xs text-slate-500",
-                      "hover:bg-slate-100",
-                    ].join(" ")}
-                  >
-                    <X className="h-3 w-3" />
-                    清空
-                  </button>
-                )}
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-slate-500">
+                  组成项计算方式
+                </label>
+                <select
+                  value={metricDefinition.expression_operator}
+                  onChange={(event) =>
+                    updateMetricDefinition({
+                      ...metricDefinition,
+                      expression_operator: event.target
+                        .value as MetricDefinition["expression_operator"],
+                    })
+                  }
+                  className="w-full"
+                >
+                  <option value="ADD">相加</option>
+                  <option value="SUBTRACT">依次相减</option>
+                  <option value="MULTIPLY">相乘</option>
+                  <option value="DIVIDE">依次相除</option>
+                  <option value="CONCAT">拼接（并列展示）</option>
+                </select>
               </div>
-              <div className="flex max-h-28 flex-wrap gap-1.5 overflow-y-auto border-t border-slate-200 pt-2">
-                {availableTargetClassOptions.length ? (
-                  availableTargetClassOptions.map((schemaClass) => (
-                    <button
-                      key={schemaClass.id}
-                      type="button"
-                      onClick={() => addTargetClass(schemaClass.id)}
-                      className={[
-                        "inline-flex max-w-full items-center gap-1 rounded-full",
-                        "border border-slate-200 bg-white px-2.5 py-1 text-xs",
-                        "text-slate-600 transition-colors hover:border-sky-300",
-                        "hover:bg-sky-50 hover:text-sky-700",
-                      ].join(" ")}
-                    >
-                      <Plus className="h-3 w-3 shrink-0" />
-                      <span className="truncate">
-                        {schemaClassLabel(schemaClass)}
-                      </span>
-                    </button>
-                  ))
-                ) : (
-                  <span className="py-1 text-xs text-slate-400">
-                    没有匹配的目标类
-                  </span>
-                )}
-              </div>
+              <div />
             </div>
-          </div>
-          <div>
-            <label
-              htmlFor="metric-field-5"
-              className="mb-1.5 block text-xs font-medium text-slate-500"
-            >
-              计算方式
-            </label>
-            <textarea
-              id="metric-field-5"
-              value={editMetric?.calculation || ""}
-              onChange={(e) =>
-                setEditMetric({ ...editMetric!, calculation: e.target.value })
-              }
-              className="w-full"
-              rows={2}
-            />
-          </div>
-          <div>
-            <label
-              htmlFor="metric-field-6"
-              className="mb-1.5 block text-xs font-medium text-slate-500"
-            >
-              公式
-            </label>
-            <textarea
-              id="metric-field-6"
-              value={editMetric?.formula || ""}
-              onChange={(e) =>
-                setEditMetric({ ...editMetric!, formula: e.target.value })
-              }
-              className="w-full font-mono text-xs"
-              rows={2}
-            />
+            <div className="mt-4">
+              <div className="mb-2 flex items-center justify-between">
+                <label className="text-xs font-medium text-slate-600">
+                  指标组成项
+                </label>
+                <button
+                  type="button"
+                  onClick={() =>
+                    updateMetricDefinition({
+                      ...metricDefinition,
+                      inputs: [
+                        ...metricDefinition.inputs,
+                        emptyMetricInput(metricDefinition.inputs.length),
+                      ],
+                    })
+                  }
+                  className="btn-ghost text-xs text-sky-700"
+                >
+                  <Plus className="mr-1 inline h-3 w-3" />
+                  添加组成项
+                </button>
+              </div>
+              <div className="space-y-3">
+                {metricDefinition.inputs.map((input, index) => {
+                  const inputClass = schemaClassById.get(input.class_id);
+                  return (
+                    <div
+                      key={input.id}
+                      className="rounded border border-slate-200 bg-white p-3"
+                    >
+                      <div className="grid gap-2 md:grid-cols-[minmax(11rem,1.2fr)_7rem_minmax(11rem,1fr)_9rem_minmax(10rem,0.9fr)_2rem]">
+                        <select
+                          value={input.class_id}
+                          onChange={(event) =>
+                            updateMetricInput(index, {
+                              class_id: event.target.value,
+                              field: "",
+                              filters: [],
+                            })
+                          }
+                        >
+                          <option value="">选择来源类</option>
+                          {componentSourceClassOptions.map((schemaClass) => (
+                            <option key={schemaClass.id} value={schemaClass.id}>
+                              {schemaClassLabel(schemaClass)}
+                            </option>
+                          ))}
+                        </select>
+                        <select
+                          value={input.source_shape || "wide"}
+                          onChange={(event) =>
+                            updateMetricInput(index, {
+                              source_shape: event.target.value as NonNullable<
+                                MetricInput["source_shape"]
+                              >,
+                            })
+                          }
+                          aria-label="来源数据形态"
+                        >
+                          <option value="wide">宽表</option>
+                          <option value="long">窄表</option>
+                        </select>
+                        <select
+                          value={input.field}
+                          disabled={!inputClass}
+                          onChange={(event) => {
+                            const field = inputClass?.fields.find(
+                              (item) => item.name === event.target.value,
+                            );
+                            updateMetricInput(index, {
+                              field: event.target.value,
+                              output_name: field?.name || "",
+                            });
+                          }}
+                        >
+                          <option value="">选择字段</option>
+                          {(inputClass?.fields || []).map((field) => (
+                            <option key={field.name} value={field.name}>
+                              {field.name}（{field.physical_name}）
+                            </option>
+                          ))}
+                        </select>
+                        <select
+                          value={input.aggregation}
+                          onChange={(event) =>
+                            updateMetricInput(index, {
+                              aggregation: event.target
+                                .value as MetricInput["aggregation"],
+                            })
+                          }
+                        >
+                          <option value="SUM">求和</option>
+                          <option value="AVG">平均</option>
+                          <option value="MIN">最小</option>
+                          <option value="MAX">最大</option>
+                          <option value="COUNT">计数</option>
+                          <option value="COUNT_DISTINCT">去重计数</option>
+                        </select>
+                        <input
+                          value={input.output_name || ""}
+                          onChange={(event) =>
+                            updateMetricInput(index, {
+                              output_name: event.target.value,
+                            })
+                          }
+                          placeholder="组成项名称（默认字段中文名）"
+                          disabled={
+                            metricDefinition.expression_operator !== "CONCAT"
+                          }
+                        />
+                        <button
+                          type="button"
+                          disabled={metricDefinition.inputs.length === 1}
+                          onClick={() =>
+                            updateMetricDefinition({
+                              ...metricDefinition,
+                              inputs: metricDefinition.inputs.filter(
+                                (_, inputIndex) => inputIndex !== index,
+                              ),
+                            })
+                          }
+                          className="btn-ghost p-1 text-slate-500 disabled:opacity-30"
+                          aria-label="删除指标组成项"
+                        >
+                          <X className="h-4 w-4" />
+                        </button>
+                      </div>
+                      {(input.source_shape || "wide") === "long" && (
+                        <div className="mt-3 rounded border border-amber-200 bg-amber-50/60 p-2.5">
+                          <div className="mb-2 flex items-center justify-between">
+                            <span className="text-xs font-medium text-amber-800">
+                              窄表固定条件（WHERE）
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateMetricInputFilters(index, [
+                                  ...(input.filters || []),
+                                  { field: "", operator: "=", value: "" },
+                                ])
+                              }
+                              className="btn-ghost text-xs text-amber-800"
+                            >
+                              <Plus className="mr-1 inline h-3 w-3" />
+                              添加条件
+                            </button>
+                          </div>
+                          {(input.filters || []).length === 0 ? (
+                            <p className="text-xs text-amber-700">
+                              请选择用于识别该 KPI、规格或类别的固定条件。
+                            </p>
+                          ) : (
+                            <div className="space-y-2">
+                              {input.filters.map((filter, filterIndex) => {
+                                const valueKey = metricInputFilterValueKey(
+                                  input.class_id,
+                                  filter.field,
+                                );
+                                const hasNoValue =
+                                  filter.operator === "IS NULL" ||
+                                  filter.operator === "IS NOT NULL";
+                                return (
+                                  <div
+                                    key={`${input.id}-filter-${filterIndex}`}
+                                    className="grid gap-2 md:grid-cols-[minmax(10rem,1fr)_8rem_minmax(11rem,1fr)_2rem]"
+                                  >
+                                    <select
+                                      value={filter.field}
+                                      disabled={!inputClass}
+                                      onChange={(event) => {
+                                        const field = event.target.value;
+                                        const next = input.filters.map(
+                                          (item, itemIndex) =>
+                                            itemIndex === filterIndex
+                                              ? { ...item, field }
+                                              : item,
+                                        );
+                                        updateMetricInputFilters(index, next);
+                                        void loadMetricInputFilterValues(
+                                          input.class_id,
+                                          field,
+                                        );
+                                      }}
+                                    >
+                                      <option value="">选择条件字段</option>
+                                      {(inputClass?.fields || []).map(
+                                        (field) => (
+                                          <option
+                                            key={field.name}
+                                            value={field.name}
+                                          >
+                                            {field.name}
+                                          </option>
+                                        ),
+                                      )}
+                                    </select>
+                                    <select
+                                      value={filter.operator}
+                                      onChange={(event) =>
+                                        updateMetricInputFilters(
+                                          index,
+                                          input.filters.map(
+                                            (item, itemIndex) =>
+                                              itemIndex === filterIndex
+                                                ? {
+                                                    ...item,
+                                                    operator: event.target
+                                                      .value as MetricInput["filters"][number]["operator"],
+                                                  }
+                                                : item,
+                                          ),
+                                        )
+                                      }
+                                    >
+                                      <option value="=">等于</option>
+                                      <option value="!=">不等于</option>
+                                      <option value="IN">属于</option>
+                                      <option value="NOT IN">不属于</option>
+                                      <option value="IS NULL">为空</option>
+                                      <option value="IS NOT NULL">
+                                        不为空
+                                      </option>
+                                    </select>
+                                    <input
+                                      list={`${input.id}-filter-values-${filterIndex}`}
+                                      disabled={hasNoValue}
+                                      value={
+                                        Array.isArray(filter.value)
+                                          ? filter.value.join("，")
+                                          : String(filter.value || "")
+                                      }
+                                      onChange={(event) => {
+                                        const rawValue = event.target.value;
+                                        const value =
+                                          filter.operator === "IN" ||
+                                          filter.operator === "NOT IN"
+                                            ? parseFilterValues(rawValue)
+                                            : rawValue;
+                                        updateMetricInputFilters(
+                                          index,
+                                          input.filters.map(
+                                            (item, itemIndex) =>
+                                              itemIndex === filterIndex
+                                                ? { ...item, value }
+                                                : item,
+                                          ),
+                                        );
+                                      }}
+                                      placeholder={
+                                        hasNoValue
+                                          ? "无需填写值"
+                                          : filter.operator === "IN" ||
+                                              filter.operator === "NOT IN"
+                                            ? "多个值用逗号分隔"
+                                            : "固定条件值"
+                                      }
+                                    />
+                                    <datalist
+                                      id={`${input.id}-filter-values-${filterIndex}`}
+                                    >
+                                      {(
+                                        metricFilterValueOptions[valueKey] || []
+                                      ).map((value) => (
+                                        <option key={value} value={value} />
+                                      ))}
+                                    </datalist>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateMetricInputFilters(
+                                          index,
+                                          input.filters.filter(
+                                            (_, itemIndex) =>
+                                              itemIndex !== filterIndex,
+                                          ),
+                                        )
+                                      }
+                                      className="btn-ghost p-1 text-slate-500 hover:text-red-500"
+                                      aria-label="删除固定条件"
+                                    >
+                                      <X className="h-4 w-4" />
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {inputClass && (
+                        <p className="mt-2 text-xs text-slate-400">
+                          组成项 {index + 1}：{input.aggregation}(
+                          {schemaClassLabel(inputClass)}.{input.field || "字段"}
+                          )
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              <p className="mt-2 text-xs text-slate-500">
+                每个组成项独立声明来源数据形态：宽表直接选择对应业务字段；窄表选择公共数值字段，并通过该组成项固定条件区分
+                KPI、规格等口径。表达式按组成项顺序计算；“拼接（并列展示）”会将每个组成项独立聚合并输出为一列。
+              </p>
+            </div>
           </div>
           <div className="grid grid-cols-2 gap-4">
             <div>
@@ -917,51 +1240,76 @@ export default function MetricManager() {
               />
             </div>
           </div>
-          <div>
-            <label
-              htmlFor="metric-field-9"
-              className="mb-1.5 block text-xs font-medium text-slate-500"
-            >
-              维度 (逗号分隔)
-            </label>
-            <input
-              id="metric-field-9"
-              value={dimensionText}
-              onChange={(e) => setDimensionText(e.target.value)}
-              className="w-full"
-              placeholder="region, category"
-            />
-          </div>
-          <div>
-            <label
-              htmlFor="metric-field-10"
-              className="mb-1.5 block text-xs font-medium text-slate-500"
-            >
-              必要维度 (逗号分隔)
-            </label>
-            <input
-              id="metric-field-10"
-              value={requiredDimensionText}
-              onChange={(e) => setRequiredDimensionText(e.target.value)}
-              className="w-full"
-            />
-          </div>
-          <div>
-            <label
-              htmlFor="metric-field-11"
-              className="mb-1.5 block text-xs font-medium text-slate-500"
-            >
-              筛选提示
-            </label>
-            <input
-              id="metric-field-11"
-              value={editMetric?.filters_hint || ""}
-              onChange={(e) =>
-                setEditMetric({ ...editMetric!, filters_hint: e.target.value })
-              }
-              className="w-full"
-            />
-          </div>
+          {semanticSourceClass && (
+            <div className="grid gap-4 md:grid-cols-2">
+              {(
+                [
+                  [
+                    "dimensions",
+                    "可选维度",
+                    "用户提问时可用于筛选、分组的字段",
+                  ],
+                  [
+                    "required_dimensions",
+                    "必要维度",
+                    "查询该指标时必须明确的字段",
+                  ],
+                ] as const
+              ).map(([key, label, hint]) => (
+                <div key={key} className="rounded border border-slate-200 p-3">
+                  <label className="block text-xs font-medium text-slate-600">
+                    {label}
+                  </label>
+                  <p className="mt-1 text-xs text-slate-400">{hint}</p>
+                  <select
+                    className="mt-2 w-full text-sm"
+                    value=""
+                    onChange={(event) => {
+                      if (event.target.value)
+                        toggleDimension(
+                          event.target.value,
+                          key === "required_dimensions",
+                        );
+                    }}
+                  >
+                    <option value="">从字段下拉框添加…</option>
+                    {semanticFields
+                      .filter(
+                        (field) =>
+                          !(editMetric?.[key] || []).includes(field.name),
+                      )
+                      .map((field) => (
+                        <option key={field.name} value={field.name}>
+                          {field.name}（{field.physical_name}）
+                        </option>
+                      ))}
+                  </select>
+                  <div className="mt-2 flex min-h-6 flex-wrap gap-1.5">
+                    {(editMetric?.[key] || []).length ? (
+                      (editMetric?.[key] || []).map((field) => (
+                        <button
+                          key={field}
+                          type="button"
+                          onClick={() =>
+                            toggleDimension(
+                              field,
+                              key === "required_dimensions",
+                            )
+                          }
+                          className="inline-flex items-center gap-1 rounded-full bg-sky-50 px-2 py-1 text-xs text-sky-700 hover:bg-sky-100"
+                        >
+                          {field}
+                          <X className="h-3 w-3" />
+                        </button>
+                      ))
+                    ) : (
+                      <span className="text-xs text-slate-400">尚未选择</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
           <div>
             <label className="mb-1.5 block text-xs font-medium text-slate-500">
               人工审核

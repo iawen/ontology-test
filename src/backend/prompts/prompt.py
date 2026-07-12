@@ -80,7 +80,6 @@ def _load_metrics_by_class(scenario_id: str) -> dict[str, list[str]]:
         grouped.setdefault(target_class, []).append(
             f"    关联指标: **{r['name']}** (`{r['id']}`)"
             f" | 说明: {r['description']}"
-            f" | 计算: {r['calculation']}"
             f" | 可选维度: {', '.join(dims) or '-'}"
             f" | 必选维度: {', '.join(req_dims) or '-'}"
             f" | 推荐图表: {chart}"

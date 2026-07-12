@@ -148,10 +148,14 @@ export default function DataManager() {
         const selectedConn = connections.find(c => c.id === dbTablesConnId) || connections.find(c => c.is_active === 1) || connections[0];
         if (selectedConn) body.db_connection_id = selectedConn.id;
       }
+      setExtractStatus({ running: true, phase: "starting", progress: 0, total: 0, message: "正在启动本体提取..." });
       await api(`/api/scenarios/${activeScenario}/extract`, { method: "POST", body: JSON.stringify(body) });
       addToast("success", "提取已启动");
       startExtractStream();
-    } catch (e: any) { addToast("error", e.message || "启动提取失败"); }
+    } catch (e: any) {
+      setExtractStatus({ running: false, phase: "error", progress: 0, total: 0, message: e.message || "启动提取失败" });
+      addToast("error", e.message || "启动提取失败");
+    }
   };
 
   // SSE 流式监听提取进度
@@ -163,6 +167,24 @@ export default function DataManager() {
       extractEventSourceRef.current.close();
     }
 
+    const stopMonitoring = () => {
+      if (extractEventSourceRef.current) {
+        extractEventSourceRef.current.close();
+        extractEventSourceRef.current = null;
+      }
+    };
+
+    const applyStatus = (status: typeof extractStatus) => {
+      setExtractStatus(status);
+      if (!status.running && (status.phase === "done" || status.phase === "error")) {
+        stopMonitoring();
+        if (status.phase === "done") {
+          invalidateCache(cacheKey);
+          loadFiles(true);
+        }
+      }
+    };
+
     // 使用相对路径，通过 next.config.ts 的 rewrite 代理到后端
     const eventSource = new EventSource("/api/extract/stream");
     extractEventSourceRef.current = eventSource;
@@ -170,19 +192,7 @@ export default function DataManager() {
     eventSource.onmessage = (event) => {
       try {
         const status = JSON.parse(event.data);
-        setExtractStatus(status);
-
-        // 如果已完成或出错，关闭连接
-        if (!status.running && (status.phase === "done" || status.phase === "error")) {
-          eventSource.close();
-          extractEventSourceRef.current = null;
-
-          // 完成后刷新文件列表
-          if (status.phase === "done") {
-            invalidateCache(cacheKey);
-            loadFiles(true);
-          }
-        }
+        applyStatus(status);
       } catch (e) {
         console.error("解析 SSE 消息失败:", e);
       }
@@ -190,9 +200,7 @@ export default function DataManager() {
 
     eventSource.onerror = (error) => {
       console.error("SSE 连接错误:", error);
-      eventSource.close();
-      extractEventSourceRef.current = null;
-      if (extractStatus.running) addToast("error", "提取进度连接已断开，请稍后重试");
+      // 不主动关闭：EventSource 会自动重连，持续接收后续阶段及最终状态。
     };
   };
 

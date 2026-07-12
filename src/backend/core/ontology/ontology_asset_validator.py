@@ -10,9 +10,9 @@ class OntologyAssetValidator:
 
     def validate_schema_assets(self, schema: dict, summaries: list[dict]) -> dict:
         summary_index = self._build_summary_index(summaries)
-        valid_classes, class_fields, class_ids = self._validate_classes(schema.get("classes", []), summary_index)
+        valid_classes, class_fields, class_metric_fields, class_ids = self._validate_classes(schema.get("classes", []), summary_index)
         valid_relationships = self._validate_relationships(schema.get("relationships", []), class_fields, class_ids)
-        valid_metrics = self._validate_metrics(schema.get("metrics", []), class_fields, class_ids)
+        valid_metrics = self._validate_metrics(schema.get("metrics", []), class_metric_fields, class_ids)
         valid_concepts = self._validate_concepts(schema.get("concepts", []), class_ids)
         if self.ensure_concept_coverage:
             valid_concepts = self.ensure_concept_coverage(valid_classes, valid_concepts)
@@ -26,9 +26,10 @@ class OntologyAssetValidator:
             "concepts": valid_concepts,
         }
 
-    def _validate_classes(self, classes: list[dict], summary_index: dict[str, dict]) -> tuple[list[dict], dict[str, set[str]], set[str]]:
+    def _validate_classes(self, classes: list[dict], summary_index: dict[str, dict]) -> tuple[list[dict], dict[str, set[str]], dict[str, set[str]], set[str]]:
         valid_classes = []
         class_fields = {}
+        class_metric_fields = {}
         class_ids = set()
 
         for cls in classes:
@@ -72,10 +73,15 @@ class OntologyAssetValidator:
             cls["fields"] = fields
             cls["primary_key"] = ",".join(primary_key)
             class_fields[cid] = seen
+            class_metric_fields[cid] = seen | {
+                str(field.get("name") or "").strip()
+                for field in fields
+                if str(field.get("name") or "").strip()
+            }
             class_ids.add(cid)
             valid_classes.append(cls)
 
-        return valid_classes, class_fields, class_ids
+        return valid_classes, class_fields, class_metric_fields, class_ids
 
     def _validate_relationships(self, relationships: list[dict], class_fields: dict[str, set[str]], class_ids: set[str]) -> list[dict]:
         valid = []
@@ -114,10 +120,63 @@ class OntologyAssetValidator:
                 continue
 
             fields = class_fields.get(target_class, set())
-            formula_fields = self._extract_formula_fields(metric.get("formula", ""))
-            invalid_formula_fields = [field for field in formula_fields if field not in fields]
-            if invalid_formula_fields:
-                self._log_asset_drop("metric", metric_id, f"公式字段不属于 {target_class}: {invalid_formula_fields}")
+            definition = metric.get("definition", {})
+            if isinstance(definition, str):
+                try:
+                    definition = json.loads(definition or "{}")
+                except json.JSONDecodeError:
+                    definition = {}
+            inputs = definition.get("inputs", []) if isinstance(definition, dict) else []
+            if definition.get("version") != 1 or not inputs:
+                self._log_asset_drop("metric", metric_id, "缺少有效的结构化 definition")
+                continue
+            if str(definition.get("anchor_class", "")).strip() != target_class:
+                self._log_asset_drop("metric", metric_id, "definition.anchor_class 与 target_class 不一致")
+                continue
+            operator = str(definition.get("expression_operator", "")).upper()
+            if operator not in {"ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "CONCAT"}:
+                self._log_asset_drop("metric", metric_id, "definition.expression_operator 不支持")
+                continue
+            input_error = ""
+            for item in inputs:
+                if not isinstance(item, dict):
+                    input_error = "definition 组成项格式无效"
+                    break
+                source_class = str(item.get("class_id", "")).strip()
+                source_shape = str(item.get("source_shape", "wide")).lower().strip()
+                source_field = str(item.get("field", "")).strip()
+                aggregation = str(item.get("aggregation", "")).upper().strip()
+                output_name = str(item.get("output_name", "")).strip()
+                filters = item.get("filters", [])
+                if source_class not in class_ids or source_field not in class_fields.get(source_class, set()):
+                    input_error = "definition 组成项引用了无效 Class 或字段"
+                    break
+                if not output_name:
+                    input_error = "definition 组成项缺少 output_name"
+                    break
+                if source_shape not in {"wide", "long"}:
+                    input_error = "definition 组成项的 source_shape 不支持"
+                    break
+                if aggregation not in {"SUM", "AVG", "MIN", "MAX", "COUNT", "COUNT_DISTINCT"}:
+                    input_error = "definition 组成项的 aggregation 不支持"
+                    break
+                if not isinstance(filters, list) or (source_shape == "long" and not filters):
+                    input_error = "窄表 definition 组成项必须包含固定条件"
+                    break
+                if not all(
+                    isinstance(filter_item, dict)
+                    and str(filter_item.get("field", "")).strip() in class_fields.get(source_class, set())
+                    and str(filter_item.get("operator", "")).upper().strip() in {"=", "!=", "IN", "NOT IN", "IS NULL", "IS NOT NULL"}
+                    and (
+                        str(filter_item.get("operator", "")).upper().strip() in {"IS NULL", "IS NOT NULL"}
+                        or filter_item.get("value") not in (None, "", [])
+                    )
+                    for filter_item in filters
+                ):
+                    input_error = "definition 组成项包含无效固定条件"
+                    break
+            if input_error:
+                self._log_asset_drop("metric", metric_id, input_error)
                 continue
 
             dimensions = self._parse_json_list(metric.get("dimensions", []))
@@ -127,7 +186,7 @@ class OntologyAssetValidator:
             if invalid_dimensions:
                 self._log_asset_drop("metric_dimension", metric_id, f"剔除无效维度字段: {invalid_dimensions}")
 
-            invalid_required = [field for field in required_dimensions if field not in fields]
+            invalid_required = [field for field in required_dimensions if field not in valid_dimensions]
             if invalid_required:
                 self._log_asset_drop("metric", metric_id, f"required_dimensions 包含无效字段: {invalid_required}")
                 continue

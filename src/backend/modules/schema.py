@@ -24,6 +24,16 @@ def _json_list(value) -> list:
         return []
 
 
+def _json_dict(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(value or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
 def _normalize_fields(fields: list) -> list[dict]:
     normalized = []
     for item in fields or []:
@@ -230,48 +240,103 @@ async def admin_update_class(scenario_id: str, class_id: str, req: SchemaClassEd
 
 
 def _rename_metric_class_references(conn, scenario_id: str, old_class_id: str, new_class_id: str) -> None:
-    """Replace exact class IDs in both legacy target_class and multi-class target_classes fields."""
+    """Replace exact class IDs in Metric anchors and structured input definitions."""
     metric_rows = conn.execute(
-        "SELECT id, target_class, target_classes FROM metrics WHERE scenario_id=?",
+        "SELECT id, target_class, definition FROM metrics WHERE scenario_id=?",
         (scenario_id,),
     ).fetchall()
     for row in metric_rows:
         metric = dict(row)
-        target_classes = _json_list(metric.get("target_classes"))
-        if not target_classes and metric.get("target_class"):
-            target_classes = [metric["target_class"]]
-        renamed_classes = [new_class_id if value == old_class_id else value for value in target_classes]
-        renamed_classes = list(dict.fromkeys(renamed_classes))
         target_class = new_class_id if metric.get("target_class") == old_class_id else metric.get("target_class", "")
-        if renamed_classes:
-            target_class = renamed_classes[0]
-        if renamed_classes != target_classes or target_class != metric.get("target_class", ""):
+        definition = _json_dict(metric.get("definition"))
+        if definition.get("anchor_class") == old_class_id:
+            definition["anchor_class"] = new_class_id
+        for input_item in definition.get("inputs", []):
+            if isinstance(input_item, dict) and input_item.get("class_id") == old_class_id:
+                input_item["class_id"] = new_class_id
+        if definition.get("anchor_class"):
+            target_class = definition["anchor_class"]
+        if target_class != metric.get("target_class", "") or definition != _json_dict(metric.get("definition")):
             conn.execute(
-                """UPDATE metrics SET target_class=?, target_classes=?, updated_at=CURRENT_TIMESTAMP
+                """UPDATE metrics SET target_class=?, definition=?, updated_at=CURRENT_TIMESTAMP
                    WHERE id=? AND scenario_id=?""",
-                (target_class, json.dumps(renamed_classes, ensure_ascii=False), metric["id"], scenario_id),
+                (target_class, json.dumps(definition, ensure_ascii=False), metric["id"], scenario_id),
             )
 
 
 @router.delete("/api/scenarios/{scenario_id}/schema/classes/{class_id}")
 @router.delete("/api/admin/scenarios/{scenario_id}/schema/classes/{class_id}", include_in_schema=False)
 async def admin_delete_class(scenario_id: str, class_id: str):
-    """管理面板：删除 Schema 类"""
+    """删除 Class 及其所有直接依赖的 Relationship、Metric 和 Concept。"""
     conn = get_db()
-    # 同时删除关联的关系
-    conn.execute(
-        "DELETE FROM schema_relationships WHERE scenario_id=? AND (source=? OR target=?)",
-        (scenario_id, class_id, class_id),
-    )
-    conn.execute(
-        "DELETE FROM schema_classes WHERE id=? AND scenario_id=?",
-        (class_id, scenario_id),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        class_row = conn.execute(
+            "SELECT id FROM schema_classes WHERE id=? AND scenario_id=?",
+            (class_id, scenario_id),
+        ).fetchone()
+        if class_row is None:
+            raise HTTPException(404, "待删除的类不存在")
+
+        # Metric 不仅可锚定该 Class，也可以在 definition.inputs 中将其作为来源。
+        metric_rows = conn.execute(
+            "SELECT id, target_class, definition FROM metrics WHERE scenario_id=?",
+            (scenario_id,),
+        ).fetchall()
+        dependent_metric_ids = []
+        for metric_row in metric_rows:
+            metric = dict(metric_row)
+            definition = _json_dict(metric.get("definition"))
+            input_class_ids = {
+                str(input_item.get("class_id") or "").strip()
+                for input_item in definition.get("inputs", [])
+                if isinstance(input_item, dict)
+            }
+            if (
+                metric.get("target_class") == class_id
+                or definition.get("anchor_class") == class_id
+                or class_id in input_class_ids
+            ):
+                dependent_metric_ids.append(metric["id"])
+
+        deleted_relationships = conn.execute(
+            "DELETE FROM schema_relationships WHERE scenario_id=? AND (source=? OR target=?)",
+            (scenario_id, class_id, class_id),
+        ).rowcount
+        deleted_concepts = conn.execute(
+            "DELETE FROM concepts WHERE scenario_id=? AND related_class=?",
+            (scenario_id, class_id),
+        ).rowcount
+        deleted_metrics = 0
+        if dependent_metric_ids:
+            placeholders = ",".join("?" for _ in dependent_metric_ids)
+            deleted_metrics = conn.execute(
+                f"DELETE FROM metrics WHERE scenario_id=? AND id IN ({placeholders})",
+                (scenario_id, *dependent_metric_ids),
+            ).rowcount
+        conn.execute(
+            "DELETE FROM schema_classes WHERE id=? AND scenario_id=?",
+            (class_id, scenario_id),
+        )
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(400, f"删除类及关联资产失败: {exc}") from exc
+    finally:
+        conn.close()
 
     _sync_schema_files(scenario_id)
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "deleted": {
+            "classes": 1,
+            "relationships": max(0, deleted_relationships or 0),
+            "metrics": max(0, deleted_metrics or 0),
+            "concepts": max(0, deleted_concepts or 0),
+        },
+    }
 
 
 @router.get("/api/scenarios/{scenario_id}/schema/relationships")
@@ -448,9 +513,6 @@ def _sync_schema_files(scenario_id: str):
     parsed_metrics = []
     for row in metrics:
         m = dict(row)
-        target_classes = _json_list(m.get("target_classes", "[]"))
-        if not target_classes and m.get("target_class"):
-            target_classes = [m["target_class"]]
         parsed_metrics.append({
             "id": m["id"],
             "name": m["name"],
@@ -458,12 +520,9 @@ def _sync_schema_files(scenario_id: str):
             "description": m["description"],
             "category": m["category"],
             "target_class": m["target_class"],
-            "target_classes": target_classes,
-            "calculation": m["calculation"],
-            "formula": m["formula"],
+            "definition": _json_dict(m.get("definition", "{}")),
             "dimensions": _json_list(m["dimensions"]),
             "required_dimensions": _json_list(m["required_dimensions"]),
-            "filters_hint": m["filters_hint"],
             "chart_type": m["chart_type"],
             "sort_order": m["sort_order"],
             "is_reviewed": _is_reviewed_status(

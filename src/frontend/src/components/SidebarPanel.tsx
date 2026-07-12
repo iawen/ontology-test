@@ -1,6 +1,6 @@
 "use client";
 
-import React from "react";
+import React, { useRef, useState } from "react";
 import type { Scenario } from "@/lib/types";
 
 interface Conversation {
@@ -17,6 +17,7 @@ interface SidebarPanelProps {
   conversations: Conversation[];
   activeConvId: string;
   onSelectConversation: (id: string) => void;
+  onRenameConversation: (id: string, title: string) => Promise<void>;
   onDeleteConversation: (id: string, e: React.MouseEvent) => void;
   onNewConversation: () => void;
   onLogout: () => void;
@@ -30,10 +31,36 @@ export default function SidebarPanel({
   conversations,
   activeConvId,
   onSelectConversation,
+  onRenameConversation,
   onDeleteConversation,
   onNewConversation,
   onLogout,
 }: SidebarPanelProps) {
+  const [editingConversationId, setEditingConversationId] = useState("");
+  const [editingTitle, setEditingTitle] = useState("");
+  const cancelledRenameId = useRef("");
+  const savingRenameId = useRef("");
+
+  const startRenaming = (conversation: Conversation, event: React.MouseEvent) => {
+    event.stopPropagation();
+    cancelledRenameId.current = "";
+    setEditingConversationId(conversation.id);
+    setEditingTitle(conversation.title || "");
+  };
+
+  const finishRenaming = async () => {
+    const title = editingTitle.trim();
+    const conversationId = editingConversationId;
+    setEditingConversationId("");
+    if (!conversationId || !title || cancelledRenameId.current === conversationId || savingRenameId.current === conversationId) return;
+    savingRenameId.current = conversationId;
+    try {
+      await onRenameConversation(conversationId, title);
+    } finally {
+      savingRenameId.current = "";
+    }
+  };
+
   return (
     <aside className="w-64 border-r border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-950 flex flex-col h-full flex-shrink-0">
       {/* 顶部场景切换 */}
@@ -65,6 +92,7 @@ export default function SidebarPanel({
         ) : (
           conversations.map((c) => {
             const isActive = c.id === activeConvId;
+            const isEditing = c.id === editingConversationId;
             return (
               <div
                 key={c.id}
@@ -75,14 +103,44 @@ export default function SidebarPanel({
                     : "text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-900/50"
                 }`}
               >
-                <span className="truncate pr-2">💬 {c.title || "未命名对话"}</span>
-                <button
-                  onClick={(e) => onDeleteConversation(c.id, e)}
-                  className="opacity-0 group-hover:opacity-100 hover:text-red-500 p-0.5 text-[10px] rounded transition-opacity"
-                  title="删除会话"
-                >
-                  ✕
-                </button>
+                {isEditing ? (
+                  <input
+                    autoFocus
+                    value={editingTitle}
+                    onClick={(event) => event.stopPropagation()}
+                    onChange={(event) => setEditingTitle(event.target.value)}
+                    onBlur={() => void finishRenaming()}
+                    onKeyDown={(event) => {
+                      event.stopPropagation();
+                      if (event.key === "Enter") event.currentTarget.blur();
+                      if (event.key === "Escape") {
+                        cancelledRenameId.current = c.id;
+                        setEditingConversationId("");
+                      }
+                    }}
+                    className="min-w-0 flex-1 rounded border border-indigo-300 bg-white px-1.5 py-0.5 text-xs text-slate-700 outline-none dark:border-indigo-600 dark:bg-slate-900 dark:text-slate-200"
+                    aria-label="会话标题"
+                  />
+                ) : (
+                  <span className="min-w-0 flex-1 truncate pr-2">💬 {c.title || "未命名对话"}</span>
+                )}
+                {!isEditing && <div className="flex shrink-0 opacity-0 transition-opacity group-hover:opacity-100">
+                  <button
+                    onClick={(event) => startRenaming(c, event)}
+                    className="rounded p-0.5 text-[10px] hover:text-indigo-500"
+                    title="修改标题"
+                    aria-label="修改会话标题"
+                  >
+                    ✎
+                  </button>
+                  <button
+                    onClick={(event) => onDeleteConversation(c.id, event)}
+                    className="rounded p-0.5 text-[10px] hover:text-red-500"
+                    title="删除会话"
+                  >
+                    ✕
+                  </button>
+                </div>}
               </div>
             );
           })

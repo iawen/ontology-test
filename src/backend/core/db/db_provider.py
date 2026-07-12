@@ -284,7 +284,7 @@ def _migrate_db(conn, dialect):
         migrations = [
             ("SELECT required_dimensions FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN required_dimensions TEXT DEFAULT '[]'"),
             ("SELECT chart_type FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN chart_type TEXT DEFAULT 'bar'"),
-            ("SELECT target_classes FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN target_classes TEXT DEFAULT '[]'"),
+            ("SELECT definition FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN definition TEXT DEFAULT '{}'"),
             ("SELECT source_key FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN source_key TEXT DEFAULT ''"),
             ("SELECT target_key FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN target_key TEXT DEFAULT ''"),
             ("SELECT join_key FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN join_key TEXT DEFAULT ''"),
@@ -318,7 +318,12 @@ def _migrate_db(conn, dialect):
         for table in ("schema_classes", "schema_relationships", "metrics", "concepts"):
             conn.execute(f"UPDATE {table} SET created_at=CURRENT_TIMESTAMP WHERE created_at IS NULL OR created_at='' ")
             conn.execute(f"UPDATE {table} SET updated_at=CURRENT_TIMESTAMP WHERE updated_at IS NULL OR updated_at='' ")
-        conn.execute("UPDATE metrics SET target_classes=json_array(target_class) WHERE (target_classes IS NULL OR target_classes='' OR target_classes='[]') AND target_class<>'' ")
+        conn.execute("DELETE FROM metrics WHERE definition IS NULL OR definition='' OR definition='{}'")
+        for column in ("target_classes", "calculation", "formula", "filters_hint", "source_shape", "value_field", "aggregation", "metric_filters", "value_type", "display_format"):
+            try:
+                conn.execute(f"ALTER TABLE metrics DROP COLUMN {column}")
+            except sqlite3.OperationalError:
+                pass
         conn.execute("UPDATE schema_optimization_runs SET started_at=created_at WHERE started_at IS NULL OR started_at='' ")
         for table in ("schema_classes", "schema_relationships", "metrics", "concepts"):
             conn.execute(f"UPDATE {table} SET review_status='approved' WHERE is_reviewed=1 AND (review_status IS NULL OR review_status='' OR review_status='pending')")
@@ -328,7 +333,17 @@ def _migrate_db(conn, dialect):
         migrations = [
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS required_dimensions TEXT DEFAULT '[]'",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS chart_type TEXT DEFAULT 'bar'",
-            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS target_classes TEXT DEFAULT '[]'",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS target_classes",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS calculation",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS formula",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS filters_hint",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS source_shape",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS value_field",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS aggregation",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS metric_filters",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS value_type",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS display_format",
+            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS definition TEXT DEFAULT '{}'",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS source_key TEXT DEFAULT ''",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS target_key TEXT DEFAULT ''",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS join_key TEXT DEFAULT ''",
@@ -358,7 +373,17 @@ def _migrate_db(conn, dialect):
         migrations = [
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS required_dimensions TEXT DEFAULT '[]'",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS chart_type TEXT DEFAULT 'bar'",
-            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS target_classes TEXT DEFAULT '[]'",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS target_classes",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS calculation",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS formula",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS filters_hint",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS source_shape",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS value_field",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS aggregation",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS metric_filters",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS value_type",
+            "ALTER TABLE metrics DROP COLUMN IF EXISTS display_format",
+            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS definition TEXT DEFAULT '{}'",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS source_key TEXT DEFAULT ''",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS target_key TEXT DEFAULT ''",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS join_key TEXT DEFAULT ''",
@@ -503,12 +528,9 @@ def _schema_sql(dialect):
             description TEXT DEFAULT '',
             category TEXT DEFAULT '',
             target_class TEXT DEFAULT '',
-            target_classes TEXT DEFAULT '[]',
-            calculation TEXT DEFAULT '',
-            formula TEXT DEFAULT '',
             dimensions TEXT DEFAULT '[]',
             required_dimensions TEXT DEFAULT '[]',
-            filters_hint TEXT DEFAULT '',
+            definition TEXT DEFAULT '{{}}',
             chart_type TEXT DEFAULT 'bar',
             sort_order INTEGER DEFAULT 0,
             is_reviewed INTEGER DEFAULT 0,

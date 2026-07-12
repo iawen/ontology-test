@@ -7,7 +7,7 @@ from typing import cast
 
 from openai.types.chat import ChatCompletionMessageParam
 
-from agents.ontology_chatbi.helper import metric_target_classes
+from agents.ontology_chatbi.helper import metric_context_summary, metric_definition, metric_target_classes
 from agents.ontology_chatbi.prompt import (
     ONTOLOGY_PLANNING_SYSTEM_PROMPT,
     get_ontology_planning_feedback_prompt,
@@ -163,17 +163,25 @@ class OntologyAgent:
             return any(field_name in engine.get_field_map(class_id) for class_id in allowed_classes)
 
         def infer_metric_from_field(field_name: str) -> dict | None:
-            field_map = engine.get_field_map(target_class)
-            physical_field = field_map.get(field_name, field_name)
-            if physical_field not in field_map.values():
-                return None
-            pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(physical_field)}(?![A-Za-z0-9_])", re.IGNORECASE)
-            matched_metrics = [
-                metric
-                for metric in available_metrics
-                if pattern.search(str(metric.get("formula") or ""))
-                or pattern.search(str(metric.get("calculation") or ""))
-            ]
+            """Resolve a Metric from a structured definition component output name.
+
+            `output_name` is the governed user-facing name of a component (and the
+            output column for CONCAT Metrics). Formula text is legacy metadata and
+            must not be used to infer a structured Metric.
+            """
+            normalized_name = field_name.casefold()
+            matched_metrics = []
+            seen_metric_ids = set()
+            for metric in available_metrics:
+                output_names = {
+                    str(input_item.get("output_name") or "").strip().casefold()
+                    for input_item in metric_definition(metric).get("inputs", [])
+                    if isinstance(input_item, dict) and str(input_item.get("output_name") or "").strip()
+                }
+                metric_id = str(metric.get("id") or "")
+                if normalized_name in output_names and metric_id not in seen_metric_ids:
+                    matched_metrics.append(metric)
+                    seen_metric_ids.add(metric_id)
             return matched_metrics[0] if len(matched_metrics) == 1 else None
 
         def validate_candidate_metric(metric_name: str, source: str) -> tuple[dict | None, str]:
@@ -184,7 +192,7 @@ class OntologyAgent:
             if inferred_metric:
                 resolved_metric = str(inferred_metric.get("id") or inferred_metric.get("name") or metric_name)
                 logger.info(
-                    "Query metric inferred from Class field: target_class=%s source=%s field=%s metric=%s",
+                    "Query metric inferred from definition input output_name: target_class=%s source=%s output_name=%s metric=%s",
                     target_class,
                     source,
                     metric_name,
@@ -194,7 +202,7 @@ class OntologyAgent:
             if not metric_info:
                 return {
                     "valid": False,
-                    "error": f"{source} 必须从当前 Class 的 Metrics 列表中选择，且字段无法反推唯一 Metric：{metric_name}",
+                    "error": f"{source} 必须从当前 Class 的 Metrics 列表中选择，且组成项名称无法反推唯一 Metric：{metric_name}",
                 }, metric_name
             return {
                 "valid": False,
@@ -291,11 +299,7 @@ class OntologyAgent:
         metric_blocks = []
         target_metrics = OntologyAgent._target_class_metrics(scope, engine, metric_candidates or [])
         for metric in target_metrics:
-            metric_blocks.append(
-                f"- {metric.get('name') or metric.get('id')}: id={metric.get('id', '')}; "
-                f"formula={metric.get('formula') or metric.get('calculation', '')}; "
-                f"description={metric.get('description', '')}"
-            )
+            metric_blocks.append(f"- {metric_context_summary(metric)}")
         logger.info(
             "Query detail scope context built: target_class=%s class_count=%d metric_count=%d",
             scope.get("target_class"),
@@ -317,7 +321,7 @@ class OntologyAgent:
         metrics = [
             metric
             for metric in engine.list_metrics()
-            if target_class in metric_target_classes(metric)
+            if str(metric_definition(metric).get("anchor_class") or metric.get("target_class") or "") == target_class
         ]
         return sorted(metrics, key=lambda metric: 0 if str(metric.get("id") or "") in preferred else 1)
 

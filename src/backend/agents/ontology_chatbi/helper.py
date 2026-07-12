@@ -12,21 +12,26 @@ from .constants import (
     TOOL_PURPOSES,
 )
 
-def metric_target_classes(metric: dict) -> list[str]:
-    raw_value = metric.get("target_classes") or metric.get("target_class") or metric.get("class_id")
-    if isinstance(raw_value, list):
-        items = raw_value
-    elif isinstance(raw_value, str):
-        text_value = raw_value.strip()
-        if not text_value:
-            return []
+def metric_definition(metric: dict) -> dict:
+    definition = metric.get("definition", {})
+    if isinstance(definition, str):
         try:
-            parsed = json.loads(text_value)
+            definition = json.loads(definition or "{}")
         except json.JSONDecodeError:
-            parsed = None
-        items = parsed if isinstance(parsed, list) else [text_value]
-    else:
-        return []
+            definition = {}
+    return definition if isinstance(definition, dict) else {}
+
+
+def metric_target_classes(metric: dict) -> list[str]:
+    """Return the Metric anchor plus source classes declared by its structured inputs."""
+    definition = metric_definition(metric)
+    items = [definition.get("anchor_class")]
+    items.extend(
+        input_item.get("class_id")
+        for input_item in definition.get("inputs", [])
+        if isinstance(input_item, dict)
+    )
+    items.append(metric.get("target_class") or metric.get("class_id"))
 
     target_classes = []
     seen = set()
@@ -37,6 +42,39 @@ def metric_target_classes(metric: dict) -> list[str]:
         seen.add(class_id)
         target_classes.append(class_id)
     return target_classes
+
+
+def metric_component_names(metric: dict) -> list[str]:
+    """Return the user-facing names of definition inputs, preserving component order."""
+    return [
+        str(input_item.get("output_name") or input_item.get("field") or input_item.get("id") or "").strip()
+        for input_item in metric_definition(metric).get("inputs", [])
+        if isinstance(input_item, dict) and str(input_item.get("output_name") or input_item.get("field") or input_item.get("id") or "").strip()
+    ]
+
+
+def metric_context_summary(metric: dict) -> str:
+    """Provide LLMs a governed description of the current Metric definition."""
+    definition = metric_definition(metric)
+    components = metric_component_names(metric)
+    input_details = []
+    for input_item in definition.get("inputs", []):
+        if not isinstance(input_item, dict):
+            continue
+        label = str(input_item.get("output_name") or input_item.get("field") or input_item.get("id") or "").strip()
+        class_id = str(input_item.get("class_id") or "").strip()
+        field = str(input_item.get("field") or "").strip()
+        aggregation = str(input_item.get("aggregation") or "SUM").upper()
+        if label:
+            input_details.append(f"{label}={aggregation}({class_id}.{field})")
+    return (
+        f"id={metric.get('id', '')}; 名称={metric.get('name') or metric.get('name_cn', '')}; "
+        f"锚点类={definition.get('anchor_class') or metric.get('target_class', '')}; "
+        f"组成项名称={components}; 组成项={'; '.join(input_details) or '无'}; "
+        f"计算方式={definition.get('expression_operator') or '未定义'}; "
+        f"可选维度={metric.get('dimensions') or []}; 必要维度={metric.get('required_dimensions') or []}; "
+        f"说明={metric.get('description', '')}"
+    )
 
 
 def get_tool_purpose(tool_name: str) -> str:

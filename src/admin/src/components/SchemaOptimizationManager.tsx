@@ -57,10 +57,11 @@ const RUN_STATUS_BADGE: Record<string, string> = {
 };
 
 export default function SchemaOptimizationManager() {
-  const { activeScenario, addToast } = useApp();
-  const api = useApi();
+  const { token, activeScenario, addToast } = useApp();
+  const api = useApi(token);
   const inputRef = useRef<HTMLInputElement>(null);
   const streamRef = useRef<EventSource | null>(null);
+  const completedRunRef = useRef<string | null>(null);
   const [files, setFiles] = useState<OptimizationFile[]>([]);
   const [runs, setRuns] = useState<OptimizationRun[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -137,6 +138,7 @@ export default function SchemaOptimizationManager() {
 
   const runOptimization = async () => {
     if (!activeScenario) return;
+    completedRunRef.current = null;
     setOptimizing(true);
     setProgressStatus({
       run_id: "",
@@ -168,37 +170,42 @@ export default function SchemaOptimizationManager() {
       return;
     }
     streamRef.current?.close();
-    const source = new EventSource(
-      `/api/scenarios/${activeScenario}/schema-optimization/stream/${runId}`,
-    );
-    streamRef.current = source;
-    source.onmessage = async (event) => {
-      const status = JSON.parse(event.data) as OptimizationProgress;
+
+    const stopMonitoring = () => {
+      streamRef.current?.close();
+      streamRef.current = null;
+    };
+    const applyStatus = async (status: OptimizationProgress) => {
       setProgressStatus(status);
       if (
         !status.running &&
         (status.phase === "done" || status.phase === "error")
       ) {
-        source.close();
-        streamRef.current = null;
+        if (completedRunRef.current === runId) return;
+        completedRunRef.current = runId;
+        stopMonitoring();
         setOptimizing(false);
         if (status.phase === "done") {
           invalidateCache(`schema:${activeScenario}`);
           invalidateCacheByPrefix("metrics:");
           invalidateCacheByPrefix("concepts:");
           addToast("success", status.message || "Schema 优化完成");
-          await load();
         } else {
           addToast("error", status.message || "Schema 优化失败");
-          await load();
         }
+        await load();
       }
     };
+    const source = new EventSource(
+      `/api/scenarios/${activeScenario}/schema-optimization/stream/${runId}`,
+    );
+    streamRef.current = source;
+    source.onmessage = async (event) => {
+      await applyStatus(JSON.parse(event.data) as OptimizationProgress);
+    };
     source.onerror = () => {
-      source.close();
-      streamRef.current = null;
-      setOptimizing(false);
-      addToast("error", "Schema 优化进度连接中断");
+      // 不主动关闭：EventSource 会自动重连，确保持续从流式接口接收最终状态。
+      console.warn("Schema 优化进度流暂时断开，正在自动重连");
     };
   };
 

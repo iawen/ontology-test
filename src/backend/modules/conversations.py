@@ -52,15 +52,22 @@ async def create_conversation(scenario_id: str, request: Request):
 @router.put("/api/conversations/{conv_id}")
 async def update_conversation(conv_id: str, request: Request):
     """更新会话标题"""
-    verify_token(request, Cfg.jwt_secret)
+    user = verify_token(request, Cfg.jwt_secret)
     body = await request.json()
+    title = str(body.get("title") or "").strip()
+    if not title:
+        raise HTTPException(400, "会话标题不能为空")
+    if len(title) > 100:
+        raise HTTPException(400, "会话标题不能超过 100 个字符")
     conn = get_db()
-    conn.execute(
-        "UPDATE conversations SET title=?, updated_at=? WHERE id=?",
-        (body.get("title", ""), datetime.now(timezone.utc), conv_id),
+    cursor = conn.execute(
+        "UPDATE conversations SET title=?, updated_at=? WHERE id=? AND user_id=?",
+        (title, datetime.now(timezone.utc), conv_id, user["sub"]),
     )
     conn.commit()
     conn.close()
+    if cursor.rowcount == 0:
+        raise HTTPException(404, "会话不存在")
     return {"status": "ok"}
 
 

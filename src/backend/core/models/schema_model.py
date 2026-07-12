@@ -65,11 +65,9 @@ class MetricOptimization(BaseModel):
     description: str = Field("", description="指标业务定义及应用场景")
     category: str = Field("", description="指标业务分类")
     target_class: str = Field("", description="绑定的实体类ID")
-    calculation: str = Field("", description="计算逻辑自然语言描述")
-    formula: str = Field("", description="可执行SQL聚合公式，如 SUM(total_amount)")
+    definition: dict = Field(default_factory=dict, description="结构化指标定义")
     dimensions: List[str] = Field(default_factory=list, description="可用分析维度物理列名列表")
     required_dimensions: List[str] = Field(default_factory=list, description="最低必要粒度维度字段")
-    filters_hint: str = Field("", description="过滤条件提示")
     chart_type: str = Field("bar", description="推荐图表类型")
 
     @field_validator("id")

@@ -86,14 +86,10 @@ class MetricCreate(BaseModel):
     name: str
     description: str = ""
     category: str = ""
-    # 管理端会同时提交 target_class / target_classes，且前者可能为数组。
-    target_class: str | list[str] = ""
-    target_classes: list[str] = []
-    calculation: str = ""
-    formula: str = ""
+    target_class: str = ""
+    definition: dict = {}
     dimensions: list[str] = []
     required_dimensions: list[str] = []
-    filters_hint: str = ""
     chart_type: str = "bar"
     sort_order: int = 0
     is_reviewed: int | bool = 0
@@ -104,13 +100,10 @@ class MetricUpdate(BaseModel):
     name: str = ""
     description: str = ""
     category: str = ""
-    target_class: str | list[str] = ""
-    target_classes: list[str] | None = None
-    calculation: str = ""
-    formula: str = ""
+    target_class: str = ""
+    definition: dict | None = None
     dimensions: list[str] | None = None
     required_dimensions: list[str] | None = None
-    filters_hint: str = ""
     chart_type: str = ""
     sort_order: int | None = None
     is_reviewed: int | bool | None = None

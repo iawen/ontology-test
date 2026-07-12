@@ -177,7 +177,7 @@ class DataQueryEngine:
             candidates.insert(0, preferred_class)
         return candidates
 
-    def get_field_distinct_values(self, class_id: str, field_name: str, limit: int = 200) -> dict:
+    def get_field_distinct_values(self, class_id: str, field_name: str, limit: int = 200, search: str = "") -> dict:
         """Read distinct non-null values for entity disambiguation from the configured data source."""
         if not self.field_available_in_class(class_id, field_name):
             return {"values": [], "matched_values": []}
@@ -186,10 +186,14 @@ class DataQueryEngine:
         physical_field = self.oe.map_field(class_id, field_name)
         self._register_csv(class_id)
         table_name = self._resolve_table_name(class_id)
+        where_parts = [f"{self._quote_ident(physical_field)} IS NOT NULL"]
+        if search and self.oe.get_field_type(class_id, field_name) != "numeric":
+            where_parts.append(f"{self._quote_ident(physical_field)} LIKE '%{self._escape_value(search)}%'")
         sql = (
             f"SELECT DISTINCT {self._quote_ident(physical_field)} AS value "
             f"FROM {self._quote_table(table_name)} "
-            f"WHERE {self._quote_ident(physical_field)} IS NOT NULL "
+            f"WHERE {' AND '.join(where_parts)} "
+            f"ORDER BY {self._quote_ident(physical_field)} "
             f"LIMIT {safe_limit}"
         )
         rows = self._execute_sql(sql)
@@ -425,6 +429,61 @@ class DataQueryEngine:
     def _metric_class(self, metric_info: dict, default_class: str) -> str:
         return metric_info.get("class_id") or metric_info.get("target_class") or default_class
 
+    def _metric_definition(self, metric_info: dict) -> dict:
+        definition = metric_info.get("definition", {})
+        if isinstance(definition, str):
+            try:
+                definition = json.loads(definition or "{}")
+            except json.JSONDecodeError:
+                definition = {}
+        return definition if isinstance(definition, dict) else {}
+
+    def _definition_source_classes(self, metric_info: dict) -> list[str]:
+        definition = self._metric_definition(metric_info)
+        return list(dict.fromkeys(
+            str(item.get("class_id") or "").strip()
+            for item in definition.get("inputs", [])
+            if isinstance(item, dict) and str(item.get("class_id") or "").strip()
+        ))
+
+    def _definition_input_expr(self, item: dict, alias_map: dict) -> str:
+        if not isinstance(item, dict):
+            raise ValueError("Metric definition 组成项无效")
+        class_id = str(item.get("class_id") or "").strip()
+        field = str(item.get("field") or "").strip()
+        aggregation = str(item.get("aggregation") or "").upper()
+        if class_id not in alias_map or not field or aggregation not in {"SUM", "AVG", "MIN", "MAX", "COUNT", "COUNT_DISTINCT"}:
+            raise ValueError("Metric definition 组成项不完整或来源类未加入查询范围")
+        alias = alias_map[class_id]
+        value_expr = self._col_ref(alias, self._ensure_query_field(class_id, field, "Metric 组成项字段"))
+        conditions = [self._build_filter_clause(class_id, filter_item, alias) for filter_item in item.get("filters", []) if isinstance(filter_item, dict)]
+        if conditions:
+            value_expr = f"CASE WHEN {' AND '.join(conditions)} THEN {value_expr} END"
+        return f"COUNT(DISTINCT {value_expr})" if aggregation == "COUNT_DISTINCT" else f"{aggregation}({value_expr})"
+
+    def _definition_metric_expr(self, metric_info: dict, alias_map: dict) -> Optional[str]:
+        definition = self._metric_definition(metric_info)
+        if definition.get("version") != 1:
+            return None
+        inputs = definition.get("inputs", [])
+        operator = str(definition.get("expression_operator") or "").upper()
+        if not inputs or operator not in {"ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "CONCAT"}:
+            raise ValueError("Metric definition 无效")
+        if operator == "CONCAT":
+            return None
+        expressions = []
+        for item in inputs:
+            expressions.append(self._definition_input_expr(item, alias_map))
+        symbols = {"ADD": " + ", "SUBTRACT": " - ", "MULTIPLY": " * ", "DIVIDE": " / "}
+        return "(" + symbols[operator].join(expressions) + ")"
+
+    def _structured_metric_expr(self, metric_info: dict, default_class: str, alias_map: dict) -> Optional[str]:
+        """Compile a Metric exclusively from its governed structured definition."""
+        definition_expr = self._definition_metric_expr(metric_info, alias_map)
+        if definition_expr:
+            return definition_expr
+        return None
+
     def _extract_formula_field(self, formula: str) -> Optional[str]:
         if not formula:
             return None
@@ -540,6 +599,9 @@ class DataQueryEngine:
         return deduped
 
     def _metric_expr_for_formula(self, metric_info: dict, metric_name: str, default_class: str, alias_map: dict, formula: str) -> str:
+        structured_expr = self._structured_metric_expr(metric_info, default_class, alias_map)
+        if structured_expr:
+            return structured_expr
         cls = self._metric_class(metric_info, default_class)
         alias = alias_map.get(cls, "t0")
         expr, _ = self._split_formula_alias(formula)
@@ -557,24 +619,19 @@ class DataQueryEngine:
         return expr
 
     def _metric_exprs(self, metric_info: dict, metric_name: str, default_class: str, alias_map: dict) -> list[tuple[str, str]]:
-        formula = str(metric_info.get("formula") or "").strip()
-        formula_parts = self._split_formula_parts(formula)
-        if formula_parts:
-            total = len(formula_parts)
+        definition = self._metric_definition(metric_info)
+        if definition.get("version") == 1 and str(definition.get("expression_operator") or "").upper() == "CONCAT":
             return [
                 (
-                    self._metric_expr_for_formula(metric_info, metric_name, default_class, alias_map, part),
-                    self._formula_alias(metric_info, metric_name, default_class, part, index, total),
+                    self._definition_input_expr(item, alias_map),
+                    str(item.get("output_name") or item.get("field") or f"{metric_name}_{index + 1}").strip(),
                 )
-                for index, part in enumerate(formula_parts)
+                for index, item in enumerate(definition.get("inputs", []))
             ]
-
-        cls = self.oe.find_class_by_field(metric_name) or default_class
-        alias = alias_map.get(cls, "t0")
-        p_col = self.oe.map_field(cls, metric_name)
-        f_type = self.oe.get_field_type(cls, metric_name)
-        agg_func = "SUM" if f_type == "numeric" else "COUNT"
-        return [(f'{agg_func}({self._col_ref(alias, p_col)})', metric_name)]
+        structured_expr = self._structured_metric_expr(metric_info, default_class, alias_map)
+        if structured_expr:
+            return [(structured_expr, metric_name)]
+        raise ValueError(f"Metric {metric_name} 缺少有效的结构化 definition")
 
     def _metric_expr(self, metric_info: dict, metric_name: str, default_class: str, alias_map: dict) -> str:
         return self._metric_exprs(metric_info, metric_name, default_class, alias_map)[0][0]
@@ -657,6 +714,42 @@ class DataQueryEngine:
                 normalized_filters.append(item)
         return normalized_filters, normalized_having
 
+    @staticmethod
+    def _filter_value_set(item: dict) -> set[str] | None:
+        operator = str(item.get("operator", "=")).upper().strip()
+        if operator not in {"=", "IN"}:
+            return None
+        value = item.get("value")
+        values = value if isinstance(value, list) else [value]
+        return {str(value) for value in values}
+
+    def _metric_filter_conflict(self, target_class: str, metrics: list, filters: list) -> Optional[str]:
+        """Detect simple equality/IN conflicts between user filters and metric fixed filters."""
+        for metric_name in metrics:
+            metric_info = self.oe.get_metric_info(metric_name)
+            if not metric_info or self._metric_class(metric_info, target_class) != target_class:
+                continue
+            definition = self._metric_definition(metric_info)
+            for input_item in definition.get("inputs", []):
+                if not isinstance(input_item, dict) or str(input_item.get("class_id") or "") != target_class:
+                    continue
+                for metric_filter in input_item.get("filters", []):
+                    if not isinstance(metric_filter, dict):
+                        continue
+                    metric_values = self._filter_value_set(metric_filter)
+                    if metric_values is None:
+                        continue
+                    metric_field = str(metric_filter.get("field", "")).strip()
+                    for user_filter in filters:
+                        user_field = str(user_filter.get("field", "")).strip()
+                        user_values = self._filter_value_set(user_filter)
+                        if user_field == metric_field and user_values is not None and metric_values.isdisjoint(user_values):
+                            return (
+                                f"Metric {metric_name} 的固定条件 {metric_field}={sorted(metric_values)} "
+                                f"与查询过滤条件 {sorted(user_values)} 冲突"
+                            )
+        return None
+
     # ──────────────────────────────────────────────────────────
     # 核心优化方法：智能化执行本体论 SQL 查询
     # ──────────────────────────────────────────────────────────
@@ -704,6 +797,9 @@ class DataQueryEngine:
             limit = None
 
         filters, having = self._normalize_metric_filters(query_id, filters, having)
+        if conflict_error := self._metric_filter_conflict(target_class, metrics, filters):
+            logger.warning("DataQuery metric filter conflict: query_id=%s error=%s", query_id, conflict_error)
+            return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": conflict_error, "sql": ""}
 
         # ── 1. 自动化依赖推导（核心优化） ──
         # 扫描所有输入的字段，自动判定其归属的语义实体类，免除 LLM 强行指定
@@ -718,10 +814,11 @@ class DataQueryEngine:
         for m in metrics:
             m_info = self.oe.get_metric_info(m)
             if m_info:
-                metric_class = self._metric_class(m_info, target_class)
-                if metric_class:
-                    discovered_classes.add(metric_class)
-                    logger.debug("DataQuery dependency discovered: query_id=%s source=metric metric=%s class=%s", query_id, m, metric_class)
+                metric_classes = self._definition_source_classes(m_info) or [self._metric_class(m_info, target_class)]
+                for metric_class in metric_classes:
+                    if metric_class:
+                        discovered_classes.add(metric_class)
+                        logger.debug("DataQuery dependency discovered: query_id=%s source=metric metric=%s class=%s", query_id, m, metric_class)
             else:
                 cls = self.oe.find_class_by_field(m)
                 if cls:

@@ -122,12 +122,9 @@ def init_db():
             description TEXT DEFAULT '',
             category TEXT DEFAULT '',
             target_class TEXT DEFAULT '',
-            target_classes TEXT DEFAULT '[]',
-            calculation TEXT DEFAULT '',
-            formula TEXT DEFAULT '',
             dimensions TEXT DEFAULT '[]',
             required_dimensions TEXT DEFAULT '[]',
-            filters_hint TEXT DEFAULT '',
+            definition TEXT DEFAULT '{}',
             chart_type TEXT DEFAULT 'bar',
             sort_order INTEGER DEFAULT 0,
             is_reviewed INTEGER DEFAULT 0,
@@ -322,7 +319,7 @@ def _migrate_db(conn):
     migrations = [
         ("metrics", "required_dimensions", "ALTER TABLE metrics ADD COLUMN required_dimensions TEXT DEFAULT '[]'"),
         ("metrics", "chart_type", "ALTER TABLE metrics ADD COLUMN chart_type TEXT DEFAULT 'bar'"),
-        ("metrics", "target_classes", "ALTER TABLE metrics ADD COLUMN target_classes TEXT DEFAULT '[]'"),
+        ("metrics", "definition", "ALTER TABLE metrics ADD COLUMN definition TEXT DEFAULT '{}'"),
         ("schema_relationships", "source_key", "ALTER TABLE schema_relationships ADD COLUMN source_key TEXT DEFAULT ''"),
         ("schema_relationships", "target_key", "ALTER TABLE schema_relationships ADD COLUMN target_key TEXT DEFAULT ''"),
         ("schema_relationships", "join_key", "ALTER TABLE schema_relationships ADD COLUMN join_key TEXT DEFAULT ''"),
@@ -346,7 +343,12 @@ def _migrate_db(conn):
             conn.execute(statement)
     for table in ("schema_classes", "schema_relationships", "metrics", "concepts"):
         conn.execute(f"UPDATE {table} SET review_status='approved' WHERE is_reviewed=1 AND (review_status IS NULL OR review_status='' OR review_status='pending')")
-    conn.execute("UPDATE metrics SET target_classes=json_array(target_class) WHERE (target_classes IS NULL OR target_classes='' OR target_classes='[]') AND target_class<>'' ")
+    conn.execute("DELETE FROM metrics WHERE definition IS NULL OR definition='' OR definition='{}'")
+    for column in ("target_classes", "calculation", "formula", "filters_hint", "source_shape", "value_field", "aggregation", "metric_filters", "value_type", "display_format"):
+        try:
+            conn.execute(f"ALTER TABLE metrics DROP COLUMN {column}")
+        except sqlite3.OperationalError:
+            pass
     conn.execute("UPDATE schema_optimization_runs SET started_at=created_at WHERE started_at IS NULL OR started_at='' ")
 
 

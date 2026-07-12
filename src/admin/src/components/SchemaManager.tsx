@@ -402,7 +402,22 @@ export default function SchemaManager() {
     const results = await Promise.allSettled(ids.map((id) => api(`/api/scenarios/${activeScenario}/schema/classes/${id}`, { method: "DELETE" })));
     const succeeded = results.filter((result) => result.status === "fulfilled").length;
     if (succeeded) {
-      addToast("success", `已删除 ${succeeded} 个类`);
+      const cascaded = results.reduce(
+        (total, result) => {
+          if (result.status !== "fulfilled") return total;
+          const deleted = result.value?.deleted || {};
+          return {
+            relationships: total.relationships + Number(deleted.relationships || 0),
+            metrics: total.metrics + Number(deleted.metrics || 0),
+            concepts: total.concepts + Number(deleted.concepts || 0),
+          };
+        },
+        { relationships: 0, metrics: 0, concepts: 0 },
+      );
+      addToast(
+        "success",
+        `已删除 ${succeeded} 个类，并清理关系 ${cascaded.relationships} 条、指标 ${cascaded.metrics} 个、概念 ${cascaded.concepts} 个`,
+      );
       setSelectedClassIds(new Set());
       invalidateCache(cacheKey);
       load(true);
@@ -1570,7 +1585,7 @@ export default function SchemaManager() {
         title={deleteTarget?.type === "class" ? "删除类" : "删除关系"}
         message={
           deleteTarget?.type === "class"
-            ? `确定要删除选中的 ${deleteTarget.ids.length} 个类吗？关联的关系也将被删除。`
+            ? `确定要删除选中的 ${deleteTarget.ids.length} 个类吗？所有关联的 Relationship、Metric 和 Concept 都将一并删除。`
             : `确定要删除选中的 ${deleteTarget?.ids.length || 0} 条关系吗？`
         }
         onConfirm={() => {

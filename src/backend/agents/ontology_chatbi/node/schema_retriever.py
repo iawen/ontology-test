@@ -4,7 +4,7 @@ from agents.ontology_chatbi.constants import (
     PROGRESS_METRIC_KEYWORDS,
     PROGRESS_QUERY_KEYWORDS,
 )
-from agents.ontology_chatbi.helper import metric_target_classes
+from agents.ontology_chatbi.helper import metric_component_names, metric_context_summary, metric_target_classes
 
 # ============================================================
 # Schema 检索 Agent
@@ -97,8 +97,8 @@ class SchemaRetrieverAgent:
                 metric.get("name_cn"),
                 metric.get("description"),
                 metric.get("category"),
-                metric.get("formula"),
-                metric.get("calculation"),
+                *metric_component_names(metric),
+                metric_context_summary(metric),
             )
         ).lower()
 
@@ -205,8 +205,5 @@ class SchemaRetrieverAgent:
             if metric_class != current_class:
                 current_class = metric_class
                 parts.append(f"### 指标所属实体：{metric_class}")
-            parts.append(
-                f"- **{metric['id']}**({metric.get('name', '')}): {metric.get('formula', '')} "
-                f"| 说明: {metric.get('description', '')}"
-            )
+            parts.append(f"- {metric_context_summary(metric)}")
         return "\n".join(parts)
