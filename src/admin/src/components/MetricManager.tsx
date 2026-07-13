@@ -643,6 +643,7 @@ export default function MetricManager() {
                 <col className="w-56" />
                 <col className="w-24" />
                 <col className="w-24" />
+                <col className="w-40" />
                 <col className="w-24" />
               </colgroup>
               <thead>
@@ -675,6 +676,7 @@ export default function MetricManager() {
                   {SORTABLE_COLUMNS.map((column) =>
                     renderSortableHeader(column.key, column.label),
                   )}
+                  <th>最后更新时间</th>
                   <th className="text-right">操作</th>
                 </tr>
               </thead>
@@ -730,6 +732,9 @@ export default function MetricManager() {
                       >
                         {reviewStatusLabel(m.is_reviewed)}
                       </span>
+                    </td>
+                    <td className="whitespace-nowrap text-xs text-slate-500">
+                      {m.updated_at || "-"}
                     </td>
                     <td className="whitespace-nowrap text-right">
                       <button
@@ -957,7 +962,9 @@ export default function MetricManager() {
                           disabled={!inputClass}
                           onChange={(event) => {
                             const field = inputClass?.fields.find(
-                              (item) => item.name === event.target.value,
+                              (item) =>
+                                (item.physical_name || item.name) ===
+                                event.target.value,
                             );
                             updateMetricInput(index, {
                               field: event.target.value,
@@ -967,7 +974,10 @@ export default function MetricManager() {
                         >
                           <option value="">选择字段</option>
                           {(inputClass?.fields || []).map((field) => (
-                            <option key={field.name} value={field.name}>
+                            <option
+                              key={field.physical_name || field.name}
+                              value={field.physical_name || field.name}
+                            >
                               {field.name}（{field.physical_name}）
                             </option>
                           ))}
@@ -1078,10 +1088,14 @@ export default function MetricManager() {
                                       {(inputClass?.fields || []).map(
                                         (field) => (
                                           <option
-                                            key={field.name}
-                                            value={field.name}
+                                            key={
+                                              field.physical_name || field.name
+                                            }
+                                            value={
+                                              field.physical_name || field.name
+                                            }
                                           >
-                                            {field.name}
+                                            {field.name}（{field.physical_name}）
                                           </option>
                                         ),
                                       )}

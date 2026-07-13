@@ -342,7 +342,7 @@ PHASE2_GLOBAL_PROMPT = """你是企业指标语义建模专家。第一阶段已
 1. 每个 Metric 必须提供 `definition`，且 `version` 固定为 1；不得输出 `formula`、`calculation`、`value_field`、顶层 `aggregation` 或顶层 `metric_filters` 等旧字段。
 2. `definition.anchor_class` 是指标的查询锚点，必须是上方 Class 的 ID；`target_class` 必须与它完全相同。
 3. 每个 `inputs[]` 是独立聚合来源，必须包含 `id`、`output_name`、`class_id`、`source_shape`、`field`、`aggregation`、`filters`：
-    - `class_id` 必须来自上方 Class ID；`field`、`dimensions`、`required_dimensions` 与过滤字段必须使用该 Class 的**逻辑字段名**，不可臆造字段。
+    - `class_id` 必须来自上方 Class ID；`inputs[].field` 与 `inputs[].filters[].field` 必须使用该 Class 的**物理字段名**（`physical_name`）；`dimensions`、`required_dimensions` 使用逻辑字段名。不可臆造字段。
     - 宽表：`source_shape="wide"`，直接选择业务数值字段；`filters` 通常为空。
     - 窄表：`source_shape="long"`，选择公共数值字段，且必须至少一个 `filters` 固定 WHERE 条件来识别 KPI、规格、品类或序列。
     - `filters` 的操作符仅允许 `=`、`!=`、`IN`、`NOT IN`、`IS NULL`、`IS NOT NULL`；`IN` / `NOT IN` 的 value 必须是数组。
@@ -380,9 +380,9 @@ PHASE2_GLOBAL_PROMPT = """你是企业指标语义建模专家。第一阶段已
                     "output_name": "组成项中文名称",
                     "class_id": "Class ID",
                     "source_shape": "wide / long",
-                    "field": "逻辑数值字段名",
+                    "field": "物理数值字段名",
                     "aggregation": "SUM / AVG / MIN / MAX / COUNT / COUNT_DISTINCT",
-                    "filters": [{{"field": "逻辑条件字段名", "operator": "=", "value": "固定值"}}]
+                    "filters": [{{"field": "物理条件字段名", "operator": "=", "value": "固定值"}}]
                 }}]
             }},
             "dimensions": ["锚点类逻辑维度字段名"],

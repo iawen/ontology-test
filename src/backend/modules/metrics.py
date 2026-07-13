@@ -23,7 +23,26 @@ def _metric_definition(value) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _validate_metric_definition(scenario_id: str, definition: dict) -> tuple[str, list[str]]:
+def _physical_metric_definition(definition: dict, class_field_map: dict[str, dict[str, str]]) -> dict:
+    """Convert legacy logical metric field names to their physical column names."""
+    normalized = json.loads(json.dumps(_metric_definition(definition)))
+    for item in normalized.get("inputs", []):
+        if not isinstance(item, dict):
+            continue
+        fields = class_field_map.get(str(item.get("class_id") or "").strip(), {})
+        field = str(item.get("field") or "").strip()
+        if field in fields:
+            item["field"] = fields[field]
+        for filter_item in item.get("filters", []):
+            if not isinstance(filter_item, dict):
+                continue
+            filter_field = str(filter_item.get("field") or "").strip()
+            if filter_field in fields:
+                filter_item["field"] = fields[filter_field]
+    return normalized
+
+
+def _validate_metric_definition(scenario_id: str, definition: dict) -> tuple[str, list[str], dict]:
     definition = _metric_definition(definition)
     if definition.get("version") != 1:
         raise HTTPException(400, "指标定义版本不受支持")
@@ -37,12 +56,27 @@ def _validate_metric_definition(scenario_id: str, definition: dict) -> tuple[str
     rows = conn.execute("SELECT id, fields, properties FROM schema_classes WHERE scenario_id=?", (scenario_id,)).fetchall()
     conn.close()
     class_fields = {}
+    class_field_map = {}
     for row in rows:
         try:
             fields = json.loads(row["fields"] or "[]")
         except (TypeError, json.JSONDecodeError):
             fields = []
-        class_fields[row["id"]] = {str(item.get("name") or item.get("physical_name") or "").strip() for item in fields if isinstance(item, dict)}
+        field_map = {}
+        for item in fields:
+            if not isinstance(item, dict):
+                continue
+            physical_name = str(item.get("physical_name") or item.get("name") or "").strip()
+            logical_name = str(item.get("name") or "").strip()
+            if not physical_name:
+                continue
+            field_map[physical_name] = physical_name
+            if logical_name:
+                field_map[logical_name] = physical_name
+        class_field_map[row["id"]] = field_map
+        class_fields[row["id"]] = set(field_map.values())
+    definition = _physical_metric_definition(definition, class_field_map)
+    inputs = definition.get("inputs")
     if anchor_class not in class_fields:
         raise HTTPException(400, "锚点类不存在")
     source_classes = []
@@ -76,7 +110,7 @@ def _validate_metric_definition(scenario_id: str, definition: dict) -> tuple[str
             if operator not in {"IS NULL", "IS NOT NULL"} and filter_item.get("value") in (None, "", []):
                 raise HTTPException(400, "指标组成项的固定条件必须包含值")
         source_classes.append(class_id)
-    return anchor_class, list(dict.fromkeys(source_classes))
+    return anchor_class, list(dict.fromkeys(source_classes)), definition
 
 
 def _reviewed_value(value) -> bool:
@@ -136,6 +170,14 @@ async def list_metrics(scenario_id: str):
             d["definition"] = json.loads(d.get("definition") or "{}")
         except (TypeError, json.JSONDecodeError):
             d["definition"] = {}
+        # Keep the editor compatible with definitions saved before physical names
+        # became mandatory. A subsequent save persists the normalized definition.
+        try:
+            _, _, d["definition"] = _validate_metric_definition(
+                scenario_id, d["definition"]
+            )
+        except HTTPException:
+            pass
         # chart_type 可能不存在于旧数据库中
         d.setdefault("chart_type", "bar")
         d["review_status"] = _review_status(d.get("review_status"), d.get("is_reviewed", 0))
@@ -152,7 +194,7 @@ async def metric_field_values(
     q: str = Query("", max_length=100),
     limit: int = Query(100, ge=1, le=500),
 ):
-    """Return bounded DISTINCT values for a configured logical Class field."""
+    """Return bounded DISTINCT values for a configured physical Class field."""
     try:
         from prompts.prompt import init_prompt, get_query_engine
 
@@ -172,7 +214,7 @@ async def metric_field_values(
 async def create_metric(scenario_id: str, req: MetricCreate):
     conn = get_db()
     review_status = _review_status(req.review_status, req.is_reviewed)
-    anchor_class, _ = _validate_metric_definition(scenario_id, req.definition)
+    anchor_class, _, definition = _validate_metric_definition(scenario_id, req.definition)
     try:
         conn.execute(
             """INSERT INTO metrics
@@ -180,7 +222,7 @@ async def create_metric(scenario_id: str, req: MetricCreate):
                 dimensions, required_dimensions, chart_type, sort_order, is_reviewed, review_status, created_at, updated_at)
                                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
             (req.id, scenario_id, req.name, req.description, req.category,
-                         anchor_class, json.dumps(req.definition, ensure_ascii=False),
+                         anchor_class, json.dumps(definition, ensure_ascii=False),
              json.dumps(req.dimensions, ensure_ascii=False),
              json.dumps(req.required_dimensions, ensure_ascii=False),
                  req.chart_type, req.sort_order, _is_reviewed_status(review_status), review_status),
@@ -200,9 +242,9 @@ async def update_metric(scenario_id: str, metric_id: str, req: MetricUpdate):
     conn = get_db()
     sets, vals = [], []
     if req.definition is not None:
-        anchor_class, _ = _validate_metric_definition(scenario_id, req.definition)
+        anchor_class, _, definition = _validate_metric_definition(scenario_id, req.definition)
         sets.extend(["definition=?", "target_class=?"])
-        vals.extend([json.dumps(req.definition, ensure_ascii=False), anchor_class])
+        vals.extend([json.dumps(definition, ensure_ascii=False), anchor_class])
     for k, v in [("name", req.name), ("description", req.description),
                   ("category", req.category),
                   ("chart_type", req.chart_type),

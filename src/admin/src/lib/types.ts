@@ -74,6 +74,7 @@ export interface MetricInput {
   class_id: string;
   /** Source-table layout for this individual component; not the Metric anchor. */
   source_shape?: "wide" | "long";
+  /** Physical source-column name; `output_name` retains the business display name. */
   field: string;
   aggregation: MetricAggregation;
   filters: Array<{
