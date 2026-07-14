@@ -7,7 +7,12 @@ from typing import cast
 
 from openai.types.chat import ChatCompletionMessageParam
 
-from agents.ontology_chatbi.helper import metric_context_summary, metric_definition, metric_target_classes
+from agents.ontology_chatbi.helper import (
+    metric_context_summary,
+    metric_definition,
+    metric_target_classes,
+    resolve_metric_reference,
+)
 from agents.ontology_chatbi.prompt import (
     ONTOLOGY_PLANNING_SYSTEM_PROMPT,
     get_ontology_planning_feedback_prompt,
@@ -197,7 +202,7 @@ class OntologyAgent:
         def is_scope_field(field_name: str) -> bool:
             return any(field_name in engine.get_field_map(class_id) for class_id in allowed_classes)
 
-        def infer_metric_from_field(field_name: str) -> dict | None:
+        def infer_metric_from_field(field_name: str) -> tuple[dict, dict | None] | None:
             """Resolve a Metric from a structured definition component output name.
 
             `output_name` is the governed user-facing name of a component (and the
@@ -208,6 +213,15 @@ class OntologyAgent:
             matched_metrics = []
             seen_metric_ids = set()
             for metric in available_metrics:
+                definition = metric_definition(metric)
+                if definition.get("version") == 2:
+                    for output in definition.get("outputs", []):
+                        if isinstance(output, dict) and normalized_name in {
+                            str(output.get("id") or "").casefold(),
+                            str(output.get("output_name") or "").casefold(),
+                        }:
+                            matched_metrics.append((metric, output))
+                    continue
                 output_names = {
                     str(input_item.get("output_name") or "").strip().casefold()
                     for input_item in metric_definition(metric).get("inputs", [])
@@ -215,17 +229,20 @@ class OntologyAgent:
                 }
                 metric_id = str(metric.get("id") or "")
                 if normalized_name in output_names and metric_id not in seen_metric_ids:
-                    matched_metrics.append(metric)
+                    matched_metrics.append((metric, None))
                     seen_metric_ids.add(metric_id)
             return matched_metrics[0] if len(matched_metrics) == 1 else None
 
         def validate_candidate_metric(metric_name: str, source: str) -> tuple[dict | None, str]:
-            metric_info = engine.get_metric_info(metric_name)
+            metric_info, output = resolve_metric_reference(metric_name, available_metrics)
             if metric_info and str(metric_info.get("id") or "") in available_metric_ids:
-                return None, metric_name
+                return None, str(output.get("id")) if output else str(metric_info.get("id") or metric_name)
             inferred_metric = infer_metric_from_field(metric_name)
             if inferred_metric:
-                resolved_metric = str(inferred_metric.get("id") or inferred_metric.get("name") or metric_name)
+                parent_metric, inferred_output = inferred_metric
+                resolved_metric = str(
+                    inferred_output.get("id") if inferred_output else parent_metric.get("id") or parent_metric.get("name") or metric_name
+                )
                 logger.info(
                     "Query metric inferred from definition input output_name: target_class=%s source=%s output_name=%s metric=%s",
                     target_class,
@@ -274,7 +291,8 @@ class OntologyAgent:
 
         for item in filters:
             field = str(item.get("field") or "").strip()
-            if engine.get_metric_info(field) or not is_scope_field(field):
+            resolved_metric, _ = resolve_metric_reference(field, available_metrics)
+            if resolved_metric or not is_scope_field(field):
                 logger.warning(
                     "Preserving invalid filter field for downstream handling: target_class=%s field=%s",
                     target_class,
@@ -293,9 +311,18 @@ class OntologyAgent:
             return None
 
         for metric in metrics:
-            metric_info = engine.get_metric_info(metric)
+            metric_info, selected_output = resolve_metric_reference(metric, available_metrics)
             if metric_info:
-                for class_id in metric_target_classes(metric_info):
+                definition = metric_definition(metric_info)
+                source_items = selected_output.get("inputs", []) if selected_output else [
+                    input_item
+                    for output in definition.get("outputs", [])
+                    if isinstance(output, dict)
+                    for input_item in output.get("inputs", [])
+                ] if definition.get("version") == 2 else definition.get("inputs", [])
+                classes = [definition.get("anchor_class") or metric_info.get("target_class")]
+                classes.extend(item.get("class_id") for item in source_items if isinstance(item, dict))
+                for class_id in dict.fromkeys(str(value or "") for value in classes):
                     if error := add_dependency(class_id, f"指标 {metric}"):
                         return {"valid": False, "error": error}
             elif not any(query_engine.field_available_in_class(class_id, metric) for class_id in allowed_classes):

@@ -26,32 +26,55 @@ def _metric_definition(value) -> dict:
 def _physical_metric_definition(definition: dict, class_field_map: dict[str, dict[str, str]]) -> dict:
     """Convert legacy logical metric field names to their physical column names."""
     normalized = json.loads(json.dumps(_metric_definition(definition)))
-    for item in normalized.get("inputs", []):
-        if not isinstance(item, dict):
-            continue
-        fields = class_field_map.get(str(item.get("class_id") or "").strip(), {})
-        field = str(item.get("field") or "").strip()
-        if field in fields:
-            item["field"] = fields[field]
-        for filter_item in item.get("filters", []):
-            if not isinstance(filter_item, dict):
+    input_groups = [normalized.get("inputs", [])]
+    input_groups.extend(
+        output.get("inputs", []) for output in normalized.get("outputs", [])
+        if isinstance(output, dict)
+    )
+    for inputs in input_groups:
+        for item in inputs:
+            if not isinstance(item, dict):
                 continue
-            filter_field = str(filter_item.get("field") or "").strip()
-            if filter_field in fields:
-                filter_item["field"] = fields[filter_field]
+            fields = class_field_map.get(str(item.get("class_id") or "").strip(), {})
+            field = str(item.get("field") or "").strip()
+            if field in fields:
+                item["field"] = fields[field]
+            for filter_item in item.get("filters", []):
+                if not isinstance(filter_item, dict):
+                    continue
+                filter_field = str(filter_item.get("field") or "").strip()
+                if filter_field in fields:
+                    filter_item["field"] = fields[filter_field]
     return normalized
 
 
 def _validate_metric_definition(scenario_id: str, definition: dict) -> tuple[str, list[str], dict]:
     definition = _metric_definition(definition)
-    if definition.get("version") != 1:
+    version = definition.get("version")
+    if version not in {1, 2}:
         raise HTTPException(400, "指标定义版本不受支持")
     anchor_class = str(definition.get("anchor_class") or "").strip()
-    inputs = definition.get("inputs")
-    if not anchor_class or not isinstance(inputs, list) or not inputs:
+    if not anchor_class:
         raise HTTPException(400, "指标定义必须包含锚点类和至少一个组成项")
-    if str(definition.get("expression_operator") or "") not in {"ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "CONCAT"}:
+    if version == 1 and str(definition.get("expression_operator") or "") not in {"ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "CONCAT"}:
         raise HTTPException(400, "指标表达式操作符不支持")
+    outputs = definition.get("outputs") if version == 2 else None
+    if version == 2:
+        if not isinstance(outputs, list) or not outputs:
+            raise HTTPException(400, "并列指标必须至少包含一个输出")
+        names = [str(output.get("output_name") or "").strip() for output in outputs if isinstance(output, dict)]
+        if len(names) != len(outputs) or not all(names) or len(set(names)) != len(names):
+            raise HTTPException(400, "并列指标输出名称必填且不能重复")
+        if any(
+            str(output.get("expression_operator") or "").upper() not in {"ADD", "SUBTRACT", "MULTIPLY", "DIVIDE"}
+            or (
+                str(output.get("expression_operator") or "").upper() == "DIVIDE"
+                and len(output.get("inputs") or []) != 2
+            )
+            for output in outputs
+            if isinstance(output, dict)
+        ):
+            raise HTTPException(400, "并列输出仅支持基础运算；相除必须恰好包含分子和分母两个组成项")
     conn = get_db()
     rows = conn.execute("SELECT id, fields, properties FROM schema_classes WHERE scenario_id=?", (scenario_id,)).fetchall()
     conn.close()
@@ -76,40 +99,43 @@ def _validate_metric_definition(scenario_id: str, definition: dict) -> tuple[str
         class_field_map[row["id"]] = field_map
         class_fields[row["id"]] = set(field_map.values())
     definition = _physical_metric_definition(definition, class_field_map)
-    inputs = definition.get("inputs")
     if anchor_class not in class_fields:
         raise HTTPException(400, "锚点类不存在")
     source_classes = []
-    for item in inputs:
-        if not isinstance(item, dict):
-            raise HTTPException(400, "指标组成项格式无效")
-        class_id = str(item.get("class_id") or "").strip()
-        source_shape = str(item.get("source_shape") or "wide").lower().strip()
-        field = str(item.get("field") or "").strip()
-        aggregation = str(item.get("aggregation") or "").upper()
-        if class_id not in class_fields or not field or field not in class_fields[class_id]:
-            raise HTTPException(400, "指标组成项的来源类或字段无效")
-        if source_shape not in SOURCE_SHAPES:
-            raise HTTPException(400, "指标组成项的 source_shape 仅支持 wide 或 long")
-        if aggregation not in {"SUM", "AVG", "MIN", "MAX", "COUNT", "COUNT_DISTINCT"}:
-            raise HTTPException(400, "指标组成项的聚合方式不支持")
-        filters = item.get("filters", [])
-        if not isinstance(filters, list):
-            raise HTTPException(400, "指标组成项的固定条件必须是数组")
-        if source_shape == "long" and not filters:
-            raise HTTPException(400, "窄表指标组成项必须配置至少一个固定条件")
-        for filter_item in filters:
-            if not isinstance(filter_item, dict):
-                raise HTTPException(400, "指标组成项的固定条件格式无效")
-            filter_field = str(filter_item.get("field") or "").strip()
-            operator = str(filter_item.get("operator") or "").upper().strip()
-            if not filter_field or filter_field not in class_fields[class_id]:
-                raise HTTPException(400, "指标组成项的固定条件字段无效")
-            if operator not in METRIC_FILTER_OPERATORS:
-                raise HTTPException(400, "指标组成项的固定条件操作符不支持")
-            if operator not in {"IS NULL", "IS NOT NULL"} and filter_item.get("value") in (None, "", []):
-                raise HTTPException(400, "指标组成项的固定条件必须包含值")
-        source_classes.append(class_id)
+    input_groups = [definition.get("inputs", [])] if version == 1 else [output.get("inputs", []) for output in outputs]
+    for inputs in input_groups:
+        if not isinstance(inputs, list) or not inputs:
+            raise HTTPException(400, "每个指标输出必须包含至少一个组成项")
+        for item in inputs:
+            if not isinstance(item, dict):
+                raise HTTPException(400, "指标组成项格式无效")
+            class_id = str(item.get("class_id") or "").strip()
+            source_shape = str(item.get("source_shape") or "wide").lower().strip()
+            field = str(item.get("field") or "").strip()
+            aggregation = str(item.get("aggregation") or "").upper()
+            if class_id not in class_fields or not field or field not in class_fields[class_id]:
+                raise HTTPException(400, "指标组成项的来源类或字段无效")
+            if source_shape not in SOURCE_SHAPES:
+                raise HTTPException(400, "指标组成项的 source_shape 仅支持 wide 或 long")
+            if aggregation not in {"SUM", "AVG", "MIN", "MAX", "COUNT", "COUNT_DISTINCT"}:
+                raise HTTPException(400, "指标组成项的聚合方式不支持")
+            filters = item.get("filters", [])
+            if not isinstance(filters, list):
+                raise HTTPException(400, "指标组成项的固定条件必须是数组")
+            if source_shape == "long" and not filters:
+                raise HTTPException(400, "窄表指标组成项必须配置至少一个固定条件")
+            for filter_item in filters:
+                if not isinstance(filter_item, dict):
+                    raise HTTPException(400, "指标组成项的固定条件格式无效")
+                filter_field = str(filter_item.get("field") or "").strip()
+                operator = str(filter_item.get("operator") or "").upper().strip()
+                if not filter_field or filter_field not in class_fields[class_id]:
+                    raise HTTPException(400, "指标组成项的固定条件字段无效")
+                if operator not in METRIC_FILTER_OPERATORS:
+                    raise HTTPException(400, "指标组成项的固定条件操作符不支持")
+                if operator not in {"IS NULL", "IS NOT NULL"} and filter_item.get("value") in (None, "", []):
+                    raise HTTPException(400, "指标组成项的固定条件必须包含值")
+            source_classes.append(class_id)
     return anchor_class, list(dict.fromkeys(source_classes)), definition
 
 
@@ -148,6 +174,33 @@ def _sync_ontology_files(scenario_id: str):
         raise HTTPException(500, f"数据已保存，但同步 schema 文件失败: {e}")
 
 
+def _validate_dimension_group_ids(conn, scenario_id: str, group_ids: list[str]) -> list[str]:
+    """Return unique approved group IDs, rejecting missing or unpublished assets."""
+    normalized = list(dict.fromkeys(group_id.strip() for group_id in group_ids if group_id.strip()))
+    for group_id in normalized:
+        row = conn.execute(
+            "SELECT status FROM dimension_groups WHERE scenario_id=? AND id=?",
+            (scenario_id, group_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(400, f"分析维度组不存在：{group_id}")
+        if row["status"] != "approved":
+            raise HTTPException(400, f"分析维度组尚未通过审核：{group_id}")
+    return normalized
+
+
+def _replace_metric_dimension_bindings(conn, scenario_id: str, metric_id: str, group_ids: list[str]) -> None:
+    conn.execute(
+        "DELETE FROM metric_dimension_bindings WHERE scenario_id=? AND metric_id=?",
+        (scenario_id, metric_id),
+    )
+    for group_id in group_ids:
+        conn.execute(
+            "INSERT INTO metric_dimension_bindings (metric_id, scenario_id, group_id) VALUES (?,?,?)",
+            (metric_id, scenario_id, group_id),
+        )
+
+
 # ============================================================
 # 指标 CRUD
 # ============================================================
@@ -160,12 +213,20 @@ async def list_metrics(scenario_id: str):
         "SELECT * FROM metrics WHERE scenario_id=? ORDER BY sort_order, category",
         (scenario_id,)
     ).fetchall()
+    binding_rows = conn.execute(
+        "SELECT metric_id, group_id FROM metric_dimension_bindings WHERE scenario_id=? ORDER BY group_id",
+        (scenario_id,),
+    ).fetchall()
+    bindings: dict[str, list[str]] = {}
+    for binding in binding_rows:
+        bindings.setdefault(binding["metric_id"], []).append(binding["group_id"])
     conn.close()
     result = []
     for r in rows:
         d = dict(r)
         d["dimensions"] = json.loads(d.get("dimensions", "[]"))
         d["required_dimensions"] = json.loads(d.get("required_dimensions", "[]"))
+        d["dimension_group_ids"] = bindings.get(d["id"], [])
         try:
             d["definition"] = json.loads(d.get("definition") or "{}")
         except (TypeError, json.JSONDecodeError):
@@ -216,6 +277,9 @@ async def create_metric(scenario_id: str, req: MetricCreate):
     review_status = _review_status(req.review_status, req.is_reviewed)
     anchor_class, _, definition = _validate_metric_definition(scenario_id, req.definition)
     try:
+        dimension_group_ids = _validate_dimension_group_ids(
+            conn, scenario_id, req.dimension_group_ids
+        )
         conn.execute(
             """INSERT INTO metrics
                              (id, scenario_id, name, description, category, target_class, definition,
@@ -227,6 +291,7 @@ async def create_metric(scenario_id: str, req: MetricCreate):
              json.dumps(req.required_dimensions, ensure_ascii=False),
                  req.chart_type, req.sort_order, _is_reviewed_status(review_status), review_status),
         )
+        _replace_metric_dimension_bindings(conn, scenario_id, req.id, dimension_group_ids)
         conn.commit()
     except Exception as e:
         conn.close()
@@ -264,6 +329,12 @@ async def update_metric(scenario_id: str, metric_id: str, req: MetricUpdate):
     if req.required_dimensions is not None:
         sets.append("required_dimensions=?")
         vals.append(json.dumps(req.required_dimensions, ensure_ascii=False))
+    if req.dimension_group_ids is not None:
+        dimension_group_ids = _validate_dimension_group_ids(
+            conn, scenario_id, req.dimension_group_ids
+        )
+        _replace_metric_dimension_bindings(conn, scenario_id, metric_id, dimension_group_ids)
+        sets.append("updated_at=CURRENT_TIMESTAMP")
     if req.review_status is not None or req.is_reviewed is not None:
         review_status = _review_status(req.review_status, req.is_reviewed)
         sets.append("is_reviewed=?")
@@ -273,7 +344,8 @@ async def update_metric(scenario_id: str, metric_id: str, req: MetricUpdate):
     if not sets:
         conn.close()
         return {"status": "ok"}
-    sets.append("updated_at=CURRENT_TIMESTAMP")
+    if "updated_at=CURRENT_TIMESTAMP" not in sets:
+        sets.append("updated_at=CURRENT_TIMESTAMP")
     vals.extend([metric_id, scenario_id])
     conn.execute(f"UPDATE metrics SET {','.join(sets)} WHERE id=? AND scenario_id=?", vals)
     conn.commit()
@@ -286,6 +358,7 @@ async def update_metric(scenario_id: str, metric_id: str, req: MetricUpdate):
 @router.delete("/api/admin/scenarios/{scenario_id}/metrics/{metric_id}", include_in_schema=False)
 async def delete_metric(scenario_id: str, metric_id: str):
     conn = get_db()
+    conn.execute("DELETE FROM metric_dimension_bindings WHERE scenario_id=? AND metric_id=?", (scenario_id, metric_id))
     conn.execute("DELETE FROM metrics WHERE id=? AND scenario_id=?", (metric_id, scenario_id))
     conn.commit()
     conn.close()
@@ -302,6 +375,10 @@ async def batch_delete_metrics(scenario_id: str, req: MetricBatchDelete):
 
     conn = get_db()
     try:
+        conn.executemany(
+            "DELETE FROM metric_dimension_bindings WHERE scenario_id=? AND metric_id=?",
+            [(scenario_id, metric_id) for metric_id in ids],
+        )
         cursor = conn.executemany(
             "DELETE FROM metrics WHERE id=? AND scenario_id=?",
             [(metric_id, scenario_id) for metric_id in ids],

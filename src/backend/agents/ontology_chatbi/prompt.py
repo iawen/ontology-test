@@ -144,7 +144,7 @@ def get_query_details_planning_prompt(user_message: str, scope_context: str) -> 
 }}
 
 规则：
-1. metrics 和 having.field 只能从上方 “Metrics（当前 target_class 可用指标）” 列表中选择指标逻辑名、id，或该指标组成项的名称（`definition.inputs[].output_name`）；组成项名称会被反推为唯一所属指标。绝不能把 “Class” 中的字段名填入 metrics 或 having.field。
+1. metrics 和 having.field 只能从上方 “Metrics（当前 target_class 可用指标）” 列表中选择。普通 Metric 可填写指标逻辑名或 id；对于“并列输出”，可填写输出名称或输出 id，系统会执行该独立计算。若用户要求该 Metric 的全部并列结果，填写父 Metric 的 id。V1 CONCAT 的组成项名称仍会反推为父 Metric。绝不能把 “Class” 中的字段名填入 metrics 或 having.field。
 2. dimensions、filters.field、order_by 只能使用 “Class” 中的逻辑字段名。Class 字段展示为“逻辑字段名(表字段=物理列名; 类型)”，JSON 中必须填逻辑字段名，不能填写表字段/物理列名。
 3. 聚合指标条件只能放 having；filters 只能放明细字段。除非用户明确要求明细，
 query_mode 必须是 aggregate 且至少选择一个 metrics 或 dimensions。"""

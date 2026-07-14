@@ -41,6 +41,7 @@ from modules.actions import router as actions_router
 from modules.alert_rules import router as alert_rules_router
 from modules.workflow_engine import router as workflow_router
 from modules.schema_optimization import router as schema_optimizer_router
+from modules.dimension_groups import router as dimension_groups_router
 
 # 初始化数据库
 init_db()
@@ -98,6 +99,7 @@ app.include_router(actions_router, tags=["Actions"])
 app.include_router(alert_rules_router, tags=["Alert Rules"])
 app.include_router(workflow_router, tags=["Workflow"])
 app.include_router(schema_optimizer_router, tags=["Schema Optimization"])
+app.include_router(dimension_groups_router, tags=["Dimension Groups"])
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000)

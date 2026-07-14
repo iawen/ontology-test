@@ -80,6 +80,18 @@ class OntologyEngine:
                 concept_rows = conn.execute(
                     "SELECT * FROM concepts WHERE scenario_id=?", (scenario_id,)
                 ).fetchall()
+                dimension_group_rows = conn.execute(
+                    "SELECT * FROM dimension_groups WHERE scenario_id=? ORDER BY name", (scenario_id,)
+                ).fetchall()
+                dimension_option_rows = conn.execute(
+                    "SELECT * FROM dimension_group_options WHERE scenario_id=? ORDER BY group_id, sort_order", (scenario_id,)
+                ).fetchall()
+                dimension_mapping_rows = conn.execute(
+                    "SELECT * FROM dimension_field_mappings WHERE scenario_id=? ORDER BY group_id, priority, id", (scenario_id,)
+                ).fetchall()
+                metric_binding_rows = conn.execute(
+                    "SELECT metric_id, group_id FROM metric_dimension_bindings WHERE scenario_id=? ORDER BY metric_id, group_id", (scenario_id,)
+                ).fetchall()
             finally:
                 conn.close()
         except Exception:
@@ -159,6 +171,10 @@ class OntologyEngine:
                 }
             )
 
+        metric_group_ids: dict[str, list[str]] = {}
+        for binding in metric_binding_rows:
+            metric_group_ids.setdefault(str(binding["metric_id"]), []).append(str(binding["group_id"]))
+
         metrics = []
         for row in metric_rows:
             item = dict(row)
@@ -173,6 +189,7 @@ class OntologyEngine:
                     "definition": self._json_dict(item.get("definition")),
                     "dimensions": self._json_list(item.get("dimensions")),
                     "required_dimensions": self._json_list(item.get("required_dimensions")),
+                    "dimension_group_ids": metric_group_ids.get(str(item.get("id") or ""), []),
                     "chart_type": item.get("chart_type") or "bar",
                     "sort_order": item.get("sort_order") or 0,
                     "is_reviewed": item.get("is_reviewed", 0),
@@ -180,11 +197,50 @@ class OntologyEngine:
                 }
             )
 
+        options_by_group: dict[str, list[dict]] = {}
+        for row in dimension_option_rows:
+            option = dict(row)
+            options_by_group.setdefault(str(option["group_id"]), []).append({
+                "value": option["value"],
+                "label": option["label"],
+                "aliases": self._json_list(option.get("aliases")),
+                "is_default": bool(option.get("is_default")),
+                "sort_order": option.get("sort_order", 0),
+                "status": option.get("status", "draft"),
+            })
+        mappings_by_group: dict[str, list[dict]] = {}
+        for row in dimension_mapping_rows:
+            mapping = dict(row)
+            mappings_by_group.setdefault(str(mapping["group_id"]), []).append({
+                "option_value": mapping["option_value"],
+                "class_id": mapping["class_id"],
+                "field_name": mapping["field_name"],
+                "display_name": mapping.get("display_name", ""),
+                "priority": mapping.get("priority", 0),
+            })
+        dimension_groups = [
+            {
+                "id": group["id"],
+                "name": group["name"],
+                "description": group.get("description", ""),
+                "group_type": group.get("group_type", "categorical"),
+                "concept_id": group.get("concept_id", ""),
+                "is_required": bool(group.get("is_required")),
+                "default_option": group.get("default_option", ""),
+                "clarification_policy": group.get("clarification_policy", "ask_when_ambiguous"),
+                "status": group.get("status", "draft"),
+                "options": options_by_group.get(str(group["id"]), []),
+                "field_mappings": mappings_by_group.get(str(group["id"]), []),
+            }
+            for group in map(dict, dimension_group_rows)
+        ]
+
         self.schema = {
             "business_name": scenario_id,
             "classes": classes,
             "relationships": relationships,
             "concepts": [self._database_concept(dict(row)) for row in concept_rows],
+            "dimension_groups": dimension_groups,
             "metrics": metrics,
         }
         self.mapping = {"classes": mapping_classes, "relationships": relationships}

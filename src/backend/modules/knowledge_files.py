@@ -304,6 +304,7 @@ def _sync_schema_db(scenario_id: str):
     raw_classes = schema.get("classes", []) or []
     raw_relationships = schema.get("relationships", []) or []
     raw_concepts = schema.get("concepts", []) or []
+    raw_dimension_groups = schema.get("dimension_groups", []) or []
     raw_metrics = schema.get("metrics", []) or []
 
     conn = get_db()
@@ -493,6 +494,76 @@ def _sync_schema_db(scenario_id: str):
                 item,
             )
 
+    # 维度组先于指标落库：指标绑定依赖这些可治理的业务维度资产。
+    existing_dimension_groups = {
+        row["id"]: row["status"] for row in conn.execute(
+            "SELECT id, status FROM dimension_groups WHERE scenario_id=?",
+            (scenario_id,),
+        ).fetchall()
+    }
+    extracted_dimension_group_ids = set()
+    for group in raw_dimension_groups:
+        if not isinstance(group, dict):
+            continue
+        group_id = str(group.get("id") or "").strip()
+        if not group_id:
+            continue
+        # 已审批或已废弃的资产由人工维护，提取任务不得覆盖。
+        if existing_dimension_groups.get(group_id) in {"approved", "deprecated"}:
+            continue
+        extracted_dimension_group_ids.add(group_id)
+        values = [
+            str(option.get("value") or "").strip()
+            for option in group.get("options", [])
+            if isinstance(option, dict) and str(option.get("value") or "").strip()
+        ]
+        default_option = str(group.get("default_option") or "").strip()
+        if default_option not in values:
+            default_option = values[0] if values else ""
+        group_values = (
+            group_id, scenario_id, str(group.get("name") or group_id),
+            str(group.get("description") or ""), str(group.get("group_type") or "categorical"),
+            str(group.get("concept_id") or ""), int(bool(group.get("is_required", False))),
+            default_option, str(group.get("clarification_policy") or "ask_when_ambiguous"),
+        )
+        if group_id in existing_dimension_groups:
+            conn.execute(
+                """UPDATE dimension_groups
+                   SET name=?, description=?, group_type=?, concept_id=?, is_required=?, default_option=?, clarification_policy=?, status='draft', updated_at=CURRENT_TIMESTAMP
+                   WHERE id=? AND scenario_id=?""",
+                (*group_values[2:], group_id, scenario_id),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO dimension_groups
+                   (id, scenario_id, name, description, group_type, concept_id, is_required, default_option, clarification_policy, status, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,'draft',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+                group_values,
+            )
+        conn.execute("DELETE FROM dimension_group_options WHERE scenario_id=? AND group_id=?", (scenario_id, group_id))
+        conn.execute("DELETE FROM dimension_field_mappings WHERE scenario_id=? AND group_id=?", (scenario_id, group_id))
+        for index, option in enumerate(group.get("options", [])):
+            if not isinstance(option, dict) or not str(option.get("value") or "").strip():
+                continue
+            conn.execute(
+                """INSERT INTO dimension_group_options
+                   (group_id, scenario_id, value, label, aliases, is_default, sort_order, status)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (group_id, scenario_id, option["value"], str(option.get("label") or option["value"]),
+                 _json_text(option.get("aliases", [])), int(bool(option.get("is_default", False))),
+                 option.get("sort_order", index), "draft"),
+            )
+        for index, mapping in enumerate(group.get("field_mappings", [])):
+            if not isinstance(mapping, dict):
+                continue
+            conn.execute(
+                """INSERT INTO dimension_field_mappings
+                   (group_id, scenario_id, option_value, class_id, field_name, display_name, priority)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (group_id, scenario_id, mapping.get("option_value", ""), mapping.get("class_id", ""),
+                 mapping.get("field_name", ""), mapping.get("display_name", ""), mapping.get("priority", index)),
+            )
+
     for item in metrics:
         metric_id = item[0]
         if metric_id in existing_metrics:
@@ -507,6 +578,19 @@ def _sync_schema_db(scenario_id: str):
                 "INSERT INTO metrics (id, scenario_id, name, description, category, target_class, definition, dimensions, required_dimensions, chart_type, sort_order, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'pending', CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 item,
             )
+        if metric_id not in reviewed_metrics:
+            source_metric = next((metric for metric in raw_metrics if metric.get("id") == metric_id), {})
+            group_ids = [
+                str(group_id).strip()
+                for group_id in source_metric.get("dimension_group_ids", [])
+                if str(group_id).strip() in extracted_dimension_group_ids or str(group_id).strip() in existing_dimension_groups
+            ]
+            conn.execute("DELETE FROM metric_dimension_bindings WHERE scenario_id=? AND metric_id=?", (scenario_id, metric_id))
+            for group_id in dict.fromkeys(group_ids):
+                conn.execute(
+                    "INSERT INTO metric_dimension_bindings (metric_id, scenario_id, group_id) VALUES (?,?,?)",
+                    (metric_id, scenario_id, group_id),
+                )
 
     for item in concepts:
         concept_id = item[0]

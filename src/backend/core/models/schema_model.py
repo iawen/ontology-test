@@ -68,6 +68,7 @@ class MetricOptimization(BaseModel):
     definition: dict = Field(default_factory=dict, description="结构化指标定义")
     dimensions: List[str] = Field(default_factory=list, description="可用分析维度物理列名列表")
     required_dimensions: List[str] = Field(default_factory=list, description="最低必要粒度维度字段")
+    dimension_group_ids: List[str] = Field(default_factory=list, description="关联的分析维度组ID")
     chart_type: str = Field("bar", description="推荐图表类型")
 
     @field_validator("id")
@@ -101,11 +102,30 @@ class ConceptOptimization(BaseModel):
         return v if v in allowed else "entity"
 
 
+class DimensionGroupOptimization(BaseModel):
+    """分析维度组优化建议。字段映射使用已存在的 Class 与逻辑字段。"""
+    id: str = Field(..., description="稳定维度组ID")
+    name: str = Field("", description="业务名称")
+    description: str = Field("", description="业务说明")
+    group_type: str = Field("categorical", description="time/categorical/hierarchy")
+    is_required: bool = Field(False, description="缺失时是否需要澄清")
+    default_option: str = Field("", description="默认选项值")
+    clarification_policy: str = Field("ask_when_ambiguous", description="auto_fill/ask_when_ambiguous/always_ask")
+    options: List[dict] = Field(default_factory=list)
+    field_mappings: List[dict] = Field(default_factory=list)
+
+    @field_validator("group_type")
+    @classmethod
+    def validate_group_type(cls, value):
+        return value if value in {"time", "categorical", "hierarchy"} else "categorical"
+
+
 class OptimizationBatchResult(BaseModel):
     """单批次优化结果"""
     classes: List[ClassOptimization] = Field(default_factory=list)
     relationships: List[RelationshipOptimization] = Field(default_factory=list)
     metrics: List[MetricOptimization] = Field(default_factory=list)
+    dimension_groups: List[DimensionGroupOptimization] = Field(default_factory=list)
     concepts: List[ConceptOptimization] = Field(default_factory=list)
     summary: str = Field("", description="本批次优化摘要")
 

@@ -31,6 +31,7 @@ from core.models.schema_model import (
     QualityAssessmentResult,
     ClassOptimization,
     MetricOptimization,
+    DimensionGroupOptimization,
     RelationshipOptimization,
     ConceptOptimization,
 )
@@ -45,6 +46,7 @@ BATCH_MAX_CLASSES = 6
 BATCH_MAX_METRICS = 15
 BATCH_MAX_RELATIONSHIPS = 10
 BATCH_MAX_CONCEPTS = 10
+BATCH_MAX_DIMENSION_GROUPS = 10
 DOC_CONTEXT_LIMIT = 8000
 LLM_RETRY_MAX = 2
 
@@ -151,44 +153,71 @@ class SchemaOptimizer:
 
             await _emit_progress(progress_callback, phase="loading", progress=20, total=100, message="加载当前 Schema 资产")
             # 人工已审核（批准或驳回）的资产属于受保护口径，任何优化模式都不可改写。
-            classes, relationships, metrics, concepts = self._load_schema_assets(
+            classes, relationships, metrics, concepts, dimension_groups = self._load_schema_assets(
                 incremental,
                 target_class_ids,
                 exclude_reviewed=True,
             )
+            # 已批准维度组不参与改写，但必须作为 Metric 可绑定的既有语义目录。
+            _, _, _, _, all_dimension_groups = self._load_schema_assets(
+                incremental=False,
+                target_class_ids=None,
+            )
             self.schema_reference_context = load_schema_reference_context(self.scenario_id)
 
-            if not classes and not metrics:
+            if not classes and not relationships and not metrics and not concepts and not dimension_groups:
                 await _emit_progress(progress_callback, running=False, phase="done", progress=100, total=100, message="无可优化资产")
                 return {"status": "skipped", "run_id": run_id, "message": "无可优化资产"}
 
             await _emit_progress(progress_callback, phase="class_optimizing", progress=30, total=100, message="阶段一：优化并去重 Class")
             class_results = await self._run_batch_optimization(
-                classes, [], [], [], progress_callback, stage="classes"
+                classes, [], [], [], [], progress_callback, stage="classes"
             )
             class_data = self._merge_results(class_results, GlobalCorrectionResult())
             class_data = self._deduplicate_optimization_assets(class_data)
 
-            await _emit_progress(progress_callback, phase="metric_optimizing", progress=50, total=100, message="阶段二：基于 Class 优化 Relationship 与结构化 Metric")
+            await _emit_progress(progress_callback, phase="dimension_optimizing", progress=45, total=100, message="阶段二：识别新增维度组并优化现有维度组")
+            dimension_results = await self._run_batch_optimization(
+                [], [], [], [], dimension_groups, progress_callback,
+                stage="dimension_groups",
+                stage_context={
+                    "classes": class_data.get("classes", []),
+                    "existing_dimension_groups": all_dimension_groups,
+                },
+            )
+            dimension_data = self._merge_results(dimension_results, GlobalCorrectionResult())
+            dimension_data = self._deduplicate_optimization_assets(dimension_data)
+            available_dimension_groups = {
+                item.get("id"): item for item in all_dimension_groups if item.get("id")
+            }
+            available_dimension_groups.update({
+                item.get("id"): item for item in dimension_data.get("dimension_groups", []) if item.get("id")
+            })
+
+            await _emit_progress(progress_callback, phase="metric_optimizing", progress=55, total=100, message="阶段三：基于 Class 与维度组优化 Relationship 和结构化 Metric")
             semantic_results = await self._run_batch_optimization(
-                [], relationships, metrics, [], progress_callback,
+                [], relationships, metrics, [], [], progress_callback,
                 stage="semantics",
-                stage_context={"classes": class_data.get("classes", [])},
+                stage_context={
+                    "classes": class_data.get("classes", []),
+                    "dimension_groups": list(available_dimension_groups.values()),
+                },
             )
             semantic_data = self._merge_results(semantic_results, GlobalCorrectionResult())
             semantic_data = self._deduplicate_optimization_assets(semantic_data)
 
-            await _emit_progress(progress_callback, phase="concept_optimizing", progress=62, total=100, message="阶段三：基于已确定资产优化 Concept 层级")
+            await _emit_progress(progress_callback, phase="concept_optimizing", progress=67, total=100, message="阶段四：基于已确定资产优化 Concept 层级")
             concept_results = await self._run_batch_optimization(
-                [], [], [], concepts, progress_callback,
+                [], [], [], concepts, [], progress_callback,
                 stage="concepts",
                 stage_context={
                     "classes": class_data.get("classes", []),
+                    "dimension_groups": list(available_dimension_groups.values()),
                     "relationships": semantic_data.get("relationships", []),
                     "metrics": semantic_data.get("metrics", []),
                 },
             )
-            batch_results = [*class_results, *semantic_results, *concept_results]
+            batch_results = [*class_results, *dimension_results, *semantic_results, *concept_results]
 
             await _emit_progress(progress_callback, phase="global_correcting", progress=65, total=100, message="阶段二：全局校正")
             global_result = await self._run_global_correction(batch_results, progress_callback)
@@ -278,6 +307,15 @@ class SchemaOptimizer:
             metric_sql += " AND is_reviewed IS NOT TRUE AND COALESCE(review_status, 'pending')='pending'"
         metric_rows = conn.execute(metric_sql, (sid,)).fetchall()
         metrics = [_row_to_dict(r) for r in metric_rows]
+        metric_group_rows = conn.execute(
+            "SELECT metric_id, group_id FROM metric_dimension_bindings WHERE scenario_id=?",
+            (sid,),
+        ).fetchall()
+        metric_group_ids: dict[str, list[str]] = {}
+        for row in metric_group_rows:
+            metric_group_ids.setdefault(row["metric_id"], []).append(row["group_id"])
+        for metric in metrics:
+            metric["dimension_group_ids"] = metric_group_ids.get(metric["id"], [])
 
         relationship_sql = "SELECT * FROM schema_relationships WHERE scenario_id=?"
         if incremental or exclude_reviewed:
@@ -291,14 +329,35 @@ class SchemaOptimizer:
         concept_rows = conn.execute(concept_sql, (sid,)).fetchall()
         concepts = [_row_to_dict(r) for r in concept_rows]
 
+        group_sql = "SELECT * FROM dimension_groups WHERE scenario_id=?"
+        if incremental or exclude_reviewed:
+            group_sql += " AND status='draft'"
+        group_rows = conn.execute(group_sql, (sid,)).fetchall()
+        options = conn.execute("SELECT * FROM dimension_group_options WHERE scenario_id=? ORDER BY sort_order", (sid,)).fetchall()
+        mappings = conn.execute("SELECT * FROM dimension_field_mappings WHERE scenario_id=? ORDER BY priority", (sid,)).fetchall()
+        options_by_group: dict[str, list[dict]] = {}
+        for row in options:
+            item = _row_to_dict(row)
+            options_by_group.setdefault(item["group_id"], []).append({
+                **item, "aliases": _json_list(item.get("aliases"))
+            })
+        mappings_by_group: dict[str, list[dict]] = {}
+        for row in mappings:
+            item = _row_to_dict(row)
+            mappings_by_group.setdefault(item["group_id"], []).append(item)
+        dimension_groups = [
+            {**_row_to_dict(row), "options": options_by_group.get(row["id"], []), "field_mappings": mappings_by_group.get(row["id"], [])}
+            for row in group_rows
+        ]
+
         conn.close()
-        return classes, relationships, metrics, concepts
+        return classes, relationships, metrics, concepts, dimension_groups
 
     # --------------------------------------------------------
     # 阶段一：分批优化（修复孤立资产 Bug）
     # --------------------------------------------------------
 
-    def _build_batches(self, classes, relationships, metrics, concepts) -> List[Dict]:
+    def _build_batches(self, classes, relationships, metrics, concepts, dimension_groups=None) -> List[Dict]:
         """
         按 Class 关联性分批。
         修复：孤立资产不再重复添加，各自独立成批。
@@ -394,6 +453,11 @@ class SchemaOptimizer:
                 "concepts": []
             })
 
+        for index in range(0, len(dimension_groups or []), BATCH_MAX_DIMENSION_GROUPS):
+            batches.append({
+                "classes": [], "relationships": [], "metrics": [], "concepts": [],
+                "dimension_groups": (dimension_groups or [])[index:index + BATCH_MAX_DIMENSION_GROUPS],
+            })
         return [b for b in batches if any(b.values())]
 
     async def _run_batch_optimization(
@@ -402,12 +466,23 @@ class SchemaOptimizer:
         relationships,
         metrics,
         concepts,
+        dimension_groups=None,
         progress_callback=None,
         stage: str = "all",
         stage_context: Optional[Dict] = None,
     ) -> List[OptimizationBatchResult]:
         """执行分批优化"""
-        batches = self._build_batches(classes, relationships, metrics, concepts)
+        batches = self._build_batches(classes, relationships, metrics, concepts, dimension_groups)
+        # 即使当前尚未维护任何维度组，也必须执行一次发现批次：
+        # 由业务文档和已确定的 Class 识别可复用的新分析维度组。
+        if stage == "dimension_groups":
+            if not batches:
+                batches = [{
+                    "classes": [], "relationships": [], "metrics": [], "concepts": [],
+                    "dimension_groups": [], "dimension_discovery": True,
+                }]
+            else:
+                batches[0]["dimension_discovery"] = True
         results = []
         total = len(batches)
 
@@ -418,7 +493,7 @@ class SchemaOptimizer:
                 message=f"阶段一：批次 {i+1}/{total}"
             )
 
-            query = self._build_batch_query(batch)
+            query = self._build_batch_query(batch, stage_context or {})
             doc_context = self.doc_index.build_context(query, top_k=5, max_chars=DOC_CONTEXT_LIMIT)
 
             result = await self._call_llm_batch(batch, doc_context, stage, stage_context or {})
@@ -432,6 +507,7 @@ class SchemaOptimizer:
         """忽略模型跨阶段输出，保证资产依赖顺序不能被绕过。"""
         allowed = {
             "classes": {"classes"},
+            "dimension_groups": {"dimension_groups"},
             "semantics": {"relationships", "metrics"},
             "concepts": {"concepts"},
         }.get(stage)
@@ -443,17 +519,25 @@ class SchemaOptimizer:
             result.relationships = []
         if "metrics" not in allowed:
             result.metrics = []
+        if "dimension_groups" not in allowed:
+            result.dimension_groups = []
         if "concepts" not in allowed:
             result.concepts = []
         return result
 
-    def _build_batch_query(self, batch: Dict) -> str:
+    def _build_batch_query(self, batch: Dict, stage_context: Optional[Dict] = None) -> str:
         """构建批次查询文本"""
         parts = []
         for c in batch.get("classes", []):
             parts.append(f"{c.get('name_cn', '')} {c.get('description', '')} {c.get('id', '')}")
         for m in batch.get("metrics", []):
             parts.append(f"{m.get('name', '')} {m.get('description', '')} {json.dumps(m.get('definition', {}), ensure_ascii=False)}")
+        for group in batch.get("dimension_groups", []):
+            parts.append(f"{group.get('name', '')} {group.get('description', '')} {group.get('id', '')}")
+        # 维度发现批次自身没有输入资产，需通过已确定的 Class 形成 BM25 检索词。
+        if batch.get("dimension_discovery"):
+            for cls in (stage_context or {}).get("classes", []):
+                parts.append(f"{cls.get('name_cn', '')} {cls.get('description', '')} {cls.get('id', '')}")
         return " ".join(parts)[:500]
 
     # --------------------------------------------------------
@@ -525,8 +609,9 @@ class SchemaOptimizer:
         schema_reference = json.dumps(self.schema_reference_context, ensure_ascii=False, indent=2) if self.schema_reference_context else "{}"
         stage_context = stage_context or {}
         stage_rules = {
-            "classes": "本阶段仅优化 Class。relationships、metrics、concepts 必须输出空数组；不得创建或改写任何其它资产。",
-            "semantics": "本阶段仅优化 Relationship 和 Metric。Class 已在第一阶段确定，classes、concepts 必须输出空数组。Metric 必须采用 V1 structured definition，target_class 必须等于 definition.anchor_class。",
+            "classes": "本阶段仅优化 Class。relationships、metrics、dimension_groups、concepts 必须输出空数组；不得创建或改写任何其它资产。",
+            "dimension_groups": "本阶段仅识别、创建或优化分析维度组。Class 已在第一阶段确定；classes、relationships、metrics、concepts 必须输出空数组。若当前批次的 dimension_discovery 为 true，必须根据业务文档和 Class 判断是否缺少新的可复用分析维度组；缺少时新增输出，已有维度组使用原 ID，新维度组使用稳定、语义化的英文下划线 ID。不得为单一 Metric 的临时筛选条件创建维度组。每个字段映射必须引用已有 Class 的逻辑字段。",
+            "semantics": "本阶段仅优化 Relationship 和 Metric。Class 与分析维度组均已确定，classes、dimension_groups、concepts 必须输出空数组。Metric 必须采用 V1 structured definition，target_class 必须等于 definition.anchor_class，并且 dimension_group_ids 只能引用前置阶段已确定的维度组。",
             "concepts": "本阶段仅优化 Concept 层级。Class、Relationship、Metric 已确定，classes、relationships、metrics 必须输出空数组；不得重新生成或改写它们。",
         }.get(stage, "仅修改当前批次内的资产。")
         return f"""你是数据仓库建模与本体论专家。请根据以下业务文档和当前 Schema 资产，优化实体类、指标、关系和概念。
@@ -549,7 +634,8 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
 1. {stage_rules}
 2. **去重与合并**：不得生成与当前批次、前置阶段资产、reviewed 或 existing_unreviewed 中语义相同或高度相似（同义词、缩写、仅措辞不同）的资产；应复用最合适的已有未审核 ID 并增量修正。
 3. **Class 优化**：根据文档修正 name_cn、description，fields 只输出需优化的字段（排除已正确的）。
-4. **Metric 优化**：根据文档修正 name、description、definition、dimensions、required_dimensions；definition.inputs 中每项均需包含 id、output_name、class_id、source_shape、field、aggregation、filters。long 输入必须有固定 filters。
+4. **维度组优化与发现**：根据文档修正业务名称、选项、别名、默认值与 Class 逻辑字段映射；当 dimension_discovery 为 true 时，额外识别当前系统缺失、可被多个 Metric 复用的时间/分类/层级维度组并输出。已有维度组必须保留原 ID；新维度组必须提供稳定英文下划线 ID、至少一个选项和至少一条映射。不允许使用物理字段名替代业务字段，也不得把临时过滤条件建成维度组。
+5. **Metric 优化**：根据文档修正 name、description、definition、dimensions、required_dimensions、dimension_group_ids；definition.inputs 中每项均需包含 id、output_name、class_id、source_shape、field、aggregation、filters。long 输入必须有固定 filters。
 5. **Relationship 优化**：根据文档补充或修正 source_key/target_key。
 6. **Concept 优化**：根据文档补充概念层级，parent_id 只能引用当前或前置阶段已存在的 Concept。
 7. **已有资产保护**：如果优化建议与 reviewed 冲突，必须以 reviewed 为准；不得输出 reviewed 的 ID。
@@ -564,7 +650,10 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
     {{"source": "类ID", "target": "类ID", "type": "belongs_to", "source_key": "源键", "target_key": "目标键", "join_key": ""}}
   ],
   "metrics": [
-    {{"id": "原ID", "name": "优化后名称", "description": "优化后描述", "category": "", "target_class": "类ID", "definition": {{"version": 1, "anchor_class": "类ID", "expression_operator": "ADD", "inputs": []}}, "dimensions": ["col1"], "required_dimensions": ["col1"], "chart_type": "bar"}}
+        {{"id": "原ID", "name": "优化后名称", "description": "优化后描述", "category": "", "target_class": "类ID", "definition": {{"version": 1, "anchor_class": "类ID", "expression_operator": "ADD", "inputs": []}}, "dimensions": ["col1"], "required_dimensions": [], "dimension_group_ids": ["time_granularity"], "chart_type": "bar"}}
+    ],
+    "dimension_groups": [
+        {{"id": "已有组使用原ID；新组使用英文下划线ID", "name": "时间粒度", "description": "业务说明", "group_type": "time", "is_required": true, "default_option": "month", "clarification_policy": "auto_fill", "options": [{{"value": "month", "label": "按月", "aliases": [], "is_default": true}}], "field_mappings": [{{"option_value": "month", "class_id": "类ID", "field_name": "逻辑字段名", "display_name": "月份", "priority": 0}}]}}
   ],
   "concepts": [
     {{"id": "原ID", "name": "", "description": "", "parent_id": "", "level": 0, "concept_type": "entity", "related_class": ""}}
@@ -744,6 +833,7 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
 
         all_classes = {}
         all_metrics = {}
+        all_dimension_groups = {}
         all_rels = {}
         all_concepts = {}
 
@@ -755,6 +845,8 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
             for m in r.metrics:
                 m.target_class = rename_map.get(m.target_class, m.target_class)
                 all_metrics[m.id] = m.model_dump()
+            for group in r.dimension_groups:
+                all_dimension_groups[group.id] = group.model_dump()
             for rel in r.relationships:
                 rel.source = rename_map.get(rel.source, rel.source)
                 rel.target = rename_map.get(rel.target, rel.target)
@@ -776,6 +868,7 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
         return {
             "classes": list(all_classes.values()),
             "metrics": list(all_metrics.values()),
+            "dimension_groups": list(all_dimension_groups.values()),
             "relationships": list(all_rels.values()),
             "concepts": list(all_concepts.values()),
         }
@@ -792,11 +885,12 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
 
     def _deduplicate_optimization_assets(self, assets: Dict) -> Dict:
         """保留首个稳定 ID，剔除语义完全重复或措辞高度相似的未审核优化结果。"""
-        retained = {"classes": [], "metrics": [], "relationships": [], "concepts": []}
+        retained = {"classes": [], "metrics": [], "relationships": [], "concepts": [], "dimension_groups": []}
         class_signatures: list[tuple[str, str]] = []
         metric_signatures: list[tuple[str, str]] = []
         relationship_signatures = set()
         concept_signatures: list[tuple[str, str]] = []
+        dimension_group_ids = set()
 
         for item in assets.get("classes", []):
             source = str(item.get("csv_file") or item.get("table_name") or "").strip().lower()
@@ -829,6 +923,12 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
                 retained["metrics"].append(item)
                 metric_signatures.append((structural_signature, name_signature))
 
+        for item in assets.get("dimension_groups", []):
+            group_id = str(item.get("id") or "").strip()
+            if group_id and group_id not in dimension_group_ids:
+                retained["dimension_groups"].append(item)
+                dimension_group_ids.add(group_id)
+
         for item in assets.get("relationships", []):
             signature = (
                 str(item.get("source") or "").strip(),
@@ -854,7 +954,7 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
 
     def _filter_protected_assets(self, assets: Dict) -> Dict:
         """防御性过滤：即使模型错误返回人工审核资产，也绝不将其写回。"""
-        all_classes, all_relationships, all_metrics, all_concepts = self._load_schema_assets(
+        all_classes, all_relationships, all_metrics, all_concepts, all_dimension_groups = self._load_schema_assets(
             incremental=False,
             target_class_ids=None,
         )
@@ -875,9 +975,14 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
             (item.get("source"), item.get("target")) for item in all_relationships
             if bool(item.get("is_reviewed")) or item.get("review_status") in {"approved", "rejected"}
         }
+        protected_dimension_group_ids = {
+            item.get("id") for item in all_dimension_groups
+            if item.get("status") in {"approved", "deprecated"}
+        }
         return {
             "classes": [item for item in assets.get("classes", []) if item.get("id") not in protected_class_ids],
             "metrics": [item for item in assets.get("metrics", []) if item.get("id") not in protected_metric_ids],
+            "dimension_groups": [item for item in assets.get("dimension_groups", []) if item.get("id") not in protected_dimension_group_ids],
             "relationships": [
                 item for item in assets.get("relationships", [])
                 if (item.get("source"), item.get("target")) not in protected_relationships
@@ -887,7 +992,7 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
 
     def _validate_optimization_assets(self, merged: Dict) -> Dict:
         """使用与提取阶段一致的物理字段/引用校验规则过滤优化结果。"""
-        current_classes, _, _, current_concepts = self._load_schema_assets(incremental=False, target_class_ids=None)
+        current_classes, _, _, current_concepts, current_dimension_groups = self._load_schema_assets(incremental=False, target_class_ids=None)
         class_context = {item.get("id", ""): self._normalize_class_for_validation(item) for item in current_classes if item.get("id")}
         summaries = self._build_validation_summaries(list(class_context.values()))
         for item in merged.get("classes", []):
@@ -912,10 +1017,17 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
             if cid:
                 concept_context[cid] = {**concept_context.get(cid, {}), **item}
 
+        dimension_group_context = {
+            item.get("id", ""): item for item in current_dimension_groups if item.get("id")
+        }
+        dimension_group_context.update({
+            item.get("id", ""): item for item in merged.get("dimension_groups", []) if item.get("id")
+        })
         validation_schema = {
             "business_name": self.scenario_id,
             "classes": list(class_context.values()),
             "relationships": merged.get("relationships", []),
+            "dimension_groups": list(dimension_group_context.values()),
             "metrics": merged.get("metrics", []),
             "concepts": list(concept_context.values()),
         }
@@ -923,6 +1035,7 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
 
         merged_class_ids = {item.get("id") for item in merged.get("classes", []) if item.get("id")}
         merged_concept_ids = {item.get("id") for item in merged.get("concepts", []) if item.get("id")}
+        merged_dimension_group_ids = {item.get("id") for item in merged.get("dimension_groups", []) if item.get("id")}
         cleaned_metrics = cleaned.get("metrics", [])
         for metric in cleaned_metrics:
             metric["dimensions"] = _json_list(metric.get("dimensions"))
@@ -931,6 +1044,7 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
             "classes": [item for item in cleaned.get("classes", []) if item.get("id") in merged_class_ids],
             "relationships": cleaned.get("relationships", []),
             "metrics": cleaned_metrics,
+            "dimension_groups": [item for item in cleaned.get("dimension_groups", []) if item.get("id") in merged_dimension_group_ids],
             "concepts": [item for item in cleaned.get("concepts", []) if item.get("id") in merged_concept_ids],
         }
 
@@ -1031,7 +1145,7 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
     def _apply_optimization(self, merged: Dict) -> Dict:
         """应用优化结果到数据库"""
         conn = get_db()
-        counts = {"classes": 0, "relationships": 0, "metrics": 0, "concepts": 0}
+        counts = {"classes": 0, "relationships": 0, "dimension_groups": 0, "metrics": 0, "concepts": 0}
 
         try:
             for item in merged.get("classes", []):
@@ -1040,6 +1154,9 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
             for item in merged.get("relationships", []):
                 if self._upsert_relationship(conn, item):
                     counts["relationships"] += 1
+            for item in merged.get("dimension_groups", []):
+                if self._upsert_dimension_group(conn, item):
+                    counts["dimension_groups"] += 1
             for item in merged.get("metrics", []):
                 if self._upsert_metric(conn, item):
                     counts["metrics"] += 1
@@ -1131,6 +1248,71 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
                      """INSERT INTO metrics (id, scenario_id, name, description, category, target_class, definition, dimensions, required_dimensions, chart_type, is_reviewed, review_status, created_at, updated_at)
                          VALUES (?,?,?,?,?,?,?,?,?,?,FALSE,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
                 (mid, sid, *values),
+            )
+        conn.execute("DELETE FROM metric_dimension_bindings WHERE scenario_id=? AND metric_id=?", (sid, mid))
+        valid_group_ids = {
+            row["id"] for row in conn.execute(
+                "SELECT id FROM dimension_groups WHERE scenario_id=?", (sid,)
+            ).fetchall()
+        }
+        for group_id in dict.fromkeys(_json_list(item.get("dimension_group_ids", []))):
+            if group_id in valid_group_ids:
+                conn.execute(
+                    "INSERT INTO metric_dimension_bindings (metric_id, scenario_id, group_id) VALUES (?,?,?)",
+                    (mid, sid, group_id),
+                )
+        return True
+
+    def _upsert_dimension_group(self, conn, item: dict) -> bool:
+        group_id = str(item.get("id") or "").strip()
+        if not group_id:
+            return False
+        sid = self.scenario_id
+        existing = conn.execute(
+            "SELECT status FROM dimension_groups WHERE id=? AND scenario_id=?", (group_id, sid)
+        ).fetchone()
+        if existing and existing["status"] in {"approved", "deprecated"}:
+            return False
+        values = (
+            str(item.get("name") or group_id), str(item.get("description") or ""),
+            str(item.get("group_type") or "categorical"), int(bool(item.get("is_required", False))),
+            str(item.get("default_option") or ""),
+            str(item.get("clarification_policy") or "ask_when_ambiguous"),
+        )
+        if existing:
+            conn.execute(
+                """UPDATE dimension_groups SET name=?, description=?, group_type=?, is_required=?, default_option=?, clarification_policy=?, status='draft', updated_at=CURRENT_TIMESTAMP
+                   WHERE id=? AND scenario_id=?""",
+                (*values, group_id, sid),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO dimension_groups
+                   (id, scenario_id, name, description, group_type, is_required, default_option, clarification_policy, status, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,'draft',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+                (group_id, sid, *values),
+            )
+        conn.execute("DELETE FROM dimension_group_options WHERE scenario_id=? AND group_id=?", (sid, group_id))
+        conn.execute("DELETE FROM dimension_field_mappings WHERE scenario_id=? AND group_id=?", (sid, group_id))
+        for index, option in enumerate(item.get("options", [])):
+            if not isinstance(option, dict) or not str(option.get("value") or "").strip():
+                continue
+            conn.execute(
+                """INSERT INTO dimension_group_options
+                   (group_id, scenario_id, value, label, aliases, is_default, sort_order, status)
+                   VALUES (?,?,?,?,?,?,?,'draft')""",
+                (group_id, sid, option["value"], str(option.get("label") or option["value"]),
+                 json.dumps(option.get("aliases", []), ensure_ascii=False), int(bool(option.get("is_default", False))), option.get("sort_order", index)),
+            )
+        for index, mapping in enumerate(item.get("field_mappings", [])):
+            if not isinstance(mapping, dict):
+                continue
+            conn.execute(
+                """INSERT INTO dimension_field_mappings
+                   (group_id, scenario_id, option_value, class_id, field_name, display_name, priority)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (group_id, sid, mapping.get("option_value", ""), mapping.get("class_id", ""),
+                 mapping.get("field_name", ""), mapping.get("display_name", ""), mapping.get("priority", index)),
             )
         return True
 

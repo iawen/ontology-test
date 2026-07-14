@@ -26,9 +26,15 @@ def metric_target_classes(metric: dict) -> list[str]:
     """Return the Metric anchor plus source classes declared by its structured inputs."""
     definition = metric_definition(metric)
     items = [definition.get("anchor_class")]
+    input_groups = [definition.get("inputs", [])]
+    input_groups.extend(
+        output.get("inputs", []) for output in definition.get("outputs", [])
+        if isinstance(output, dict)
+    )
     items.extend(
         input_item.get("class_id")
-        for input_item in definition.get("inputs", [])
+        for inputs in input_groups
+        for input_item in inputs
         if isinstance(input_item, dict)
     )
     items.append(metric.get("target_class") or metric.get("class_id"))
@@ -46,6 +52,14 @@ def metric_target_classes(metric: dict) -> list[str]:
 
 def metric_component_names(metric: dict) -> list[str]:
     """Return the user-facing names of definition inputs, preserving component order."""
+    definition = metric_definition(metric)
+    if definition.get("version") == 2:
+        return [
+            str(output.get("output_name") or output.get("id") or "").strip()
+            for output in definition.get("outputs", [])
+            if isinstance(output, dict)
+            and str(output.get("output_name") or output.get("id") or "").strip()
+        ]
     return [
         str(input_item.get("output_name") or input_item.get("field") or input_item.get("id") or "").strip()
         for input_item in metric_definition(metric).get("inputs", [])
@@ -57,6 +71,27 @@ def metric_context_summary(metric: dict) -> str:
     """Provide LLMs a governed description of the current Metric definition."""
     definition = metric_definition(metric)
     components = metric_component_names(metric)
+    if definition.get("version") == 2:
+        outputs = []
+        for output in definition.get("outputs", []):
+            if not isinstance(output, dict):
+                continue
+            details = []
+            for item in output.get("inputs", []):
+                if isinstance(item, dict):
+                    details.append(
+                        f"{str(item.get('aggregation') or 'SUM').upper()}({item.get('class_id', '')}.{item.get('field', '')})"
+                    )
+            outputs.append(
+                f"{{id={output.get('id', '')}; 名称={output.get('output_name', '')}; "
+                f"计算方式={output.get('expression_operator', '')}; 组成项={', '.join(details)}}}"
+            )
+        return (
+            f"id={metric.get('id', '')}; 名称={metric.get('name') or metric.get('name_cn', '')}; "
+            f"锚点类={definition.get('anchor_class') or metric.get('target_class', '')}; "
+            f"并列输出=[{'; '.join(outputs) or '无'}]; 可选维度={metric.get('dimensions') or []}; "
+            f"必要维度={metric.get('required_dimensions') or []}; 说明={metric.get('description', '')}"
+        )
     input_details = []
     for input_item in definition.get("inputs", []):
         if not isinstance(input_item, dict):
@@ -75,6 +110,23 @@ def metric_context_summary(metric: dict) -> str:
         f"可选维度={metric.get('dimensions') or []}; 必要维度={metric.get('required_dimensions') or []}; "
         f"说明={metric.get('description', '')}"
     )
+
+
+def resolve_metric_reference(reference: str, metrics: list[dict]) -> tuple[dict | None, dict | None]:
+    """Resolve a parent Metric or a V2 output ID/name within a Metric collection."""
+    value = str(reference or "").strip()
+    for metric in metrics:
+        if value in {str(metric.get("id") or ""), str(metric.get("name") or ""), str(metric.get("name_cn") or "")}:
+            return metric, None
+    matches = []
+    for metric in metrics:
+        definition = metric_definition(metric)
+        if definition.get("version") != 2:
+            continue
+        for output in definition.get("outputs", []):
+            if isinstance(output, dict) and value in {str(output.get("id") or ""), str(output.get("output_name") or "")}:
+                matches.append((metric, output))
+    return matches[0] if len(matches) == 1 else (None, None)
 
 
 def get_tool_purpose(tool_name: str) -> str:

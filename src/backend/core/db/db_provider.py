@@ -555,6 +555,48 @@ def _schema_sql(dialect):
             updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id, scenario_id)
         );
+        CREATE TABLE IF NOT EXISTS dimension_groups (
+            id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            group_type TEXT NOT NULL DEFAULT 'categorical',
+            concept_id TEXT DEFAULT '',
+            is_required INTEGER DEFAULT 0,
+            default_option TEXT DEFAULT '',
+            clarification_policy TEXT NOT NULL DEFAULT 'ask_when_ambiguous',
+            status TEXT NOT NULL DEFAULT 'draft',
+            created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
+            updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id, scenario_id)
+        );
+        CREATE TABLE IF NOT EXISTS dimension_group_options (
+            group_id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            value TEXT NOT NULL,
+            label TEXT NOT NULL,
+            aliases TEXT DEFAULT '[]',
+            is_default INTEGER DEFAULT 0,
+            sort_order INTEGER DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'approved',
+            PRIMARY KEY (group_id, scenario_id, value)
+        );
+        CREATE TABLE IF NOT EXISTS dimension_field_mappings (
+            id {serial_pk},
+            group_id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            option_value TEXT NOT NULL,
+            class_id TEXT NOT NULL,
+            field_name TEXT NOT NULL,
+            display_name TEXT DEFAULT '',
+            priority INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS metric_dimension_bindings (
+            metric_id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            group_id TEXT NOT NULL,
+            PRIMARY KEY (metric_id, scenario_id, group_id)
+        );
         CREATE TABLE IF NOT EXISTS chart_rules (
             id {serial_pk},
             scenario_id TEXT NOT NULL,

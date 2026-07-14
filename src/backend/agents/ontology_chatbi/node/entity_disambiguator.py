@@ -8,7 +8,7 @@ from agents.ontology_chatbi.constants import (
     CHINESE_QUARTER_VALUE_PATTERN,
     QUARTER_VALUE_PATTERN,
 )
-from agents.ontology_chatbi.helper import metric_target_classes
+from agents.ontology_chatbi.helper import metric_target_classes, resolve_metric_reference
 from tools.logger import logger
 from core.llm.chat_model import get_async_client, get_model_name
 from agents.ontology_chatbi.helper import ap_month_to_quarter, current_quarter_ap_months, valid_ap_month
@@ -335,7 +335,8 @@ class EntityDisambiguatorAgent:
                 continue
             item = self._normalize_quarter_filter(item, target_class, engine, scenario_id)
             field = item.get("field", "")
-            if engine.get_metric_info(field):
+            metric_info, _ = resolve_metric_reference(field, engine.list_metrics())
+            if metric_info:
                 having.append(dict(item))
                 logger.warning(
                     "Metric filter moved to HAVING before execution: scenario_id=%s field=%s filter=%s",
@@ -538,7 +539,7 @@ class EntityDisambiguatorAgent:
     def _infer_target_class(arguments: dict, engine) -> str:
         class_votes = Counter()
         for metric in arguments.get("metrics") or []:
-            metric_info = engine.get_metric_info(metric)
+            metric_info, _ = resolve_metric_reference(metric, engine.list_metrics())
             if metric_info:
                 for class_id in metric_target_classes(metric_info):
                     class_votes[class_id] += 3
@@ -554,7 +555,7 @@ class EntityDisambiguatorAgent:
             if not isinstance(item, dict):
                 continue
             field = item.get("field", "")
-            metric_info = engine.get_metric_info(field)
+            metric_info, _ = resolve_metric_reference(field, engine.list_metrics())
             if metric_info:
                 for class_id in metric_target_classes(metric_info):
                     class_votes[class_id] += 1

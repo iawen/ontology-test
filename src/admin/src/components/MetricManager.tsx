@@ -12,8 +12,11 @@ import LoadingSpinner from "@/components/ui/LoadingSpinner";
 import ScenarioSelector from "@/components/ScenarioSelector";
 import type {
   Metric,
+  AnyMetricDefinition,
   MetricDefinition,
   MetricInput,
+  MetricOutput,
+  DimensionGroup,
   SchemaClass,
 } from "@/lib/types";
 import {
@@ -92,6 +95,23 @@ function emptyMetricDefinition(): MetricDefinition {
   };
 }
 
+function emptyMetricOutput(index: number): MetricOutput {
+  return {
+    id: `output_${Date.now()}_${index}`,
+    output_name: "",
+    expression_operator: "DIVIDE",
+    inputs: [emptyMetricInput(0), emptyMetricInput(1)],
+  };
+}
+
+function emptyParallelMetricDefinition(anchorClass = ""): AnyMetricDefinition {
+  return {
+    version: 2,
+    anchor_class: anchorClass,
+    outputs: [emptyMetricOutput(0)],
+  };
+}
+
 function normalizeMetric(metric: Metric): Metric {
   return {
     ...metric,
@@ -99,6 +119,9 @@ function normalizeMetric(metric: Metric): Metric {
     dimensions: Array.isArray(metric.dimensions) ? metric.dimensions : [],
     required_dimensions: Array.isArray(metric.required_dimensions)
       ? metric.required_dimensions
+      : [],
+    dimension_group_ids: Array.isArray(metric.dimension_group_ids)
+      ? metric.dimension_group_ids
       : [],
     definition: metric.definition || undefined,
   };
@@ -128,6 +151,7 @@ export default function MetricManager() {
   const api = useApi(token);
   const [metrics, setMetrics] = useState<Metric[]>([]);
   const [schemaClasses, setSchemaClasses] = useState<SchemaClass[]>([]);
+  const [dimensionGroups, setDimensionGroups] = useState<DimensionGroup[]>([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
   const [filterCategory, setFilterCategory] = useState("");
@@ -167,6 +191,18 @@ export default function MetricManager() {
     }
   };
 
+  const loadDimensionGroups = async () => {
+    if (!activeScenario) return;
+    try {
+      const data = await api(
+        `/api/admin/scenarios/${activeScenario}/dimension-groups`,
+      );
+      setDimensionGroups(data || []);
+    } catch {
+      addToast("error", "加载分析维度组失败");
+    }
+  };
+
   const load = async (force = false) => {
     if (!activeScenario) return;
     if (!force) {
@@ -195,6 +231,7 @@ export default function MetricManager() {
       setSelectedMetricIds([]);
       load();
       loadSchemaClasses();
+      loadDimensionGroups();
     }
   }, [activeScenario]);
 
@@ -203,22 +240,25 @@ export default function MetricManager() {
       addToast("warning", "名称必填");
       return;
     }
-    if (!metricDefinition.anchor_class) {
+    if (!activeMetricDefinition.anchor_class) {
       addToast("warning", "请选择锚点类");
       return;
     }
-    if (
-      !metricDefinition.inputs.length ||
-      metricDefinition.inputs.some((input) => !input.class_id || !input.field)
-    ) {
-      addToast("warning", "请完整配置至少一个指标组成项");
+    const outputs = activeMetricDefinition.version === 2
+      ? activeMetricDefinition.outputs
+      : [{ output_name: "", inputs: activeMetricDefinition.inputs }];
+    if (!outputs.length || outputs.some((output) => !output.inputs.length || output.inputs.some((input) => !input.class_id || !input.field))) {
+      addToast("warning", "请完整配置每个指标输出的组成项");
       return;
     }
-    if (
-      metricDefinition.inputs.some(
-        (input) => input.source_shape === "long" && !input.filters?.length,
-      )
-    ) {
+    if (activeMetricDefinition.version === 2) {
+      const names = activeMetricDefinition.outputs.map((output) => output.output_name.trim());
+      if (names.some((name) => !name) || new Set(names).size !== names.length) {
+        addToast("warning", "并列输出名称必填且不能重复");
+        return;
+      }
+    }
+    if (outputs.some((output) => output.inputs.some((input) => input.source_shape === "long" && !input.filters?.length))) {
       addToast("warning", "窄表指标组成项必须配置至少一个固定条件");
       return;
     }
@@ -226,8 +266,8 @@ export default function MetricManager() {
     const payload = {
       ...editMetric,
       id: isEdit ? editMetric.id : metricIdFromName(editMetric.name),
-      target_class: metricDefinition.anchor_class,
-      definition: metricDefinition,
+      target_class: activeMetricDefinition.anchor_class,
+      definition: activeMetricDefinition,
       dimensions: editMetric.dimensions || [],
       required_dimensions: editMetric.required_dimensions || [],
     };
@@ -322,11 +362,6 @@ export default function MetricManager() {
       ),
     [schemaClassOptions],
   );
-  const semanticSourceClass = useMemo(
-    () => schemaClassById.get(metricTargetClasses(editMetric)[0] || ""),
-    [editMetric, schemaClassById],
-  );
-  const semanticFields = semanticSourceClass?.fields || [];
   const metricDefinition = useMemo<MetricDefinition>(() => {
     const definition = editMetric?.definition;
     if (definition?.version === 1) return definition;
@@ -335,15 +370,21 @@ export default function MetricManager() {
       anchor_class: metricTargetClasses(editMetric)[0] || "",
     };
   }, [editMetric]);
+  const parallelMetricDefinition = useMemo(() => {
+    const definition = editMetric?.definition;
+    return definition?.version === 2 ? definition : null;
+  }, [editMetric]);
+  const activeMetricDefinition: AnyMetricDefinition =
+    parallelMetricDefinition || metricDefinition;
   const componentSourceClassOptions = useMemo(() => {
-    const anchorClass = metricDefinition.anchor_class;
+    const anchorClass = activeMetricDefinition.anchor_class;
     if (!anchorClass) return schemaClassOptions;
     return [...schemaClassOptions].sort((left, right) => {
       if (left.id === anchorClass) return -1;
       if (right.id === anchorClass) return 1;
       return 0;
     });
-  }, [metricDefinition.anchor_class, schemaClassOptions]);
+  }, [activeMetricDefinition.anchor_class, schemaClassOptions]);
   const availableTargetClassOptions = useMemo(() => {
     const selected = new Set(metricTargetClasses(editMetric));
     const keyword = targetClassSearch.trim().toLowerCase();
@@ -413,13 +454,12 @@ export default function MetricManager() {
       : `${targetClass}（未匹配）`;
   };
 
-  const toggleDimension = (field: string, required = false) => {
-    const key = required ? "required_dimensions" : "dimensions";
-    const current = editMetric?.[key] || [];
-    const next = current.includes(field)
-      ? current.filter((item) => item !== field)
-      : [...current, field];
-    setEditMetric({ ...editMetric!, [key]: next });
+  const toggleDimensionGroup = (groupId: string) => {
+    const current = editMetric?.dimension_group_ids || [];
+    const dimension_group_ids = current.includes(groupId)
+      ? current.filter((id) => id !== groupId)
+      : [...current, groupId];
+    setEditMetric({ ...editMetric!, dimension_group_ids });
   };
 
   const updateMetricDefinition = (definition: MetricDefinition) => {
@@ -427,6 +467,39 @@ export default function MetricManager() {
       ...editMetric!,
       definition,
       target_class: definition.anchor_class,
+    });
+  };
+
+  const updateParallelMetricDefinition = (
+    definition: Extract<AnyMetricDefinition, { version: 2 }>,
+  ) => {
+    setEditMetric({ ...editMetric!, definition, target_class: definition.anchor_class });
+  };
+
+  const updateParallelOutput = (
+    outputIndex: number,
+    changes: Partial<MetricOutput>,
+  ) => {
+    if (!parallelMetricDefinition) return;
+    updateParallelMetricDefinition({
+      ...parallelMetricDefinition,
+      outputs: parallelMetricDefinition.outputs.map((output, index) =>
+        index === outputIndex ? { ...output, ...changes } : output,
+      ),
+    });
+  };
+
+  const updateParallelInput = (
+    outputIndex: number,
+    inputIndex: number,
+    changes: Partial<MetricInput>,
+  ) => {
+    const output = parallelMetricDefinition?.outputs[outputIndex];
+    if (!output) return;
+    updateParallelOutput(outputIndex, {
+      inputs: output.inputs.map((input, index) =>
+        index === inputIndex ? { ...input, ...changes } : input,
+      ),
     });
   };
 
@@ -506,6 +579,7 @@ export default function MetricManager() {
               target_class: "",
               dimensions: [],
               required_dimensions: [],
+              dimension_group_ids: [],
               definition: emptyMetricDefinition(),
               chart_type: "bar",
               sort_order: 0,
@@ -848,6 +922,105 @@ export default function MetricManager() {
             <p className="mt-1 text-xs text-slate-500">
               每个组成项可选择不同来源类和字段；同一表多字段、跨表指标均使用同一个表达式模型。
             </p>
+            <div className="mt-3 rounded border border-sky-200 bg-white/80 p-3">
+              <div className="grid items-center gap-2 md:grid-cols-[10rem_minmax(15rem,22rem)_1fr]">
+                <label className="text-sm font-medium text-slate-700">
+                  计算模式
+                </label>
+                <select
+                  value={parallelMetricDefinition ? "parallel" : "single"}
+                  onChange={(event) => {
+                    if (event.target.value === "parallel") {
+                      updateParallelMetricDefinition(
+                        emptyParallelMetricDefinition(activeMetricDefinition.anchor_class) as Extract<AnyMetricDefinition, { version: 2 }>,
+                      );
+                    } else {
+                      updateMetricDefinition({
+                        ...metricDefinition,
+                        anchor_class: activeMetricDefinition.anchor_class,
+                      });
+                    }
+                  }}
+                  className="w-full"
+                >
+                  <option value="single">单一计算：一个表达式</option>
+                  <option value="parallel">多个并列计算：一个 Metric 输出多列</option>
+                </select>
+                <p className="text-xs text-slate-500">
+                  例如同一个“规格达成率”同时输出 50mg、100mg、200mg 的实际额 ÷ 目标额。
+                </p>
+              </div>
+            </div>
+            {parallelMetricDefinition && (
+              <div className="mt-4 space-y-3 rounded border border-violet-200 bg-violet-50/50 p-3">
+                <div className="grid gap-3 md:grid-cols-[minmax(12rem,1fr)_auto]">
+                  <select
+                    value={parallelMetricDefinition.anchor_class}
+                    onChange={(event) =>
+                      updateParallelMetricDefinition({ ...parallelMetricDefinition, anchor_class: event.target.value })
+                    }
+                  >
+                    <option value="">请选择锚点类</option>
+                    {schemaClassOptions.map((schemaClass) => (
+                      <option key={schemaClass.id} value={schemaClass.id}>{schemaClassLabel(schemaClass)}</option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => updateParallelMetricDefinition({
+                      ...parallelMetricDefinition,
+                      outputs: [...parallelMetricDefinition.outputs, emptyMetricOutput(parallelMetricDefinition.outputs.length)],
+                    })}
+                    className="btn-ghost text-xs text-violet-700"
+                  >
+                    <Plus className="mr-1 inline h-3 w-3" />添加并列输出
+                  </button>
+                </div>
+                {parallelMetricDefinition.outputs.map((output, outputIndex) => (
+                  <div key={output.id} className="rounded border border-violet-200 bg-white p-3">
+                    <div className="mb-2 grid gap-2 md:grid-cols-[minmax(12rem,1fr)_10rem_auto]">
+                      <input
+                        value={output.output_name}
+                        onChange={(event) => updateParallelOutput(outputIndex, { output_name: event.target.value })}
+                        placeholder="输出名称，例如：50mg达成率"
+                      />
+                      <select
+                        value={output.expression_operator}
+                        onChange={(event) => updateParallelOutput(outputIndex, { expression_operator: event.target.value as MetricOutput["expression_operator"] })}
+                      >
+                        <option value="DIVIDE">相除</option><option value="ADD">相加</option><option value="SUBTRACT">相减</option><option value="MULTIPLY">相乘</option>
+                      </select>
+                      <button
+                        type="button"
+                        disabled={parallelMetricDefinition.outputs.length === 1}
+                        onClick={() => updateParallelMetricDefinition({ ...parallelMetricDefinition, outputs: parallelMetricDefinition.outputs.filter((_, index) => index !== outputIndex) })}
+                        className="btn-ghost p-1 text-slate-500 disabled:opacity-30"
+                        aria-label="删除并列输出"
+                      ><X className="h-4 w-4" /></button>
+                    </div>
+                    {output.inputs.map((input, inputIndex) => {
+                      const inputClass = schemaClassById.get(input.class_id);
+                      return <div key={input.id} className="mb-2 grid gap-2 md:grid-cols-[minmax(11rem,1fr)_minmax(11rem,1fr)_8rem_2rem]">
+                        <select value={input.class_id} onChange={(event) => updateParallelInput(outputIndex, inputIndex, { class_id: event.target.value, field: "", filters: [] })}>
+                          <option value="">选择来源类</option>
+                          {componentSourceClassOptions.map((schemaClass) => <option key={schemaClass.id} value={schemaClass.id}>{schemaClassLabel(schemaClass)}</option>)}
+                        </select>
+                        <select value={input.field} disabled={!inputClass} onChange={(event) => updateParallelInput(outputIndex, inputIndex, { field: event.target.value })}>
+                          <option value="">选择字段</option>
+                          {(inputClass?.fields || []).map((field) => <option key={field.physical_name || field.name} value={field.physical_name || field.name}>{field.name}（{field.physical_name}）</option>)}
+                        </select>
+                        <select value={input.aggregation} onChange={(event) => updateParallelInput(outputIndex, inputIndex, { aggregation: event.target.value as MetricInput["aggregation"] })}>
+                          <option value="SUM">求和</option><option value="AVG">平均</option><option value="MIN">最小</option><option value="MAX">最大</option><option value="COUNT">计数</option><option value="COUNT_DISTINCT">去重计数</option>
+                        </select>
+                        <button type="button" disabled={output.inputs.length === 1} onClick={() => updateParallelOutput(outputIndex, { inputs: output.inputs.filter((_, index) => index !== inputIndex) })} className="btn-ghost p-1 text-slate-500 disabled:opacity-30" aria-label="删除组成项"><X className="h-4 w-4" /></button>
+                      </div>;
+                    })}
+                    <button type="button" onClick={() => updateParallelOutput(outputIndex, { inputs: [...output.inputs, emptyMetricInput(output.inputs.length)] })} className="btn-ghost text-xs text-violet-700"><Plus className="mr-1 inline h-3 w-3" />添加组成项</button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className={parallelMetricDefinition ? "hidden" : ""}>
             <div className="mt-4 grid gap-3 md:grid-cols-3">
               <div>
                 <label className="mb-1.5 block text-xs font-medium text-slate-500">
@@ -1209,6 +1382,7 @@ export default function MetricManager() {
                 KPI、规格等口径。表达式按组成项顺序计算；“拼接（并列展示）”会将每个组成项独立聚合并输出为一列。
               </p>
             </div>
+            </div>
           </div>
           <div className="grid grid-cols-2 gap-4">
             <div>
@@ -1254,76 +1428,84 @@ export default function MetricManager() {
               />
             </div>
           </div>
-          {semanticSourceClass && (
-            <div className="grid gap-4 md:grid-cols-2">
-              {(
-                [
-                  [
-                    "dimensions",
-                    "可选维度",
-                    "用户提问时可用于筛选、分组的字段",
-                  ],
-                  [
-                    "required_dimensions",
-                    "必要维度",
-                    "查询该指标时必须明确的字段",
-                  ],
-                ] as const
-              ).map(([key, label, hint]) => (
-                <div key={key} className="rounded border border-slate-200 p-3">
-                  <label className="block text-xs font-medium text-slate-600">
-                    {label}
-                  </label>
-                  <p className="mt-1 text-xs text-slate-400">{hint}</p>
-                  <select
-                    className="mt-2 w-full text-sm"
-                    value=""
-                    onChange={(event) => {
-                      if (event.target.value)
-                        toggleDimension(
-                          event.target.value,
-                          key === "required_dimensions",
-                        );
-                    }}
-                  >
-                    <option value="">从字段下拉框添加…</option>
-                    {semanticFields
-                      .filter(
-                        (field) =>
-                          !(editMetric?.[key] || []).includes(field.name),
-                      )
-                      .map((field) => (
-                        <option key={field.name} value={field.name}>
-                          {field.name}（{field.physical_name}）
-                        </option>
-                      ))}
-                  </select>
-                  <div className="mt-2 flex min-h-6 flex-wrap gap-1.5">
-                    {(editMetric?.[key] || []).length ? (
-                      (editMetric?.[key] || []).map((field) => (
-                        <button
-                          key={field}
-                          type="button"
-                          onClick={() =>
-                            toggleDimension(
-                              field,
-                              key === "required_dimensions",
-                            )
-                          }
-                          className="inline-flex items-center gap-1 rounded-full bg-sky-50 px-2 py-1 text-xs text-sky-700 hover:bg-sky-100"
-                        >
-                          {field}
-                          <X className="h-3 w-3" />
-                        </button>
-                      ))
-                    ) : (
-                      <span className="text-xs text-slate-400">尚未选择</span>
-                    )}
-                  </div>
-                </div>
-              ))}
+          <div className="rounded border border-indigo-200 bg-indigo-50/40 p-4">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-semibold text-slate-700">
+                  分析维度组
+                </h3>
+                <p className="mt-1 text-xs text-slate-500">
+                  为指标关联业务级分析维度。字段映射、业务选项和澄清策略统一在“分析维度组”中维护。
+                </p>
+              </div>
+              <span className="rounded bg-white px-2 py-1 text-xs text-slate-500">
+                已关联 {(editMetric?.dimension_group_ids || []).length} 个
+              </span>
             </div>
-          )}
+            {dimensionGroups.length === 0 ? (
+              <p className="mt-3 text-xs text-amber-700">
+                当前场景尚未配置分析维度组，请先到“分析维度组”页面创建并审核通过。
+              </p>
+            ) : (
+              <div className="mt-3 grid gap-2 md:grid-cols-2">
+                {dimensionGroups
+                  .filter(
+                    (group) =>
+                      group.status === "approved" ||
+                      (editMetric?.dimension_group_ids || []).includes(group.id),
+                  )
+                  .map((group) => {
+                    const selected = (editMetric?.dimension_group_ids || []).includes(group.id);
+                    const selectable = group.status === "approved";
+                    return (
+                      <label
+                        key={group.id}
+                        className={`rounded border p-3 text-sm ${selected ? "border-indigo-300 bg-white" : "border-slate-200 bg-white/70"} ${!selectable && !selected ? "opacity-50" : ""}`}
+                      >
+                        <div className="flex items-start gap-2">
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            disabled={!selectable && !selected}
+                            onChange={() => toggleDimensionGroup(group.id)}
+                          />
+                          <div className="min-w-0">
+                            <div className="font-medium text-slate-700">
+                              {group.name}
+                              {group.is_required && (
+                                <span className="ml-1.5 text-xs font-normal text-rose-600">
+                                  必选
+                                </span>
+                              )}
+                            </div>
+                            <div className="mt-0.5 text-xs text-slate-400">
+                              {group.id} · {group.group_type}
+                              {group.status !== "approved" ? " · 未通过" : ""}
+                            </div>
+                            <div className="mt-2 flex flex-wrap gap-1">
+                              {group.options.map((option) => (
+                                <span
+                                  key={option.value}
+                                  className="rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600"
+                                >
+                                  {option.label}
+                                  {option.value === group.default_option ? " · 默认" : ""}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      </label>
+                    );
+                  })}
+              </div>
+            )}
+            {(editMetric?.dimensions || []).length > 0 && (
+              <p className="mt-3 text-xs text-slate-400">
+                兼容提示：该指标仍保存了旧版字段维度配置；后续 ClarifyAgent 集成会优先使用分析维度组。
+              </p>
+            )}
+          </div>
           <div>
             <label className="mb-1.5 block text-xs font-medium text-slate-500">
               人工审核

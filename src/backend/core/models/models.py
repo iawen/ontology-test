@@ -90,6 +90,7 @@ class MetricCreate(BaseModel):
     definition: dict = {}
     dimensions: list[str] = []
     required_dimensions: list[str] = []
+    dimension_group_ids: list[str] = []
     chart_type: str = "bar"
     sort_order: int = 0
     is_reviewed: int | bool = 0
@@ -104,6 +105,7 @@ class MetricUpdate(BaseModel):
     definition: dict | None = None
     dimensions: list[str] | None = None
     required_dimensions: list[str] | None = None
+    dimension_group_ids: list[str] | None = None
     chart_type: str = ""
     sort_order: int | None = None
     is_reviewed: int | bool | None = None
@@ -112,6 +114,56 @@ class MetricUpdate(BaseModel):
 
 class MetricBatchDelete(BaseModel):
     ids: list[str]
+
+
+# ============================================================
+# 分析维度组
+# ============================================================
+
+class DimensionFieldMapping(BaseModel):
+    option_value: str
+    class_id: str
+    field_name: str
+    display_name: str = ""
+    priority: int = 0
+
+
+class DimensionOption(BaseModel):
+    value: str
+    label: str
+    aliases: list[str] = []
+    is_default: bool = False
+    sort_order: int = 0
+    status: str = "approved"
+
+
+class DimensionGroupCreate(BaseModel):
+    id: str
+    name: str
+    description: str = ""
+    group_type: str = "categorical"
+    concept_id: str = ""
+    is_required: bool = False
+    default_option: str = ""
+    clarification_policy: str = "ask_when_ambiguous"
+    status: str = "draft"
+    options: list[DimensionOption] = []
+    field_mappings: list[DimensionFieldMapping] = []
+    metric_ids: list[str] = []
+
+
+class DimensionGroupUpdate(BaseModel):
+    name: str = ""
+    description: str = ""
+    group_type: str = ""
+    concept_id: str = ""
+    is_required: bool | None = None
+    default_option: str = ""
+    clarification_policy: str = ""
+    status: str = ""
+    options: list[DimensionOption] | None = None
+    field_mappings: list[DimensionFieldMapping] | None = None
+    metric_ids: list[str] | None = None
 
 
 # ============================================================

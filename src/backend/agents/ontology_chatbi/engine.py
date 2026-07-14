@@ -584,11 +584,20 @@ class ChatEngineV3:
             if isinstance(metric_id, str) and metric_id
         ]
         planned_metric_ids = self._string_list(subquestion.get("metric_ids"))
-        preferred_metric_ids = [
-            metric_id
-            for metric_id in planned_metric_ids
-            if engine.get_metric_info(metric_id)
-        ]
+        preferred_metric_ids = []
+        for metric_id in planned_metric_ids:
+            metric_info = engine.get_metric_info(metric_id)
+            if metric_info:
+                preferred_metric_ids.append(metric_id)
+                continue
+            for candidate in engine.list_metrics():
+                definition = candidate.get("definition") or {}
+                if any(
+                    isinstance(output, dict) and metric_id in {output.get("id"), output.get("output_name")}
+                    for output in definition.get("outputs", [])
+                ):
+                    preferred_metric_ids.append(str(candidate.get("id") or metric_id))
+                    break
         metric_candidates = list(
             dict.fromkeys([*preferred_metric_ids, *metric_candidates])
         )

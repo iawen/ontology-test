@@ -55,9 +55,10 @@ export interface Metric {
   description: string;
   category: string;
   target_class: string;
-  definition?: MetricDefinition;
+  definition?: AnyMetricDefinition;
   dimensions: string[];
   required_dimensions: string[];
+  dimension_group_ids?: string[];
   chart_type: string;
   sort_order: number;
   is_reviewed?: number | ReviewStatus | boolean;
@@ -91,6 +92,21 @@ export interface MetricDefinition {
   inputs: MetricInput[];
 }
 
+export interface MetricOutput {
+  id: string;
+  output_name: string;
+  expression_operator: Exclude<MetricExpressionOperator, "CONCAT">;
+  inputs: MetricInput[];
+}
+
+export interface ParallelMetricDefinition {
+  version: 2;
+  anchor_class: string;
+  outputs: MetricOutput[];
+}
+
+export type AnyMetricDefinition = MetricDefinition | ParallelMetricDefinition;
+
 export interface Concept {
   id: string;
   scenario_id: string;
@@ -103,6 +119,41 @@ export interface Concept {
   sort_order: number;
   is_reviewed: boolean;
   review_status?: ReviewStatus;
+}
+
+export interface DimensionOption {
+  value: string;
+  label: string;
+  aliases: string[];
+  is_default: boolean;
+  sort_order: number;
+  status: "draft" | "approved" | "deprecated";
+}
+
+export interface DimensionFieldMapping {
+  option_value: string;
+  class_id: string;
+  field_name: string;
+  display_name: string;
+  priority: number;
+}
+
+export interface DimensionGroup {
+  id: string;
+  scenario_id: string;
+  name: string;
+  description: string;
+  group_type: "time" | "categorical" | "hierarchy";
+  concept_id: string;
+  is_required: boolean;
+  default_option: string;
+  clarification_policy: "auto_fill" | "ask_when_ambiguous" | "always_ask";
+  status: "draft" | "approved" | "deprecated";
+  options: DimensionOption[];
+  field_mappings: DimensionFieldMapping[];
+  metric_ids: string[];
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface ChartRule {

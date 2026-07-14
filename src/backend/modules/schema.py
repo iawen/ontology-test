@@ -452,6 +452,18 @@ def _sync_schema_files(scenario_id: str):
     concepts = conn.execute(
         "SELECT * FROM concepts WHERE scenario_id=?", (scenario_id,)
     ).fetchall()
+    dimension_groups = conn.execute(
+        "SELECT * FROM dimension_groups WHERE scenario_id=? ORDER BY name", (scenario_id,)
+    ).fetchall()
+    dimension_options = conn.execute(
+        "SELECT * FROM dimension_group_options WHERE scenario_id=? ORDER BY group_id, sort_order", (scenario_id,)
+    ).fetchall()
+    dimension_mappings = conn.execute(
+        "SELECT * FROM dimension_field_mappings WHERE scenario_id=? ORDER BY group_id, priority, id", (scenario_id,)
+    ).fetchall()
+    metric_bindings = conn.execute(
+        "SELECT metric_id, group_id FROM metric_dimension_bindings WHERE scenario_id=? ORDER BY metric_id, group_id", (scenario_id,)
+    ).fetchall()
     conn.close()
 
     parsed_classes = []
@@ -510,6 +522,10 @@ def _sync_schema_files(scenario_id: str):
         parsed_rels.append(rel_item)
         mapping_rels.append(rel_item)
 
+    metric_group_ids: dict[str, list[str]] = {}
+    for binding in metric_bindings:
+        metric_group_ids.setdefault(binding["metric_id"], []).append(binding["group_id"])
+
     parsed_metrics = []
     for row in metrics:
         m = dict(row)
@@ -523,6 +539,7 @@ def _sync_schema_files(scenario_id: str):
             "definition": _json_dict(m.get("definition", "{}")),
             "dimensions": _json_list(m["dimensions"]),
             "required_dimensions": _json_list(m["required_dimensions"]),
+            "dimension_group_ids": metric_group_ids.get(m["id"], []),
             "chart_type": m["chart_type"],
             "sort_order": m["sort_order"],
             "is_reviewed": _is_reviewed_status(
@@ -549,11 +566,50 @@ def _sync_schema_files(scenario_id: str):
             "review_status": _review_status(c.get("review_status"), c.get("is_reviewed", 0)),
         })
 
+    options_by_group: dict[str, list[dict]] = {}
+    for row in dimension_options:
+        option = dict(row)
+        options_by_group.setdefault(option["group_id"], []).append({
+            "value": option["value"],
+            "label": option["label"],
+            "aliases": _json_list(option.get("aliases")),
+            "is_default": bool(option.get("is_default")),
+            "sort_order": option.get("sort_order", 0),
+            "status": option.get("status", "draft"),
+        })
+    mappings_by_group: dict[str, list[dict]] = {}
+    for row in dimension_mappings:
+        mapping = dict(row)
+        mappings_by_group.setdefault(mapping["group_id"], []).append({
+            "option_value": mapping["option_value"],
+            "class_id": mapping["class_id"],
+            "field_name": mapping["field_name"],
+            "display_name": mapping.get("display_name", ""),
+            "priority": mapping.get("priority", 0),
+        })
+    parsed_dimension_groups = []
+    for row in dimension_groups:
+        group = dict(row)
+        parsed_dimension_groups.append({
+            "id": group["id"],
+            "name": group["name"],
+            "description": group.get("description", ""),
+            "group_type": group.get("group_type", "categorical"),
+            "concept_id": group.get("concept_id", ""),
+            "is_required": bool(group.get("is_required")),
+            "default_option": group.get("default_option", ""),
+            "clarification_policy": group.get("clarification_policy", "ask_when_ambiguous"),
+            "status": group.get("status", "draft"),
+            "options": options_by_group.get(group["id"], []),
+            "field_mappings": mappings_by_group.get(group["id"], []),
+        })
+
     schema = {
         "business_name": scenario_id,
         "classes": parsed_classes,
         "relationships": parsed_rels,
         "concepts": parsed_concepts,
+        "dimension_groups": parsed_dimension_groups,
         "metrics": parsed_metrics,
     }
     mapping = {

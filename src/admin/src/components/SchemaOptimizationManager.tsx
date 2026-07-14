@@ -283,7 +283,7 @@ export default function SchemaOptimizationManager() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
+      <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">
         <div className="card overflow-hidden">
           <div className="flex items-center justify-between border-b border-slate-100 px-5 py-3">
             <h3 className="text-sm font-semibold text-slate-700">

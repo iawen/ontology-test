@@ -10,6 +10,7 @@ import DataManager from "@/components/DataManager";
 import SchemaManager from "@/components/SchemaManager";
 import SchemaOptimizationManager from "@/components/SchemaOptimizationManager";
 import ConceptManager from "@/components/ConceptManager";
+import DimensionGroupManager from "@/components/DimensionGroupManager";
 import MetricManager from "@/components/MetricManager";
 import ChartRulesManager from "@/components/ChartRulesManager";
 import GlossaryManager from "@/components/GlossaryManager";
@@ -32,6 +33,7 @@ const PAGE_COMPONENTS: Record<PageKey, React.ComponentType> = {
   "schema": SchemaManager,
   "schema-optimization": SchemaOptimizationManager,
   "concepts": ConceptManager,
+  "dimension-groups": DimensionGroupManager,
   "metrics": MetricManager,
   "chart-rules": ChartRulesManager,
   "glossary": GlossaryManager,

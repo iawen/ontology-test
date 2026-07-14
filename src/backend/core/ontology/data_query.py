@@ -484,11 +484,39 @@ class DataQueryEngine:
                 definition = {}
         return definition if isinstance(definition, dict) else {}
 
+    def _metric_reference(self, metric_id_or_name: str) -> tuple[Optional[dict], Optional[dict]]:
+        """Resolve either a governed Metric or one named V2 parallel output.
+
+        The returned output is ``None`` for a parent Metric reference.  This
+        keeps V1 behavior intact while allowing a query to name ``50mg达成率``
+        directly in select, HAVING, or ORDER BY.
+        """
+        metric = self.oe.get_metric_info(metric_id_or_name)
+        if metric:
+            return metric, None
+        reference = str(metric_id_or_name or "").strip()
+        for candidate in self.oe.metrics:
+            definition = self._metric_definition(candidate)
+            if definition.get("version") != 2:
+                continue
+            for output in definition.get("outputs", []):
+                if not isinstance(output, dict):
+                    continue
+                if output.get("id") == reference or output.get("output_name") == reference:
+                    return candidate, output
+        return None, None
+
     def _definition_source_classes(self, metric_info: dict) -> list[str]:
         definition = self._metric_definition(metric_info)
+        input_groups = [definition.get("inputs", [])]
+        input_groups.extend(
+            output.get("inputs", []) for output in definition.get("outputs", [])
+            if isinstance(output, dict)
+        )
         return list(dict.fromkeys(
             str(item.get("class_id") or "").strip()
-            for item in definition.get("inputs", [])
+            for inputs in input_groups
+            for item in inputs
             if isinstance(item, dict) and str(item.get("class_id") or "").strip()
         ))
 
@@ -522,6 +550,32 @@ class DataQueryEngine:
             expressions.append(self._definition_input_expr(item, alias_map))
         symbols = {"ADD": " + ", "SUBTRACT": " - ", "MULTIPLY": " * ", "DIVIDE": " / "}
         return "(" + symbols[operator].join(expressions) + ")"
+
+    def _definition_output_expr(self, output: dict, alias_map: dict) -> str:
+        """Compile one independently named V2 Metric output."""
+        inputs = output.get("inputs", [])
+        operator = str(output.get("expression_operator") or "").upper()
+        if not isinstance(inputs, list) or not inputs or operator not in {"ADD", "SUBTRACT", "MULTIPLY", "DIVIDE"}:
+            raise ValueError("Metric 并列输出定义无效")
+        expressions = [self._definition_input_expr(item, alias_map) for item in inputs]
+        if operator == "DIVIDE":
+            if len(expressions) != 2:
+                raise ValueError("相除的并列输出必须恰好包含两个组成项")
+            return f"({expressions[0]} / NULLIF({expressions[1]}, 0))"
+        symbols = {"ADD": " + ", "SUBTRACT": " - ", "MULTIPLY": " * "}
+        return "(" + symbols[operator].join(expressions) + ")"
+
+    def _metric_reference_expr(
+        self,
+        metric_info: dict,
+        output: Optional[dict],
+        metric_name: str,
+        default_class: str,
+        alias_map: dict,
+    ) -> str:
+        if output is not None:
+            return self._definition_output_expr(output, alias_map)
+        return self._metric_expr(metric_info, metric_name, default_class, alias_map)
 
     def _structured_metric_expr(self, metric_info: dict, default_class: str, alias_map: dict) -> Optional[str]:
         """Compile a Metric exclusively from its governed structured definition."""
@@ -666,6 +720,15 @@ class DataQueryEngine:
 
     def _metric_exprs(self, metric_info: dict, metric_name: str, default_class: str, alias_map: dict) -> list[tuple[str, str]]:
         definition = self._metric_definition(metric_info)
+        if definition.get("version") == 2:
+            return [
+                (
+                    self._definition_output_expr(output, alias_map),
+                    str(output.get("output_name") or f"{metric_name}_{index + 1}").strip(),
+                )
+                for index, output in enumerate(definition.get("outputs", []))
+                if isinstance(output, dict)
+            ]
         if definition.get("version") == 1 and str(definition.get("expression_operator") or "").upper() == "CONCAT":
             return [
                 (
@@ -678,6 +741,21 @@ class DataQueryEngine:
         if structured_expr:
             return [(structured_expr, metric_name)]
         raise ValueError(f"Metric {metric_name} 缺少有效的结构化 definition")
+
+    def _metric_reference_exprs(
+        self,
+        metric_info: dict,
+        output: Optional[dict],
+        metric_name: str,
+        default_class: str,
+        alias_map: dict,
+    ) -> list[tuple[str, str]]:
+        if output is not None:
+            return [(
+                self._definition_output_expr(output, alias_map),
+                str(output.get("output_name") or metric_name).strip(),
+            )]
+        return self._metric_exprs(metric_info, metric_name, default_class, alias_map)
 
     def _metric_expr(self, metric_info: dict, metric_name: str, default_class: str, alias_map: dict) -> str:
         return self._metric_exprs(metric_info, metric_name, default_class, alias_map)[0][0]
@@ -772,11 +850,16 @@ class DataQueryEngine:
     def _metric_filter_conflict(self, target_class: str, metrics: list, filters: list) -> Optional[str]:
         """Detect simple equality/IN conflicts between user filters and metric fixed filters."""
         for metric_name in metrics:
-            metric_info = self.oe.get_metric_info(metric_name)
+            metric_info, selected_output = self._metric_reference(metric_name)
             if not metric_info or self._metric_class(metric_info, target_class) != target_class:
                 continue
             definition = self._metric_definition(metric_info)
-            for input_item in definition.get("inputs", []):
+            input_groups = [definition.get("inputs", [])]
+            input_groups.extend(
+                output.get("inputs", []) for output in definition.get("outputs", [])
+                if isinstance(output, dict) and (selected_output is None or output == selected_output)
+            )
+            for input_item in (item for group in input_groups for item in group):
                 if not isinstance(input_item, dict) or str(input_item.get("class_id") or "") != target_class:
                     continue
                 for metric_filter in input_item.get("filters", []):
@@ -884,7 +967,7 @@ class DataQueryEngine:
                 return {"type": "query_result", "columns": [], "rows": [], "row_count": 0, "error": str(e), "sql": ""}
 
         for m in metrics:
-            m_info = self.oe.get_metric_info(m)
+            m_info, _ = self._metric_reference(m)
             if m_info:
                 metric_classes = self._definition_source_classes(m_info) or [self._metric_class(m_info, target_class)]
                 for metric_class in metric_classes:
@@ -907,12 +990,13 @@ class DataQueryEngine:
 
         for h in having:
             h_field = h.get("field", "")
-            m_info = self.oe.get_metric_info(h_field)
+            m_info, _ = self._metric_reference(h_field)
             if m_info:
-                metric_class = self._metric_class(m_info, target_class)
-                if metric_class:
-                    discovered_classes.add(metric_class)
-                    logger.debug("DataQuery dependency discovered: query_id=%s source=having_metric metric=%s class=%s", query_id, h_field, metric_class)
+                metric_classes = self._definition_source_classes(m_info) or [self._metric_class(m_info, target_class)]
+                for metric_class in metric_classes:
+                    if metric_class:
+                        discovered_classes.add(metric_class)
+                        logger.debug("DataQuery dependency discovered: query_id=%s source=having_metric metric=%s class=%s", query_id, h_field, metric_class)
             else:
                 try:
                     resolve_field_class(h_field, "HAVING")
@@ -923,12 +1007,13 @@ class DataQueryEngine:
         if order_by:
             for ob in order_by.split(","):
                 ob_clean = ob.strip().split(" ")[0]
-                m_info = self.oe.get_metric_info(ob_clean)
+                m_info, _ = self._metric_reference(ob_clean)
                 if m_info:
-                    metric_class = self._metric_class(m_info, target_class)
-                    if metric_class:
-                        discovered_classes.add(metric_class)
-                        logger.debug("DataQuery dependency discovered: query_id=%s source=order_by_metric metric=%s class=%s", query_id, ob_clean, metric_class)
+                    metric_classes = self._definition_source_classes(m_info) or [self._metric_class(m_info, target_class)]
+                    for metric_class in metric_classes:
+                        if metric_class:
+                            discovered_classes.add(metric_class)
+                            logger.debug("DataQuery dependency discovered: query_id=%s source=order_by_metric metric=%s class=%s", query_id, ob_clean, metric_class)
                 else:
                     try:
                         resolve_field_class(ob_clean, "排序")
@@ -1048,10 +1133,12 @@ class DataQueryEngine:
 
         # 指标映射 (严格遵循 schema.json 中定义的计算口径)
         for metric in metrics:
-            m_info = self.oe.get_metric_info(metric)
+            m_info, selected_output = self._metric_reference(metric)
             if m_info:
                 try:
-                    metric_exprs = self._metric_exprs(m_info, metric, target_class, alias_map)
+                    metric_exprs = self._metric_reference_exprs(
+                        m_info, selected_output, metric, target_class, alias_map
+                    )
                 except ValueError as e:
                     logger.warning(
                         "DataQuery metric build failed: query_id=%s metric=%s error=%s",
@@ -1141,10 +1228,10 @@ class DataQueryEngine:
             op = self._validate_operator(h.get("operator", ">"))
             val = self._escape_value(h.get("value"))
             
-            m_info = self.oe.get_metric_info(h_field)
+            m_info, selected_output = self._metric_reference(h_field)
             if m_info:
                 try:
-                    having_clause = f'{self._metric_expr(m_info, h_field, target_class, alias_map)} {op} {val}'
+                    having_clause = f'{self._metric_reference_expr(m_info, selected_output, h_field, target_class, alias_map)} {op} {val}'
                 except ValueError as e:
                     logger.warning(
                         "DataQuery having build failed: query_id=%s having=%s error=%s",
@@ -1187,10 +1274,10 @@ class DataQueryEngine:
                 ob_dir = "DESC" if ob.upper().endswith(" DESC") else "ASC"
                 ob_clean = ob[:-5].strip() if ob_dir == "DESC" else (ob[:-4].strip() if ob.upper().endswith(" ASC") else ob)
 
-                m_info = self.oe.get_metric_info(ob_clean)
+                m_info, selected_output = self._metric_reference(ob_clean)
                 if m_info:
                     try:
-                        order_part = f'{self._metric_expr(m_info, ob_clean, target_class, alias_map)} {ob_dir}'
+                        order_part = f'{self._metric_reference_expr(m_info, selected_output, ob_clean, target_class, alias_map)} {ob_dir}'
                     except ValueError as e:
                         logger.warning(
                             "DataQuery order build failed: query_id=%s order_by=%s error=%s",
@@ -1262,7 +1349,7 @@ class DataQueryEngine:
             "filters": filters,
             "having": having,
             "metric_definitions": [
-                self.oe.get_metric_info(metric) for metric in metrics if self.oe.get_metric_info(metric)
+                self._metric_reference(metric)[0] for metric in metrics if self._metric_reference(metric)[0]
             ],
         }
         harness_result = self._get_sql_harness().prepare(
