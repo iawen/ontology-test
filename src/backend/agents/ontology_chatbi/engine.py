@@ -52,6 +52,7 @@ from .helper import get_tool_display_name, get_tool_purpose
 from core.models.models import ChatRequest
 from .node import (
     AnalysisOrganizerTool,
+    ClarifyAgent,
     ContextCompressorAgent,
     EntityDisambiguatorAgent,
     GlossaryMatcherAgent,
@@ -84,6 +85,7 @@ class ChatEngineV3:
         self.entity_agent = EntityDisambiguatorAgent()
         self.ontology_agent = OntologyAgent(self.client, self.model_name)
         self.plan_execute_agent = PlanExecuteAgent(self.client, self.model_name)
+        self.clarify_agent = ClarifyAgent()
         self.analysis_tool = AnalysisOrganizerTool(self.client, self.model_name)
 
     async def stream_chat(self, req: ChatRequest) -> AsyncGenerator[str, None]:
@@ -328,7 +330,11 @@ class ChatEngineV3:
                 state.metric_context,
                 session_id=state.session_id,
             )
-            accepted = self._accept_metric_subquestions(initial_plan.get("subquestions"), state)
+            accepted = self._accept_metric_subquestions(
+                initial_plan.get("subquestions"),
+                state,
+                allowed_metric_ids=state.metric_candidates,
+            )
             if not accepted:
                 logger.info(
                     "Metric plan did not yield valid subquestions; falling back to single query: session_id=%s",
@@ -380,6 +386,8 @@ class ChatEngineV3:
                     pending.get("intent"),
                 )
                 await self._execute_metric_subquestion(state, pending, executor, query_engine, engine)
+                if state.clarification:
+                    return State.CLARIFY
             return State.METRIC_PLAN_EXECUTE
 
         state.metric_plan_phase = "judging"
@@ -413,7 +421,12 @@ class ChatEngineV3:
         self._append_metric_plan_step(state, "evidence_judgment", "已审核当前数据证据覆盖情况。", judgment)
 
         if decision == "add" and can_expand:
-            additions = self._accept_metric_subquestions(judgment.get("additional_subquestions"), state, limit=2)
+            additions = self._accept_metric_subquestions(
+                judgment.get("additional_subquestions"),
+                state,
+                limit=2,
+                allowed_metric_ids=state.metric_candidates,
+            )
             if additions:
                 state.metric_plan_iteration += 1
                 for item in additions:
@@ -534,6 +547,8 @@ class ChatEngineV3:
 
         state.query_scope = validation["query_scope"]
         state.query_plan = validation["query_plan"]
+        if self._prepare_required_dimension_clarification(state, engine):
+            return State.CLARIFY
         state.planned_query_args = self._with_query_context(
             "query_ontology_data",
             {
@@ -568,6 +583,15 @@ class ChatEngineV3:
             for metric_id in schema_result.get("relevant_metrics", [])
             if isinstance(metric_id, str) and metric_id
         ]
+        planned_metric_ids = self._string_list(subquestion.get("metric_ids"))
+        preferred_metric_ids = [
+            metric_id
+            for metric_id in planned_metric_ids
+            if engine.get_metric_info(metric_id)
+        ]
+        metric_candidates = list(
+            dict.fromkeys([*preferred_metric_ids, *metric_candidates])
+        )
         logger.info(
             "Metric subquestion retrieval completed: session_id=%s subquestion_id=%s relevant_classes=%s metric_candidates=%s",
             state.session_id,
@@ -583,6 +607,7 @@ class ChatEngineV3:
                 schema_context,
                 state.glossary_matches,
                 engine,
+                preferred_metric_ids=preferred_metric_ids,
                 feedback=str(scope_validation.get("error") or ""),
                 session_id=state.session_id,
             )
@@ -633,6 +658,20 @@ class ChatEngineV3:
         if not query_validation.get("valid"):
             subquestion.update(status="failed", error=str(query_validation.get("error") or "无法确定查询参数"))
             self._append_metric_plan_step(state, "subquestion_query_plan", "子问题查询参数校验失败。", subquestion)
+            return
+        state.query_scope = query_validation["query_scope"]
+        state.query_plan = query_validation["query_plan"]
+        if self._prepare_required_dimension_clarification(state, engine):
+            subquestion.update(status="needs_clarification")
+            self._append_metric_plan_step(
+                state,
+                "subquestion_query_plan",
+                "子问题缺少指标必要维度，等待用户澄清。",
+                {
+                    "subquestion_id": subquestion.get("id"),
+                    "missing_dimensions": state.missing_required_dimensions,
+                },
+            )
             return
         logger.info(
             "Metric subquestion query plan validated: session_id=%s subquestion_id=%s metrics=%s dimensions=%s filters=%d",
@@ -745,10 +784,17 @@ class ChatEngineV3:
     def _string_list(value) -> list[str]:
         return [str(item).strip() for item in value if isinstance(item, str) and item.strip()] if isinstance(value, list) else []
 
-    def _accept_metric_subquestions(self, raw_subquestions, state: AgentState, limit: int = METRIC_PLAN_MAX_INITIAL_SUBQUESTIONS) -> list[dict]:
+    def _accept_metric_subquestions(
+        self,
+        raw_subquestions,
+        state: AgentState,
+        limit: int = METRIC_PLAN_MAX_INITIAL_SUBQUESTIONS,
+        allowed_metric_ids: list[str] | None = None,
+    ) -> list[dict]:
         if not isinstance(raw_subquestions, list):
             return []
         accepted = []
+        allowed_metrics = set(allowed_metric_ids or [])
         known_intents = {str(item.get("intent") or "").strip().lower() for item in state.metric_subquestions}
         for index, raw in enumerate(raw_subquestions):
             if len(accepted) >= limit or not isinstance(raw, dict):
@@ -759,10 +805,16 @@ class ChatEngineV3:
             if re.search(r"\b(select|insert|update|delete|from|join)\b|[;{}]", intent, re.IGNORECASE):
                 continue
             subquestion_id = str(raw.get("id") or f"sq-{len(state.metric_subquestions) + len(accepted) + 1}").strip()
+            metric_ids = [
+                metric_id
+                for metric_id in self._string_list(raw.get("metric_ids"))
+                if not allowed_metrics or metric_id in allowed_metrics
+            ]
             accepted.append(
                 {
                     "id": subquestion_id,
                     "intent": intent,
+                    "metric_ids": list(dict.fromkeys(metric_ids)),
                     "expected_evidence": str(raw.get("expected_evidence") or ""),
                     "priority": int(raw.get("priority") or index + 1),
                     "iteration": state.metric_plan_iteration,
@@ -792,6 +844,7 @@ class ChatEngineV3:
                 {
                     "subquestion_id": item.get("id"),
                     "intent": item.get("intent"),
+                    "metric_ids": item.get("metric_ids") or [],
                     "expected_evidence": item.get("expected_evidence"),
                     "status": item.get("status"),
                     "error": item.get("error") or "",
@@ -1202,7 +1255,7 @@ class ChatEngineV3:
             }
         )
         logger.info(
-            "========== VALIDATED QUERY EXECUTION END | session_id=%s status=%s duration_ms=%d ==========",
+            "session_id=%s status=%s duration_ms=%d",
             state.session_id,
             "error" if result_error else "success",
             duration_ms,
@@ -1241,8 +1294,26 @@ class ChatEngineV3:
         return State.LLM_CALL
 
     async def _handle_clarify(self, state: AgentState) -> State:
-        """主动反问"""
-        # 反问事件已在 LLM_CALL 中发送
+        """Emit an explicit, governed clarification question and stop execution."""
+        clarification = state.clarification
+        if not clarification:
+            state.error = "需要澄清的问题为空。"
+            return State.ERROR
+        state.assistant_content = str(clarification["question"])
+        state.final_reason = "needs_clarification"
+        state.sse_events.append(
+            {
+                "type": "clarification",
+                "query_id": state.query_id,
+                "data": clarification,
+            }
+        )
+        logger.info(
+            "Clarification requested: session_id=%s field=%s metrics=%s",
+            state.session_id,
+            clarification.get("field"),
+            self._json_dumps(state.missing_required_dimensions),
+        )
         return State.DONE
 
     async def _handle_final_stream(self, state: AgentState) -> State:
@@ -1320,6 +1391,20 @@ class ChatEngineV3:
     # ============================================================
     # 辅助函数
     # ============================================================
+
+    def _prepare_required_dimension_clarification(self, state: AgentState, engine) -> bool:
+        """Populate clarification data when governed Metric dimensions are missing."""
+        missing = self.clarify_agent.find_missing_required_dimensions(
+            state.query_plan, engine
+        )
+        if not missing:
+            return False
+        state.missing_required_dimensions = missing
+        state.clarification_reason = "missing_required_dimensions"
+        state.clarification = self.clarify_agent.build_required_dimension_question(
+            missing
+        )
+        return True
 
     def _emit_execution_mode_routing_event(self, state: AgentState, routing: dict) -> None:
         """Publish exactly one execution-mode decision event for every request."""

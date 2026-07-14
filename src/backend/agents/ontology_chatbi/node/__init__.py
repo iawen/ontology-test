@@ -1,4 +1,5 @@
 from .analysis_organizer import AnalysisOrganizerTool
+from .clarify_agent import ClarifyAgent
 from .context_compressor import ContextCompressorAgent
 from .entity_disambiguator import EntityDisambiguatorAgent
 from .glossary_matcher import GlossaryMatcherAgent
@@ -18,4 +19,5 @@ __all__ = [
     "SkillRouterAgent",
     "ToolExecutor",
     "AnalysisOrganizerTool",
+    "ClarifyAgent",
 ]

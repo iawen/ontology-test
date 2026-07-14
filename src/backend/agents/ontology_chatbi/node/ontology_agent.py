@@ -30,17 +30,52 @@ class OntologyAgent:
         schema_context: str,
         glossary_matches: list[dict],
         ontology_engine,
+        preferred_metric_ids: list[str] | None = None,
         feedback: str = "",
         session_id: str = "",
     ) -> dict:
-        """Identify and validate the target class plus explicit join classes."""
+        """Identify and validate the target class plus explicit join classes.
+
+        Metric anchors supplied by Plan-Execute are presented as a preferred
+        target-class signal, not an unconditional override.
+        """
+        preferred_metrics = self._preferred_metric_context(
+            preferred_metric_ids or [], ontology_engine
+        )
         payload = await self._request_planning_json(
             "schema_scope",
-            get_schema_scope_planning_prompt(user_message, schema_context, self._json_dumps(glossary_matches)),
+            get_schema_scope_planning_prompt(
+                user_message,
+                schema_context,
+                self._json_dumps(glossary_matches),
+                preferred_metrics,
+            ),
             feedback,
             session_id,
         )
         return self.validate_query_scope(payload, ontology_engine)
+
+    @staticmethod
+    def _preferred_metric_context(metric_ids: list[str], ontology_engine) -> str:
+        """Render valid candidate Metrics and their primary (anchor) Class."""
+        summaries = []
+        seen = set()
+        for metric_id in metric_ids:
+            metric = ontology_engine.get_metric_info(str(metric_id).strip())
+            if not metric:
+                continue
+            resolved_id = str(metric.get("id") or "").strip()
+            if not resolved_id or resolved_id in seen:
+                continue
+            seen.add(resolved_id)
+            target_classes = metric_target_classes(metric)
+            anchor_class = target_classes[0] if target_classes else ""
+            summaries.append(
+                f"- {metric_context_summary(metric)}; "
+                f"主实体（锚点类）={anchor_class}; "
+                f"关联来源类={target_classes[1:]}"
+            )
+        return "\n".join(summaries)
 
     async def plan_query_details(
         self,

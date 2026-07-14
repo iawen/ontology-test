@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Optional
 from collections import deque
 
+from core.db.db import get_db
+
 
 class OntologyEngine:
     def __init__(self, ontology_dir: str, data_dir: str):
@@ -27,18 +29,198 @@ class OntologyEngine:
         self._load()
 
     def _load(self):
-        schema_path = self.ontology_dir / "schema.json"
-        mapping_path = self.ontology_dir / "schema_mapping.json"
-        if schema_path.exists():
-            with open(schema_path, "r", encoding="utf-8") as f:
-                self.schema = json.load(f)
-        if mapping_path.exists():
-            with open(mapping_path, "r", encoding="utf-8") as f:
-                self.mapping = json.load(f)
-                self.classes = self.mapping.get("classes", {})
-                self.relationships = self._normalize_relationships(
-                    self.mapping.get("relationships", [])
-                )
+        """Load canonical ontology assets from the database.
+
+        The JSON files remain an import/extraction fallback for scenarios that
+        have not been persisted yet; runtime reads should not depend on them
+        being regenerated after an admin-side change.
+        """
+        self.schema = {}
+        self.mapping = {}
+        self.classes = {}
+        self.relationships = []
+        self.metrics = []
+        if self._load_from_database():
+            self._filter_rejected_assets()
+            return
+
+        # schema_path = self.ontology_dir / "schema.json"
+        # mapping_path = self.ontology_dir / "schema_mapping.json"
+        # if schema_path.exists():
+        #     with open(schema_path, "r", encoding="utf-8") as f:
+        #         self.schema = json.load(f)
+        # if mapping_path.exists():
+        #     with open(mapping_path, "r", encoding="utf-8") as f:
+        #         self.mapping = json.load(f)
+        #         self.classes = self.mapping.get("classes", {})
+        #         self.relationships = self._normalize_relationships(
+        #             self.mapping.get("relationships", [])
+        #         )
+        # self._filter_rejected_assets()
+
+    def _load_from_database(self) -> bool:
+        """Build the in-memory schema/mapping model from scenario-scoped rows."""
+        scenario_id = self.ontology_dir.parent.name
+        if not scenario_id:
+            return False
+        try:
+            conn = get_db()
+            try:
+                class_rows = conn.execute(
+                    "SELECT * FROM schema_classes WHERE scenario_id=?", (scenario_id,)
+                ).fetchall()
+                if not class_rows:
+                    return False
+                relationship_rows = conn.execute(
+                    "SELECT * FROM schema_relationships WHERE scenario_id=?", (scenario_id,)
+                ).fetchall()
+                metric_rows = conn.execute(
+                    "SELECT * FROM metrics WHERE scenario_id=?", (scenario_id,)
+                ).fetchall()
+                concept_rows = conn.execute(
+                    "SELECT * FROM concepts WHERE scenario_id=?", (scenario_id,)
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            # JSON fallback preserves standalone extraction/import workflows.
+            return False
+
+        classes = []
+        mapping_classes = {}
+        for row in class_rows:
+            item = dict(row)
+            fields = self._json_list(item.get("fields"))
+            properties = self._json_list(item.get("properties"))
+            normalized_fields = []
+            field_map = {}
+            field_types = {}
+            for field in fields:
+                if not isinstance(field, dict):
+                    continue
+                logical_name = str(field.get("name") or field.get("physical_name") or "").strip()
+                physical_name = str(field.get("physical_name") or field.get("name") or "").strip()
+                if not logical_name or not physical_name:
+                    continue
+                normalized = {
+                    **field,
+                    "name": logical_name,
+                    "physical_name": physical_name,
+                    "type": str(field.get("type") or "text"),
+                }
+                normalized_fields.append(normalized)
+                field_map[logical_name] = physical_name
+                field_types[physical_name] = normalized["type"]
+            if not properties:
+                properties = [field["name"] for field in normalized_fields]
+            review_status = self._review_status(item)
+            classes.append(
+                {
+                    "id": item.get("id", ""),
+                    "name_cn": item.get("name_cn", ""),
+                    "description": item.get("description", ""),
+                    "properties": properties,
+                    "primary_key": item.get("primary_key", ""),
+                    "csv_file": item.get("csv_file", ""),
+                    "fields": normalized_fields,
+                    "is_reviewed": item.get("is_reviewed", 0),
+                    "review_status": review_status,
+                }
+            )
+            csv_file = str(item.get("csv_file") or "")
+            mapping_classes[str(item.get("id") or "")] = {
+                "csv_file": csv_file,
+                "table_name": csv_file.removesuffix(".csv") if csv_file else item.get("id", ""),
+                "primary_key": item.get("primary_key", ""),
+                "name_cn": item.get("name_cn", ""),
+                "field_map": field_map,
+                "field_types": field_types,
+                "data_source": "csv" if csv_file.endswith(".csv") else "database",
+                "is_reviewed": item.get("is_reviewed", 0),
+                "review_status": review_status,
+            }
+
+        relationships = []
+        for row in relationship_rows:
+            item = dict(row)
+            source_key = str(item.get("source_key") or item.get("join_key") or "")
+            target_key = str(item.get("target_key") or item.get("join_key") or "")
+            relationships.append(
+                {
+                    "source": item.get("source", ""),
+                    "target": item.get("target", ""),
+                    "type": item.get("type", "relates_to"),
+                    "source_key": source_key,
+                    "target_key": target_key,
+                    "join_key": item.get("join_key") or (source_key if source_key == target_key else ""),
+                    "description": item.get("description", ""),
+                    "is_reviewed": item.get("is_reviewed", 0),
+                    "review_status": self._review_status(item),
+                }
+            )
+
+        metrics = []
+        for row in metric_rows:
+            item = dict(row)
+            metrics.append(
+                {
+                    "id": item.get("id", ""),
+                    "name": item.get("name", ""),
+                    "name_cn": item.get("name", ""),
+                    "description": item.get("description", ""),
+                    "category": item.get("category", ""),
+                    "target_class": item.get("target_class", ""),
+                    "definition": self._json_dict(item.get("definition")),
+                    "dimensions": self._json_list(item.get("dimensions")),
+                    "required_dimensions": self._json_list(item.get("required_dimensions")),
+                    "chart_type": item.get("chart_type") or "bar",
+                    "sort_order": item.get("sort_order") or 0,
+                    "is_reviewed": item.get("is_reviewed", 0),
+                    "review_status": self._review_status(item),
+                }
+            )
+
+        self.schema = {
+            "business_name": scenario_id,
+            "classes": classes,
+            "relationships": relationships,
+            "concepts": [self._database_concept(dict(row)) for row in concept_rows],
+            "metrics": metrics,
+        }
+        self.mapping = {"classes": mapping_classes, "relationships": relationships}
+        self.classes = mapping_classes
+        self.relationships = self._normalize_relationships(relationships)
+        self.metrics = metrics
+        return True
+
+    @staticmethod
+    def _json_list(value) -> list:
+        if isinstance(value, list):
+            return value
+        try:
+            parsed = json.loads(value or "[]")
+            return parsed if isinstance(parsed, list) else []
+        except (TypeError, json.JSONDecodeError):
+            return []
+
+    @staticmethod
+    def _json_dict(value) -> dict:
+        if isinstance(value, dict):
+            return value
+        try:
+            parsed = json.loads(value or "{}")
+            return parsed if isinstance(parsed, dict) else {}
+        except (TypeError, json.JSONDecodeError):
+            return {}
+
+    @staticmethod
+    def _database_concept(item: dict) -> dict:
+        return {
+            key: item.get(key, "")
+            for key in ("id", "name", "description", "parent_id", "level", "concept_type", "related_class", "sort_order")
+        }
+
+    def _filter_rejected_assets(self) -> None:
         class_statuses = {
             str(schema_class.get("id") or ""): self._review_status(schema_class)
             for schema_class in self.schema.get("classes", [])

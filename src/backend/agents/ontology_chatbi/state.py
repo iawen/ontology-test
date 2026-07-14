@@ -80,6 +80,9 @@ class AgentState:
     ontology_planning_started_at_ms: int | None = None
     planned_query_args: dict | None = None
     query_executed: bool = False
+    clarification: dict | None = None
+    clarification_reason: str = ""
+    missing_required_dimensions: list[dict] = field(default_factory=list)
 
     # Metrics Plan-Execute：复杂指标问题的受控多证据执行账本
     execution_mode: str = "single_query"
@@ -135,6 +138,8 @@ class AgentState:
             "metric_subquestions_count": len(self.metric_subquestions),
             "metric_query_attempts": self.metric_query_attempts,
             "metric_plan_terminal_reason": self.metric_plan_terminal_reason,
+            "clarification_reason": self.clarification_reason,
+            "missing_required_dimensions": self.missing_required_dimensions,
             "transition_log": self.transition_log,
             "error": self.error,
         }
