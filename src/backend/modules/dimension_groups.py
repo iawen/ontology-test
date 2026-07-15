@@ -20,6 +20,17 @@ POLICY_ALIASES = {
 }
 
 
+def _refresh_chat_ontology(scenario_id: str) -> None:
+    """Invalidate the ChatBI cache after governed DimensionGroup metadata changes."""
+    try:
+        from agents.ontology_chatbi.prompt import reset_engine
+
+        reset_engine(scenario_id)
+    except Exception:
+        # The admin API must remain available when ChatBI is not initialized.
+        pass
+
+
 def _normalize_policy(value) -> str:
     """Keep legacy persisted policies writable after the policy vocabulary was renamed."""
     policy = str(value or "ask_when_ambiguous").strip().lower()
@@ -160,6 +171,7 @@ async def create_dimension_group(scenario_id: str, req: DimensionGroupCreate):
         )
         _replace_children(conn, scenario_id, req.id.strip(), payload)
         conn.commit()
+        _refresh_chat_ontology(scenario_id)
     except HTTPException:
         conn.rollback()
         raise
@@ -190,6 +202,7 @@ async def update_dimension_group(scenario_id: str, group_id: str, req: Dimension
         if "options" in incoming or "field_mappings" in incoming or "metric_ids" in incoming:
             _replace_children(conn, scenario_id, group_id, payload)
         conn.commit()
+        _refresh_chat_ontology(scenario_id)
     except HTTPException:
         conn.rollback()
         raise
@@ -210,6 +223,7 @@ async def delete_dimension_group(scenario_id: str, group_id: str):
         conn.execute("DELETE FROM dimension_group_options WHERE scenario_id=? AND group_id=?", (scenario_id, group_id))
         conn.execute("DELETE FROM dimension_groups WHERE scenario_id=? AND id=?", (scenario_id, group_id))
         conn.commit()
+        _refresh_chat_ontology(scenario_id)
     finally:
         conn.close()
     return {"status": "ok"}

@@ -83,6 +83,9 @@ class AgentState:
     clarification: dict | None = None
     clarification_reason: str = ""
     missing_required_dimensions: list[dict] = field(default_factory=list)
+    missing_dimension_groups: list[dict] = field(default_factory=list)
+    dimension_selections: dict[str, dict] = field(default_factory=dict)
+    dimension_resolution: dict = field(default_factory=dict)
 
     # Metrics Plan-Execute：复杂指标问题的受控多证据执行账本
     execution_mode: str = "single_query"
@@ -140,6 +143,8 @@ class AgentState:
             "metric_plan_terminal_reason": self.metric_plan_terminal_reason,
             "clarification_reason": self.clarification_reason,
             "missing_required_dimensions": self.missing_required_dimensions,
+            "missing_dimension_groups": self.missing_dimension_groups,
+            "dimension_resolution": self.dimension_resolution,
             "transition_log": self.transition_log,
             "error": self.error,
         }

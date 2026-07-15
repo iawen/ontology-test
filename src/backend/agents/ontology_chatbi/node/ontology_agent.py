@@ -203,11 +203,12 @@ class OntologyAgent:
             return any(field_name in engine.get_field_map(class_id) for class_id in allowed_classes)
 
         def infer_metric_from_field(field_name: str) -> tuple[dict, dict | None] | None:
-            """Resolve a Metric from a structured definition component output name.
+            """Resolve a Metric from a structured component name or input field.
 
             `output_name` is the governed user-facing name of a component (and the
-            output column for CONCAT Metrics). Formula text is legacy metadata and
-            must not be used to infer a structured Metric.
+            output column for CONCAT Metrics). Structured input `field` names are
+            also safe to recognize when they identify exactly one Metric. Formula
+            text is legacy metadata and must never be used for inference.
             """
             normalized_name = field_name.casefold()
             matched_metrics = []
@@ -216,10 +217,18 @@ class OntologyAgent:
                 definition = metric_definition(metric)
                 if definition.get("version") == 2:
                     for output in definition.get("outputs", []):
-                        if isinstance(output, dict) and normalized_name in {
+                        if not isinstance(output, dict):
+                            continue
+                        output_names = {
                             str(output.get("id") or "").casefold(),
                             str(output.get("output_name") or "").casefold(),
-                        }:
+                        }
+                        input_fields = {
+                            str(item.get("field") or "").casefold()
+                            for item in output.get("inputs", [])
+                            if isinstance(item, dict)
+                        }
+                        if normalized_name in output_names or normalized_name in input_fields:
                             matched_metrics.append((metric, output))
                     continue
                 output_names = {
@@ -227,8 +236,13 @@ class OntologyAgent:
                     for input_item in metric_definition(metric).get("inputs", [])
                     if isinstance(input_item, dict) and str(input_item.get("output_name") or "").strip()
                 }
+                input_fields = {
+                    str(input_item.get("field") or "").strip().casefold()
+                    for input_item in metric_definition(metric).get("inputs", [])
+                    if isinstance(input_item, dict) and str(input_item.get("field") or "").strip()
+                }
                 metric_id = str(metric.get("id") or "")
-                if normalized_name in output_names and metric_id not in seen_metric_ids:
+                if normalized_name in output_names | input_fields and metric_id not in seen_metric_ids:
                     matched_metrics.append((metric, None))
                     seen_metric_ids.add(metric_id)
             return matched_metrics[0] if len(matched_metrics) == 1 else None

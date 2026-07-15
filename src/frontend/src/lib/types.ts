@@ -69,12 +69,33 @@ export interface ClarificationOption {
   label: string;
   description?: string;
   value?: string;
+  is_default?: boolean;
+}
+
+export interface ClarificationQuestion {
+  group_id: string;
+  group_name: string;
+  group_type: string;
+  metric_ids: string[];
+  required: boolean;
+  requires_value?: boolean;
+  value_label?: string;
+  options: ClarificationOption[];
+}
+
+export interface ClarificationAnswer {
+  group_id: string;
+  option_value: string;
+  selection_value?: string;
 }
 
 /** Clarification 反问数据 */
 export interface ClarificationData {
   question: string;
   options: ClarificationOption[];
+  version?: number;
+  reason?: string;
+  questions?: ClarificationQuestion[];
   field?: string;          // 缺少的字段名，如 time_range / dimension
   multi_select?: boolean;  // 是否多选
 }

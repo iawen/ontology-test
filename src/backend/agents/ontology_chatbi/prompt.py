@@ -65,6 +65,8 @@ def get_query_mode_routing_prompt(
         return f"""你是企业数据查询路由器。判断用户问题能否由一条受控聚合查询完整回答，还是必须拆为多份独立数据证据。
 不得输出 SQL、字段名、表名、class ID、metric ID、公式或查询参数。
 
+{__COMMON_KG}
+
 用户问题：{user_message}
 
 术语匹配：
@@ -101,6 +103,8 @@ def get_schema_scope_planning_prompt(
 ) -> str:
     """Build the first-stage prompt for target and join-class selection."""
     return f"""你是 Schema Scope 规划器。只根据用户问题和候选 Schema 决定查询范围，不要选择指标、字段或过滤条件。
+
+{__COMMON_KG}
 
 用户问题：{user_message}
 

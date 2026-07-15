@@ -48,7 +48,7 @@ from .constants import (
     SSE_CACHE_TTL_SECONDS,
     TIME_DIMENSION_KEYWORDS,
 )
-from .helper import get_tool_display_name, get_tool_purpose
+from .helper import get_tool_display_name, get_tool_purpose, metric_target_classes
 from core.models.models import ChatRequest
 from .node import (
     AnalysisOrganizerTool,
@@ -110,7 +110,20 @@ class ChatEngineV3:
             user_message=user_message,
             messages=cast(list[ChatCompletionMessageParam], llm_messages),
         )
-        self._persist_conversation_message(session_id, "user", user_message)
+        answers = (req.options or {}).get("clarification_answers") or []
+        if isinstance(answers, list):
+            state.dimension_selections = {
+                str(answer.get("group_id")): {
+                    "option_value": str(answer.get("option_value") or ""),
+                    "selection_value": str(answer.get("selection_value") or ""),
+                }
+                for answer in answers
+                if isinstance(answer, dict) and answer.get("group_id") and answer.get("option_value")
+            }
+        persisted_user_content = str(
+            (req.options or {}).get("clarification_display") or user_message
+        )
+        self._persist_conversation_message(session_id, "user", persisted_user_content)
 
         # 状态路由表（轻量级字典路由，替代 if-elif 链）
         handlers = {
@@ -485,6 +498,7 @@ class ChatEngineV3:
             state.schema_context,
             state.glossary_matches,
             engine,
+            preferred_metric_ids=state.metric_candidates,
             feedback=feedback,
             session_id=state.session_id,
         )
@@ -503,6 +517,9 @@ class ChatEngineV3:
             state.error = f"无法确定可执行的查询实体范围：{validation['error']}"
             return State.ERROR
 
+        validation = self._align_scope_to_metric_candidates(
+            validation, state.metric_candidates, engine
+        )
         state.query_scope = {
             "target_class": validation["target_class"],
             "join_classes": validation["join_classes"],
@@ -1318,10 +1335,12 @@ class ChatEngineV3:
             }
         )
         logger.info(
-            "Clarification requested: session_id=%s field=%s metrics=%s",
+            "Clarification requested: session_id=%s group=%s requirements=%s",
             state.session_id,
             clarification.get("field"),
-            self._json_dumps(state.missing_required_dimensions),
+            self._json_dumps(
+                state.missing_dimension_groups or state.missing_required_dimensions
+            ),
         )
         return State.DONE
 
@@ -1401,11 +1420,63 @@ class ChatEngineV3:
     # 辅助函数
     # ============================================================
 
-    def _prepare_required_dimension_clarification(self, state: AgentState, engine) -> bool:
-        """Populate clarification data when governed Metric dimensions are missing."""
-        missing = self.clarify_agent.find_missing_required_dimensions(
-            state.query_plan, engine
+    @staticmethod
+    def _align_scope_to_metric_candidates(
+        validation: dict, metric_candidates: list[str], engine
+    ) -> dict:
+        """Use a single governed Metric anchor when schema retrieval is unambiguous.
+
+        A raw-field match can otherwise select a fact table with no governed
+        Metrics. That makes the query planner reject the raw field before the
+        required DimensionGroup resolver has an opportunity to ask the user.
+        """
+        candidate_anchors = []
+        for metric_id in metric_candidates:
+            metric = engine.get_metric_info(metric_id)
+            if not metric:
+                continue
+            anchors = metric_target_classes(metric)
+            if anchors:
+                candidate_anchors.append(anchors[0])
+        anchors = list(dict.fromkeys(anchor for anchor in candidate_anchors if anchor))
+        target_class = str(validation.get("target_class") or "")
+        if len(anchors) != 1 or anchors[0] == target_class:
+            return validation
+        logger.info(
+            "Schema scope aligned to governed Metric anchor: selected=%s anchor=%s candidates=%s",
+            target_class,
+            anchors[0],
+            json.dumps(metric_candidates, ensure_ascii=False),
         )
+        return {
+            **validation,
+            "target_class": anchors[0],
+            "join_classes": [],
+            "join_paths": {},
+        }
+
+    def _prepare_required_dimension_clarification(self, state: AgentState, engine) -> bool:
+        """Resolve DimensionGroups and retain legacy field checks during migration."""
+        resolution = self.clarify_agent.resolve_dimension_groups(
+            state.query_plan,
+            state.user_message,
+            engine,
+            state.dimension_selections,
+        )
+        resolution["groups"] = list(engine.schema.get("dimension_groups", []))
+        state.dimension_resolution = resolution
+        state.query_plan = self.clarify_agent.apply_resolved_selections(
+            state.query_plan, resolution
+        )
+        if resolution["unresolved_groups"]:
+            state.missing_dimension_groups = resolution["unresolved_groups"]
+            state.clarification_reason = "missing_dimension_groups"
+            state.clarification = self.clarify_agent.build_dimension_group_question(
+                state.missing_dimension_groups
+            )
+            return True
+
+        missing = resolution["legacy_missing_dimensions"]
         if not missing:
             return False
         state.missing_required_dimensions = missing
@@ -2227,20 +2298,18 @@ class ChatEngineV3:
         conn = None
         try:
             conn = get_db()
+            payload = (
+                content,
+                json.dumps(visualization, ensure_ascii=False, default=str) if visualization else "",
+                json.dumps(answer_datasets or [], ensure_ascii=False, default=str),
+                json.dumps(steps or [], ensure_ascii=False, default=str),
+                json.dumps(action_confirm, ensure_ascii=False, default=str) if action_confirm else "",
+            )
             conn.execute(
                 """INSERT INTO messages
                          (id, conversation_id, role, content, visualization, answer_datasets, steps, action_confirm)
                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    str(uuid.uuid4()),
-                    session_id,
-                    role,
-                    content,
-                    json.dumps(visualization, ensure_ascii=False, default=str) if visualization else "",
-                    json.dumps(answer_datasets or [], ensure_ascii=False, default=str),
-                    json.dumps(steps or [], ensure_ascii=False, default=str),
-                    json.dumps(action_confirm, ensure_ascii=False, default=str) if action_confirm else "",
-                ),
+                (str(uuid.uuid4()), session_id, role, *payload),
             )
             conn.execute(
                 "UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE id=?",

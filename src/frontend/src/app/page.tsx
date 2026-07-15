@@ -19,7 +19,7 @@ import PlanProgressCard from "@/components/PlanProgressCard";
 import LoginOverlay from "@/components/LoginOverlay";
 import SidebarPanel from "@/components/SidebarPanel";
 import ToolStepsPanel from "@/components/ToolStepsPanel";
-import type { AnswerDataset, Message, Conversation, ToolStep } from "@/lib/types";
+import type { AnswerDataset, ClarificationAnswer, Message, Conversation, ToolStep } from "@/lib/types";
 
 function normalizeQueryResult(value: any): QueryResultData | undefined {
   if (!value || value.error) return undefined;
@@ -294,7 +294,11 @@ function AppContent() {
   };
 
   // SSE 响应引擎
-  const sendMessage = async (text: string) => {
+  const sendMessage = async (
+    text: string,
+    clarificationAnswers?: ClarificationAnswer[],
+    continuationMessageId?: string,
+  ) => {
     if (!text.trim() || isTyping) return;
 
     let convId = activeConvId;
@@ -313,7 +317,14 @@ function AppContent() {
       }
     }
 
-    const userMsg: Message = { id: `u-${Date.now()}`, role: "user", content: text, timestamp: Date.now() };
+    const isClarificationContinuation = Boolean(continuationMessageId && clarificationAnswers?.length);
+    const continuationText = "已确认维度条件，继续查询。";
+    const userMsg: Message = {
+      id: `u-${Date.now()}`,
+      role: "user",
+      content: isClarificationContinuation ? continuationText : text,
+      timestamp: Date.now(),
+    };
     const aiMsgId = `a-${Date.now()}`;
     // 初始状态：让 isLoading = true，激活动态骨架屏和思考动画
     const initialAiMsg: Message = { 
@@ -341,7 +352,13 @@ function AppContent() {
           agent_id: currentScenario,
           message: text,
           language: navigator.language || "zh-CN",
-          options: { source: "frontend", conversation_id: convId },
+          options: {
+            source: "frontend",
+            conversation_id: convId,
+            clarification_answers: clarificationAnswers,
+            clarification_continuation: isClarificationContinuation,
+            clarification_display: isClarificationContinuation ? continuationText : undefined,
+          },
         }),
       });
 
@@ -650,6 +667,11 @@ function AppContent() {
 
   // 消息渲染
   const renderMessage = (msg: Message) => {
+    const messageIndex = messages.findIndex((item) => item.id === msg.id);
+    const originalQuestion = messages
+      .slice(0, messageIndex)
+      .reverse()
+      .find((item) => item.role === "user")?.content;
     if (msg.role === "user") {
       return (
         <div key={msg.id} className="flex justify-end mb-4">
@@ -703,7 +725,15 @@ function AppContent() {
           )}
 
           {msg.clarification && (
-            <ClarificationCard data={msg.clarification} onSelect={(optId, val) => sendMessage(val)} />
+            <ClarificationCard
+              data={msg.clarification}
+              onSelect={(optId, val) => sendMessage(val)}
+              onSubmitAnswers={(answers) => sendMessage(
+                originalQuestion || "请按已确认的维度口径继续原查询。",
+                answers,
+                msg.id,
+              )}
+            />
           )}
 
           {msg.drilldown && (
