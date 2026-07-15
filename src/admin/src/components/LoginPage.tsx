@@ -25,11 +25,11 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-50 to-indigo-50">
+    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-deloitte-mist to-deloitte-green-light">
       <div className="w-full max-w-md mx-4">
         <div className="card p-8 shadow-xl">
           <div className="text-center mb-8">
-            <div className="w-14 h-14 rounded-2xl bg-indigo-600 flex items-center justify-center text-white text-2xl mx-auto mb-4">O</div>
+            <div className="w-14 h-14 rounded-2xl bg-deloitte-charcoal flex items-center justify-center text-deloitte-green text-2xl mx-auto mb-4">O</div>
             <h1 className="text-xl font-bold text-slate-800">本体助手管理平台</h1>
             <p className="text-sm text-slate-400 mt-1">Ontology Assistant Admin</p>
           </div>

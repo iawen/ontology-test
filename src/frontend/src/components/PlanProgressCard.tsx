@@ -10,7 +10,7 @@ export default function PlanProgressCard({ data }: Props) {
   const statusColors: Record<string, string> = {
     pending: "text-slate-400",
     running: "text-amber-600 dark:text-amber-400",
-    completed: "text-emerald-500",
+    completed: "text-deloitte-green-dark",
     failed: "text-red-500",
   };
 
@@ -35,7 +35,7 @@ export default function PlanProgressCard({ data }: Props) {
         )}
         <div className="h-1.5 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
           <div
-            className="h-full bg-indigo-500 rounded-full transition-all duration-500"
+            className="h-full bg-deloitte-green rounded-full transition-all duration-500"
             style={{ width: `${progress}%` }}
           />
         </div>

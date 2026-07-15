@@ -8,7 +8,7 @@ import type { QueryResultData, ChartConfigData } from "@/lib/types";
 
 echarts.use([BarChart, PieChart, LineChart, ScatterChart, GaugeChart, GridComponent, TooltipComponent, LegendComponent, TitleComponent, CanvasRenderer]);
 
-const PALETTE = ["#6366f1", "#22d3ee", "#f59e0b", "#34d399", "#f43f5e", "#a78bfa", "#fb923c", "#2dd4bf"];
+const PALETTE = ["#86BC25", "#5D8C00", "#0076A8", "#F2A900", "#DA291C", "#6FC2B4", "#9B9B9B", "#4C4C4C"];
 
 interface Props {
   data: QueryResultData;
@@ -148,10 +148,10 @@ export default function QueryResult({ data, chartConfig, onDrilldown }: Props) {
     <div className="my-3 space-y-3">
       {/* 单值指标：使用 KPI 卡片而不是没有业务目标值的仪表盘 */}
       {isSingleValueKpi && (
-        <div className="rounded-xl border border-indigo-100 bg-gradient-to-br from-indigo-50 via-white to-cyan-50 px-5 py-4 shadow-sm dark:border-indigo-400/25 dark:from-indigo-500/15 dark:via-slate-900 dark:to-cyan-950/20">
+        <div className="rounded-xl border border-deloitte-line border-l-4 border-l-deloitte-green bg-gradient-to-br from-deloitte-green-light via-white to-deloitte-mist px-5 py-4 shadow-sm dark:border-deloitte-green/35 dark:from-deloitte-green/15 dark:via-slate-900 dark:to-slate-950">
           <div className="text-xs font-medium text-slate-500 dark:text-slate-400">{kpiColumn}</div>
           <div className="mt-1 flex items-baseline gap-2">
-            <span className="text-3xl font-semibold tracking-tight text-indigo-700 dark:text-indigo-200">
+            <span className="text-3xl font-semibold tracking-tight text-deloitte-green-dark dark:text-deloitte-green-light">
               {Number.isFinite(kpiValue) ? kpiValue.toLocaleString("zh-CN", { maximumFractionDigits: 2 }) : "--"}
             </span>
             <span className="text-xs text-slate-400 dark:text-slate-500">汇总结果</span>

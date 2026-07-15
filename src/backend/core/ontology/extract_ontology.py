@@ -394,7 +394,7 @@ PHASE3_GLOBAL_PROMPT = """你是企业指标语义建模专家。第一、二阶
     - 宽表：`source_shape="wide"`，直接选择业务数值字段；`filters` 通常为空。
     - 窄表：`source_shape="long"`，选择公共数值字段，且必须至少一个 `filters` 固定 WHERE 条件来识别 KPI、规格、品类或序列。
     - `filters` 的操作符仅允许 `=`、`!=`、`IN`、`NOT IN`、`IS NULL`、`IS NOT NULL`；`IN` / `NOT IN` 的 value 必须是数组。
-4. 单输入指标使用 `ADD`。同口径并列展示的多个结果使用 `CONCAT`，每个输入必须具有唯一且业务可读的 `output_name`。只有业务上确需组合计算时，才使用 `ADD`、`SUBTRACT`、`MULTIPLY` 或 `DIVIDE`。
+4. 单输入指标使用 `ADD`。同口径并列展示的多个结果使用 `CONCAT`，每个输入必须具有唯一且业务可读的 `output_name`。只有业务上确需组合计算时，才使用 `ADD`、`SUBTRACT`、`MULTIPLY` 或 `DIVIDE`。可选 `offset` 是表达式完成后追加的有限数字；例如同比或环比增长率应使用 `DIVIDE`、两个输入，并设置 `offset: -1`，即 `(分子 / NULLIF(分母, 0)) - 1`。`CONCAT` 不得设置非零 `offset`。
 5. 跨 Class Metric 的每个输入 Class 必须可通过下方 `relationships` 与 anchor_class 连通；无法确认关联时，不要生成跨 Class Metric。
 6. 每个 Metric 必须输出 `dimension_group_ids`，只引用上方已提取的维度组 ID。不要创建不存在的维度组 ID；没有适用组时输出空数组。`required_dimensions` 保留为兼容字段，优先输出空数组，必选治理由维度组的 `is_required` 负责。
 7. `dimensions` 必须属于 anchor_class；`required_dimensions` 是 `dimensions` 的子集。
@@ -424,6 +424,7 @@ PHASE3_GLOBAL_PROMPT = """你是企业指标语义建模专家。第一、二阶
                 "version": 1,
                 "anchor_class": "Class ID",
                 "expression_operator": "ADD / SUBTRACT / MULTIPLY / DIVIDE / CONCAT",
+                "offset": 0,
                 "inputs": [{{
                     "id": "input_1",
                     "output_name": "组成项中文名称",

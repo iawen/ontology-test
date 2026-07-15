@@ -4,22 +4,22 @@
 
 @layer base {
   body {
-    @apply bg-slate-50 text-slate-800;
+    @apply bg-deloitte-mist text-deloitte-ink;
   }
 }
 
 @layer components {
   .card {
-    @apply rounded-xl border border-slate-200/80 bg-white;
+    @apply rounded-xl border border-deloitte-line bg-white shadow-sm;
   }
   .btn-primary {
-    @apply rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50;
+    @apply rounded-lg bg-deloitte-green px-4 py-2 text-sm font-semibold text-deloitte-ink transition-colors hover:bg-deloitte-green-dark hover:text-white disabled:cursor-not-allowed disabled:opacity-50;
   }
   .btn-outline {
-    @apply rounded-lg border border-slate-200 px-4 py-2 text-sm font-medium text-slate-600 transition-colors hover:bg-slate-50;
+    @apply rounded-lg border border-deloitte-line bg-white px-4 py-2 text-sm font-medium text-slate-700 transition-colors hover:border-deloitte-green hover:bg-deloitte-green-light hover:text-deloitte-ink;
   }
   .btn-ghost {
-    @apply rounded-lg px-3 py-1.5 text-sm text-slate-500 transition-colors hover:bg-slate-100;
+    @apply rounded-lg px-3 py-1.5 text-sm text-slate-600 transition-colors hover:bg-deloitte-green-light hover:text-deloitte-ink;
   }
 
   input[type="text"],
@@ -30,7 +30,7 @@
   input:not([type]),
   textarea,
   select {
-    @apply w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm transition-colors placeholder:text-slate-300 focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20;
+    @apply w-full rounded-lg border border-deloitte-line bg-white px-3 py-2 text-sm transition-colors placeholder:text-slate-300 focus:border-deloitte-green focus:outline-none focus:ring-2 focus:ring-deloitte-green/25;
   }
   textarea {
     @apply resize-y;
@@ -44,13 +44,13 @@
     @apply w-full;
   }
   .data-table th {
-    @apply bg-slate-50/80 px-5 py-3 text-left text-xs font-medium uppercase tracking-wider text-slate-500;
+    @apply bg-deloitte-mist px-5 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-600;
   }
   .data-table td {
-    @apply border-t border-slate-50 px-5 py-3 text-sm;
+    @apply border-t border-slate-100 px-5 py-3 text-sm;
   }
   .data-table tr:hover td {
-    @apply bg-slate-50/50;
+    @apply bg-deloitte-green-light/40;
   }
 }
 
@@ -62,9 +62,9 @@
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #cbd5e1;
+  background: #b8b8b4;
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #94a3b8;
+  background: #86BC25;
 }

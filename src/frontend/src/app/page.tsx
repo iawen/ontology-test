@@ -690,10 +690,10 @@ function AppContent() {
 
           {msg.isLoading && !msg.content && (!msg.steps || msg.steps.length === 0) && (
             <div 
-              className="flex w-full max-w-md items-center gap-3 rounded-xl border border-indigo-200 bg-gradient-to-br from-indigo-50 via-white to-slate-50 px-4 py-3 shadow-sm dark:border-indigo-400/35 dark:from-indigo-500/25 dark:via-slate-900 dark:to-slate-950 dark:shadow-indigo-950/30"
+              className="flex w-full max-w-md items-center gap-3 rounded-xl border border-deloitte-line border-l-4 border-l-deloitte-green bg-gradient-to-br from-deloitte-green-light via-white to-deloitte-mist px-4 py-3 shadow-sm dark:border-deloitte-green/35 dark:from-deloitte-green/20 dark:via-slate-900 dark:to-slate-950"
             >
-              <div className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-indigo-700 dark:bg-indigo-400/25 dark:text-indigo-100">
-                <span className="absolute inset-0 animate-ping rounded-full bg-indigo-400/30 dark:bg-indigo-300/25" />
+              <div className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-deloitte-green-light text-deloitte-green-dark dark:bg-deloitte-green/25 dark:text-deloitte-green-light">
+                <span className="absolute inset-0 animate-ping rounded-full bg-deloitte-green/30" />
                 <svg className="relative h-4 w-4 animate-pulse" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                   <path d="M12 3v3m0 12v3M4.22 4.22l2.12 2.12m11.32 11.32 2.12 2.12M3 12h3m12 0h3M4.22 19.78l2.12-2.12M17.66 6.34l2.12-2.12" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
                   <circle cx="12" cy="12" r="3.2" stroke="currentColor" strokeWidth="1.8" />
@@ -701,12 +701,12 @@ function AppContent() {
               </div>
               <div className="min-w-0">
                 <div className="text-sm font-semibold text-slate-800 dark:text-white">正在理解你的问题</div>
-                <div className="mt-0.5 text-xs font-medium text-slate-600 dark:text-indigo-100">正在匹配业务术语并准备分析上下文</div>
+                <div className="mt-0.5 text-xs font-medium text-slate-600 dark:text-deloitte-green-light">正在匹配业务术语并准备分析上下文</div>
               </div>
               <div className="ml-auto flex shrink-0 gap-1.5 pt-4" aria-label="处理中">
-                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-indigo-500 dark:bg-indigo-200 [animation-delay:-0.3s]" />
-                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-indigo-500 dark:bg-indigo-200 [animation-delay:-0.15s]" />
-                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-indigo-500 dark:bg-indigo-200" />
+                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-deloitte-green [animation-delay:-0.3s]" />
+                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-deloitte-green [animation-delay:-0.15s]" />
+                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-deloitte-green" />
               </div>
             </div>
           )}
@@ -723,7 +723,7 @@ function AppContent() {
           )}
 
           {msg.content && (
-            <div className="md-content rounded-lg border border-indigo-100 bg-white px-4 py-3 text-sm text-slate-800 shadow-sm dark:border-slate-700/60 dark:bg-slate-950/30 dark:text-slate-100">
+            <div className="md-content rounded-lg border border-deloitte-line bg-white px-4 py-3 text-sm text-slate-800 shadow-sm dark:border-slate-700/60 dark:bg-slate-950/30 dark:text-slate-100">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
             </div>
           )}
@@ -786,7 +786,7 @@ function AppContent() {
 
   // 主布局
   return (
-    <div className="flex h-screen bg-slate-100 dark:bg-slate-950 overflow-hidden text-slate-900 dark:text-slate-100 font-sans antialiased">
+    <div className="flex h-screen bg-deloitte-mist dark:bg-deloitte-ink overflow-hidden text-slate-900 dark:text-slate-100 font-sans antialiased">
       <SidebarPanel
         username={username}
         scenarios={scenarios}
@@ -806,7 +806,7 @@ function AppContent() {
       />
 
       {/* 主视图视窗 */}
-      <main className="flex-1 flex flex-col h-full bg-slate-50 dark:bg-slate-900 relative">
+      <main className="flex-1 flex flex-col h-full bg-deloitte-mist dark:bg-deloitte-charcoal relative">
         
         {/* 对话滚动区域 */}
         <div className="flex-1 overflow-y-auto px-4 md:px-8 py-6">
@@ -828,9 +828,9 @@ function AppContent() {
                     <button
                       key={s.id}
                       onClick={() => sendMessage(s.question)}
-                      className="p-3 text-left bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 border border-slate-200/80 dark:border-slate-800 rounded-lg text-xs transition-all duration-200 hover:border-indigo-300 dark:hover:border-indigo-800 cursor-pointer group shadow-sm"
+                      className="p-3 text-left bg-white dark:bg-slate-900 hover:bg-deloitte-green-light/40 dark:hover:bg-deloitte-green/10 border border-slate-200/80 dark:border-slate-800 rounded-lg text-xs transition-all duration-200 hover:border-deloitte-green cursor-pointer group shadow-sm"
                     >
-                      <span className="font-medium text-slate-700 dark:text-slate-300 group-hover:text-indigo-600 dark:group-hover:text-indigo-400">
+                      <span className="font-medium text-slate-700 dark:text-slate-300 group-hover:text-deloitte-green-dark dark:group-hover:text-deloitte-green">
                         {s.question}
                       </span>
                     </button>
@@ -854,12 +854,12 @@ function AppContent() {
               placeholder={isTyping ? "正在处理当前问题..." : "输入指标、维度或业务问题..."}
               disabled={isTyping}
               onKeyDown={(e) => e.key === "Enter" && sendMessage(input)}
-              className="flex-1 px-4 py-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 disabled:opacity-60 transition-all shadow-inner"
+              className="flex-1 px-4 py-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-sm focus:outline-none focus:ring-2 focus:ring-deloitte-green/25 focus:border-deloitte-green disabled:opacity-60 transition-all shadow-inner"
             />
             <button
               onClick={() => sendMessage(input)}
               disabled={isTyping || !input.trim()}
-              className="px-5 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-medium text-sm rounded-lg transition-all disabled:opacity-40 cursor-pointer shadow-sm active:scale-95 shrink-0"
+              className="px-5 py-3 bg-deloitte-green hover:bg-deloitte-green-dark text-deloitte-ink hover:text-white font-semibold text-sm rounded-lg transition-all disabled:opacity-40 cursor-pointer shadow-sm active:scale-95 shrink-0"
             >
               发送
             </button>

@@ -318,6 +318,7 @@ export default function DimensionGroupManager() {
       <Modal
         isOpen={!!editing}
         onClose={() => setEditing(null)}
+        width="max-w-[calc(100vw-2rem)] md:max-w-[60vw]"
         title={
           groups.some((group) => group.id === editing?.id)
             ? "编辑分析维度组"

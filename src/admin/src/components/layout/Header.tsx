@@ -11,6 +11,7 @@ const PAGE_TITLES: Record<PageKey, string> = {
   schema: "Schema 管理",
   "schema-optimization": "Schema 优化",
   concepts: "概念管理",
+  "dimension-groups": "分析维度组",
   metrics: "指标管理",
   "chart-rules": "图表规则",
   glossary: "专用名称",
@@ -31,6 +32,7 @@ const PAGE_GROUPS: Record<PageKey, string> = {
   schema: "知识建模",
   "schema-optimization": "知识建模",
   concepts: "知识建模",
+  "dimension-groups": "知识建模",
   metrics: "知识建模",
   "chart-rules": "知识建模",
   glossary: "知识增强",
@@ -51,11 +53,11 @@ export default function Header({ activePage }: Props) {
   const { sidebarCollapsed, setSidebarCollapsed, logout } = useApp();
 
   return (
-    <header className="h-14 bg-white border-b border-slate-200 flex items-center justify-between px-6 flex-shrink-0">
+    <header className="h-14 border-b border-deloitte-line bg-white flex items-center justify-between px-6 flex-shrink-0">
       <div className="flex items-center gap-3">
         <button
           onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-          className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-colors"
+          className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-deloitte-green-light text-slate-500 hover:text-deloitte-ink transition-colors"
         >
           <svg
             width="18"
@@ -84,8 +86,8 @@ export default function Header({ activePage }: Props) {
           </span>
         </nav>
       </div>
-      <div className="flex items-center gap-2 pl-3 border-l border-slate-200">
-        <div className="w-7 h-7 rounded-full bg-indigo-100 flex items-center justify-center text-indigo-600 text-xs font-bold">
+      <div className="flex items-center gap-2 pl-3 border-l border-deloitte-line">
+        <div className="w-7 h-7 rounded-full bg-deloitte-green-light flex items-center justify-center text-deloitte-green-dark text-xs font-bold">
           A
         </div>
         <button

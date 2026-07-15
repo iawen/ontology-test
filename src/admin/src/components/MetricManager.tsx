@@ -42,7 +42,8 @@ type SortKey =
   | "category"
   | "target_class"
   | "chart_type"
-  | "is_reviewed";
+  | "is_reviewed"
+  | "updated_at";
 type SortDirection = "asc" | "desc";
 
 const SORTABLE_COLUMNS: Array<{ key: SortKey; label: string }> = [
@@ -51,6 +52,7 @@ const SORTABLE_COLUMNS: Array<{ key: SortKey; label: string }> = [
   { key: "target_class", label: "目标类" },
   { key: "chart_type", label: "图表" },
   { key: "is_reviewed", label: "审核" },
+  { key: "updated_at", label: "最后更新时间" },
 ];
 
 const REVIEW_STATUS_OPTIONS: Array<{ value: ReviewStatus; label: string }> = [
@@ -91,6 +93,7 @@ function emptyMetricDefinition(): MetricDefinition {
     version: 1,
     anchor_class: "",
     expression_operator: "ADD",
+    offset: 0,
     inputs: [emptyMetricInput(0)],
   };
 }
@@ -100,6 +103,7 @@ function emptyMetricOutput(index: number): MetricOutput {
     id: `output_${Date.now()}_${index}`,
     output_name: "",
     expression_operator: "DIVIDE",
+    offset: 0,
     inputs: [emptyMetricInput(0), emptyMetricInput(1)],
   };
 }
@@ -750,7 +754,6 @@ export default function MetricManager() {
                   {SORTABLE_COLUMNS.map((column) =>
                     renderSortableHeader(column.key, column.label),
                   )}
-                  <th>最后更新时间</th>
                   <th className="text-right">操作</th>
                 </tr>
               </thead>
@@ -784,7 +787,7 @@ export default function MetricManager() {
                           metricTargetClasses(m).map((targetClass) => (
                             <span
                               key={targetClass}
-                              className="rounded-full bg-sky-50 px-2 py-0.5 text-sky-700"
+                              className="rounded-full bg-deloitte-green-light px-2 py-0.5 text-deloitte-green-dark"
                               title={targetClassLabel(targetClass)}
                             >
                               {targetClass}
@@ -796,7 +799,7 @@ export default function MetricManager() {
                       </div>
                     </td>
                     <td>
-                      <span className="inline-block max-w-full break-words rounded bg-indigo-50 px-1.5 py-0.5 text-xs leading-relaxed text-indigo-600">
+                      <span className="inline-block max-w-full break-words rounded bg-deloitte-green-light px-1.5 py-0.5 text-xs leading-relaxed text-deloitte-green-dark">
                         {CHART_LABELS[m.chart_type] || m.chart_type}
                       </span>
                     </td>
@@ -915,14 +918,14 @@ export default function MetricManager() {
               rows={2}
             />
           </div>
-          <div className="rounded border border-sky-200 bg-sky-50/40 p-4">
+          <div className="rounded border border-deloitte-line border-l-4 border-l-deloitte-green bg-white p-4">
             <h3 className="text-sm font-semibold text-slate-700">
               指标来源与计算
             </h3>
             <p className="mt-1 text-xs text-slate-500">
               每个组成项可选择不同来源类和字段；同一表多字段、跨表指标均使用同一个表达式模型。
             </p>
-            <div className="mt-3 rounded border border-sky-200 bg-white/80 p-3">
+            <div className="mt-3 rounded border border-deloitte-line bg-deloitte-mist/70 p-3">
               <div className="grid items-center gap-2 md:grid-cols-[10rem_minmax(15rem,22rem)_1fr]">
                 <label className="text-sm font-medium text-slate-700">
                   计算模式
@@ -952,7 +955,7 @@ export default function MetricManager() {
               </div>
             </div>
             {parallelMetricDefinition && (
-              <div className="mt-4 space-y-3 rounded border border-violet-200 bg-violet-50/50 p-3">
+              <div className="mt-4 space-y-3 rounded border border-deloitte-line bg-deloitte-green-light/40 p-3">
                 <div className="grid gap-3 md:grid-cols-[minmax(12rem,1fr)_auto]">
                   <select
                     value={parallelMetricDefinition.anchor_class}
@@ -971,14 +974,14 @@ export default function MetricManager() {
                       ...parallelMetricDefinition,
                       outputs: [...parallelMetricDefinition.outputs, emptyMetricOutput(parallelMetricDefinition.outputs.length)],
                     })}
-                    className="btn-ghost text-xs text-violet-700"
+                    className="btn-ghost text-xs text-deloitte-green-dark"
                   >
                     <Plus className="mr-1 inline h-3 w-3" />添加并列输出
                   </button>
                 </div>
                 {parallelMetricDefinition.outputs.map((output, outputIndex) => (
-                  <div key={output.id} className="rounded border border-violet-200 bg-white p-3">
-                    <div className="mb-2 grid gap-2 md:grid-cols-[minmax(12rem,1fr)_10rem_auto]">
+                  <div key={output.id} className="rounded border border-deloitte-line bg-white p-3">
+                    <div className="mb-2 grid gap-2 md:grid-cols-[minmax(12rem,1fr)_10rem_8rem_auto]">
                       <input
                         value={output.output_name}
                         onChange={(event) => updateParallelOutput(outputIndex, { output_name: event.target.value })}
@@ -990,6 +993,15 @@ export default function MetricManager() {
                       >
                         <option value="DIVIDE">相除</option><option value="ADD">相加</option><option value="SUBTRACT">相减</option><option value="MULTIPLY">相乘</option>
                       </select>
+                      <input
+                        type="number"
+                        step="any"
+                        value={output.offset ?? 0}
+                        onChange={(event) => updateParallelOutput(outputIndex, { offset: Number(event.target.value) })}
+                        aria-label="计算结果调整值"
+                        title="在计算结果上增加或减少固定值；环比增长率可填写 -1"
+                        placeholder="结果调整"
+                      />
                       <button
                         type="button"
                         disabled={parallelMetricDefinition.outputs.length === 1}
@@ -1015,7 +1027,7 @@ export default function MetricManager() {
                         <button type="button" disabled={output.inputs.length === 1} onClick={() => updateParallelOutput(outputIndex, { inputs: output.inputs.filter((_, index) => index !== inputIndex) })} className="btn-ghost p-1 text-slate-500 disabled:opacity-30" aria-label="删除组成项"><X className="h-4 w-4" /></button>
                       </div>;
                     })}
-                    <button type="button" onClick={() => updateParallelOutput(outputIndex, { inputs: [...output.inputs, emptyMetricInput(output.inputs.length)] })} className="btn-ghost text-xs text-violet-700"><Plus className="mr-1 inline h-3 w-3" />添加组成项</button>
+                    <button type="button" onClick={() => updateParallelOutput(outputIndex, { inputs: [...output.inputs, emptyMetricInput(output.inputs.length)] })} className="btn-ghost text-xs text-deloitte-green-dark"><Plus className="mr-1 inline h-3 w-3" />添加组成项</button>
                   </div>
                 ))}
               </div>
@@ -1066,7 +1078,28 @@ export default function MetricManager() {
                   <option value="CONCAT">拼接（并列展示）</option>
                 </select>
               </div>
-              <div />
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-slate-500">
+                  计算结果调整
+                </label>
+                <input
+                  type="number"
+                  step="any"
+                  value={metricDefinition.offset ?? 0}
+                  disabled={metricDefinition.expression_operator === "CONCAT"}
+                  onChange={(event) =>
+                    updateMetricDefinition({
+                      ...metricDefinition,
+                      offset: Number(event.target.value),
+                    })
+                  }
+                  className="w-full"
+                  placeholder="例如：-1"
+                />
+                <p className="mt-1 text-xs text-slate-400">
+                  例如环比增长率填写 -1。
+                </p>
+              </div>
             </div>
             <div className="mt-4">
               <div className="mb-2 flex items-center justify-between">
@@ -1084,7 +1117,7 @@ export default function MetricManager() {
                       ],
                     })
                   }
-                  className="btn-ghost text-xs text-sky-700"
+                  className="btn-ghost text-xs text-deloitte-green-dark"
                 >
                   <Plus className="mr-1 inline h-3 w-3" />
                   添加组成项

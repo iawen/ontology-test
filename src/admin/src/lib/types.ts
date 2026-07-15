@@ -89,6 +89,8 @@ export interface MetricDefinition {
   version: 1;
   anchor_class: string;
   expression_operator: MetricExpressionOperator;
+  /** Numeric adjustment applied after the expression, e.g. -1 for a rate of change. */
+  offset?: number;
   inputs: MetricInput[];
 }
 
@@ -96,6 +98,8 @@ export interface MetricOutput {
   id: string;
   output_name: string;
   expression_operator: Exclude<MetricExpressionOperator, "CONCAT">;
+  /** Numeric adjustment applied after this independently calculated output. */
+  offset?: number;
   inputs: MetricInput[];
 }
 

@@ -11,6 +11,7 @@ Data Query Engine v5 — Ontology To SQL 全面优化增强版
 
 import csv
 import json
+import math
 import re
 import sqlite3
 import time
@@ -548,8 +549,30 @@ class DataQueryEngine:
         expressions = []
         for item in inputs:
             expressions.append(self._definition_input_expr(item, alias_map))
-        symbols = {"ADD": " + ", "SUBTRACT": " - ", "MULTIPLY": " * ", "DIVIDE": " / "}
-        return "(" + symbols[operator].join(expressions) + ")"
+        if operator == "DIVIDE":
+            expression = "(" + " / ".join(
+                [expressions[0], *[f"NULLIF({item}, 0)" for item in expressions[1:]]]
+            ) + ")"
+        else:
+            symbols = {"ADD": " + ", "SUBTRACT": " - ", "MULTIPLY": " * "}
+            expression = "(" + symbols[operator].join(expressions) + ")"
+        return self._apply_metric_offset(expression, definition.get("offset"))
+
+    @staticmethod
+    def _apply_metric_offset(expression: str, raw_offset: object) -> str:
+        """Append a validated numeric adjustment to a structured Metric expression."""
+        if raw_offset in (None, ""):
+            return expression
+        try:
+            offset = float(raw_offset)
+        except (TypeError, ValueError):
+            raise ValueError("Metric 计算结果调整值无效") from None
+        if not math.isfinite(offset):
+            raise ValueError("Metric 计算结果调整值无效")
+        if offset == 0:
+            return expression
+        operator = "+" if offset > 0 else "-"
+        return f"({expression} {operator} {abs(offset):g})"
 
     def _definition_output_expr(self, output: dict, alias_map: dict) -> str:
         """Compile one independently named V2 Metric output."""
@@ -561,9 +584,11 @@ class DataQueryEngine:
         if operator == "DIVIDE":
             if len(expressions) != 2:
                 raise ValueError("相除的并列输出必须恰好包含两个组成项")
-            return f"({expressions[0]} / NULLIF({expressions[1]}, 0))"
-        symbols = {"ADD": " + ", "SUBTRACT": " - ", "MULTIPLY": " * "}
-        return "(" + symbols[operator].join(expressions) + ")"
+            expression = f"({expressions[0]} / NULLIF({expressions[1]}, 0))"
+        else:
+            symbols = {"ADD": " + ", "SUBTRACT": " - ", "MULTIPLY": " * "}
+            expression = "(" + symbols[operator].join(expressions) + ")"
+        return self._apply_metric_offset(expression, output.get("offset"))
 
     def _metric_reference_expr(
         self,

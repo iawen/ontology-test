@@ -1,4 +1,5 @@
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Callable
@@ -221,6 +222,13 @@ class OntologyAssetValidator:
                 if operator not in {"ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "CONCAT"}:
                     self._log_asset_drop("metric", metric_id, "definition.expression_operator 不支持")
                     continue
+                try:
+                    offset = float(definition.get("offset") or 0)
+                except (TypeError, ValueError):
+                    offset = float("nan")
+                if not math.isfinite(offset) or (operator == "CONCAT" and offset):
+                    self._log_asset_drop("metric", metric_id, "definition 计算结果调整值无效")
+                    continue
             else:
                 outputs = definition.get("outputs", [])
                 names = [str(output.get("output_name", "")).strip() for output in outputs if isinstance(output, dict)] if isinstance(outputs, list) else []
@@ -239,6 +247,17 @@ class OntologyAssetValidator:
                     for output in outputs
                 ):
                     self._log_asset_drop("metric", metric_id, "并列输出表达式无效")
+                    continue
+                try:
+                    valid_offsets = all(
+                        not isinstance(output.get("offset"), bool)
+                        and math.isfinite(float(output.get("offset") or 0))
+                        for output in outputs
+                    )
+                except (TypeError, ValueError):
+                    valid_offsets = False
+                if not valid_offsets:
+                    self._log_asset_drop("metric", metric_id, "并列输出计算结果调整值无效")
                     continue
             input_error = ""
             for inputs in input_groups:

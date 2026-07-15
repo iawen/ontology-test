@@ -84,7 +84,8 @@ def metric_context_summary(metric: dict) -> str:
                     )
             outputs.append(
                 f"{{id={output.get('id', '')}; 名称={output.get('output_name', '')}; "
-                f"计算方式={output.get('expression_operator', '')}; 组成项={', '.join(details)}}}"
+                f"计算方式={output.get('expression_operator', '')}; 结果调整={output.get('offset', 0)}; "
+                f"组成项={', '.join(details)}}}"
             )
         return (
             f"id={metric.get('id', '')}; 名称={metric.get('name') or metric.get('name_cn', '')}; "
@@ -107,6 +108,7 @@ def metric_context_summary(metric: dict) -> str:
         f"锚点类={definition.get('anchor_class') or metric.get('target_class', '')}; "
         f"组成项名称={components}; 组成项={'; '.join(input_details) or '无'}; "
         f"计算方式={definition.get('expression_operator') or '未定义'}; "
+        f"结果调整={definition.get('offset', 0)}; "
         f"可选维度={metric.get('dimensions') or []}; 必要维度={metric.get('required_dimensions') or []}; "
         f"说明={metric.get('description', '')}"
     )

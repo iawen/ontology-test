@@ -150,8 +150,8 @@ export default function ToolStepsPanel({ steps }: ToolStepsPanelProps) {
     };
 
     return (
-      <div key={key} className={`relative text-sm group transition-all ${depth ? "mt-2 border-l border-indigo-200 pl-4 dark:border-indigo-800" : "pl-7"}`}>
-        <div className={depth ? "absolute -left-1.5 top-1.5 z-10 h-2.5 w-2.5 rounded-full bg-indigo-400 ring-4 ring-white dark:ring-slate-900" : "absolute left-3 top-1 -translate-x-1/2 flex items-center justify-center z-10"}>
+      <div key={key} className={`relative text-sm group transition-all ${depth ? "mt-2 border-l border-deloitte-line pl-4 dark:border-deloitte-green/50" : "pl-7"}`}>
+        <div className={depth ? "absolute -left-1.5 top-1.5 z-10 h-2.5 w-2.5 rounded-full bg-deloitte-green ring-4 ring-white dark:ring-slate-900" : "absolute left-3 top-1 -translate-x-1/2 flex items-center justify-center z-10"}>
           {!depth && isRunning && <div className="w-3 h-3 rounded-full bg-amber-500 ring-4 ring-amber-100 dark:ring-amber-950 animate-pulse" />}
           {!depth && isCompleted && <div className="w-3 h-3 rounded-full bg-emerald-500 ring-4 ring-emerald-100 dark:ring-emerald-950" />}
           {!depth && isFailed && <div className="w-3 h-3 rounded-full bg-red-500 ring-4 ring-red-100 dark:ring-red-950" />}
@@ -166,8 +166,8 @@ export default function ToolStepsPanel({ steps }: ToolStepsPanelProps) {
             {!depth && <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-normal text-slate-400 dark:text-slate-500"><span>开始 {formatClock(step.startedAt)}</span><span>总耗时 {formatDuration(step.durationMs)}</span></div>}
           </div>
           <div className="flex shrink-0 items-center gap-2">
-            {hasChildren && <button onClick={toggleChildren} className="whitespace-nowrap text-xs text-slate-500 hover:text-indigo-600 dark:text-slate-400 dark:hover:text-indigo-300 font-medium cursor-pointer">{isCollapsed ? `展开子任务 (${children.length})` : "收起子任务"}</button>}
-            {canExpand && <button onClick={() => setExpandedIndex(isExpanded ? null : key)} className="whitespace-nowrap text-xs text-indigo-500 hover:text-indigo-600 dark:text-indigo-400 dark:hover:text-indigo-300 font-medium cursor-pointer">{isExpanded ? "隐藏" : "详情"}</button>}
+            {hasChildren && <button onClick={toggleChildren} className="whitespace-nowrap text-xs text-slate-500 hover:text-deloitte-green-dark dark:text-slate-400 dark:hover:text-deloitte-green font-medium cursor-pointer">{isCollapsed ? `展开子任务 (${children.length})` : "收起子任务"}</button>}
+            {canExpand && <button onClick={() => setExpandedIndex(isExpanded ? null : key)} className="whitespace-nowrap text-xs text-deloitte-green-dark hover:text-deloitte-green-dark dark:text-deloitte-green dark:hover:text-deloitte-green-light font-medium cursor-pointer">{isExpanded ? "隐藏" : "详情"}</button>}
           </div>
         </div>
 

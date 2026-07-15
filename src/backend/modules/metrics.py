@@ -5,6 +5,7 @@ CRUD + lookup_metric（供 Chat 工具链调用）
 """
 
 import json
+import math
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -18,6 +19,21 @@ router = APIRouter()
 REVIEW_STATUSES = {"pending", "approved", "rejected"}
 SOURCE_SHAPES = {"wide", "long"}
 METRIC_FILTER_OPERATORS = {"=", "!=", "IN", "NOT IN", "IS NULL", "IS NOT NULL"}
+
+
+def _normalize_metric_offset(value, label: str) -> float:
+    """Validate a post-expression numeric adjustment without allowing SQL text."""
+    if value in (None, ""):
+        return 0.0
+    if isinstance(value, bool):
+        raise HTTPException(400, f"{label}必须是有限数字")
+    try:
+        offset = float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"{label}必须是有限数字") from None
+    if not math.isfinite(offset):
+        raise HTTPException(400, f"{label}必须是有限数字")
+    return offset
 
 def _metric_definition(value) -> dict:
     return value if isinstance(value, dict) else {}
@@ -56,8 +72,15 @@ def _validate_metric_definition(scenario_id: str, definition: dict) -> tuple[str
     anchor_class = str(definition.get("anchor_class") or "").strip()
     if not anchor_class:
         raise HTTPException(400, "指标定义必须包含锚点类和至少一个组成项")
-    if version == 1 and str(definition.get("expression_operator") or "") not in {"ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "CONCAT"}:
-        raise HTTPException(400, "指标表达式操作符不支持")
+    if version == 1:
+        operator = str(definition.get("expression_operator") or "").upper()
+        if operator not in {"ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "CONCAT"}:
+            raise HTTPException(400, "指标表达式操作符不支持")
+        offset = _normalize_metric_offset(definition.get("offset"), "指标计算结果调整值")
+        if operator == "CONCAT" and offset:
+            raise HTTPException(400, "拼接展示不支持计算结果调整值")
+        definition["expression_operator"] = operator
+        definition["offset"] = offset
     outputs = definition.get("outputs") if version == 2 else None
     if version == 2:
         if not isinstance(outputs, list) or not outputs:
@@ -75,6 +98,11 @@ def _validate_metric_definition(scenario_id: str, definition: dict) -> tuple[str
             if isinstance(output, dict)
         ):
             raise HTTPException(400, "并列输出仅支持基础运算；相除必须恰好包含分子和分母两个组成项")
+        for output in outputs:
+            output["offset"] = _normalize_metric_offset(
+                output.get("offset"),
+                "并列输出计算结果调整值",
+            )
     conn = get_db()
     rows = conn.execute("SELECT id, fields, properties FROM schema_classes WHERE scenario_id=?", (scenario_id,)).fetchall()
     conn.close()

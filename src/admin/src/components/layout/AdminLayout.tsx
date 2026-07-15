@@ -55,7 +55,7 @@ export default function AdminLayout() {
   const PageComponent = PAGE_COMPONENTS[activePage] || Dashboard;
 
   return (
-    <div className="h-screen flex overflow-hidden bg-slate-50">
+    <div className="h-screen flex overflow-hidden bg-deloitte-mist">
       <Sidebar activePage={activePage} onNavigate={setActivePage} />
       <div className="flex-1 flex flex-col min-w-0">
         <Header activePage={activePage} />

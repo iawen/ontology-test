@@ -10,7 +10,7 @@ interface Props {
   width?: string;
 }
 
-export default function Modal({ title, isOpen, onClose, children, footer, width = "max-w-2xl" }: Props) {
+export default function Modal({ title, isOpen, onClose, children, footer, width = "max-w-[calc(100vw-2rem)] md:max-w-[50vw]" }: Props) {
   if (!isOpen) return null;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
