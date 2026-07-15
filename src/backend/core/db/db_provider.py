@@ -514,13 +514,6 @@ def _schema_sql(dialect):
             action_confirm TEXT DEFAULT '',
             created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP
         );
-        CREATE TABLE IF NOT EXISTS suggested_questions (
-            id {serial_pk},
-            scenario_id TEXT NOT NULL,
-            question TEXT NOT NULL,
-            icon TEXT DEFAULT '💬',
-            sort_order INTEGER DEFAULT 0
-        );
         CREATE TABLE IF NOT EXISTS metrics (
             id TEXT NOT NULL,
             scenario_id TEXT NOT NULL,

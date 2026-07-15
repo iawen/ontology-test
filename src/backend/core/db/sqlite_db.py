@@ -108,13 +108,6 @@ def init_db():
             action_confirm TEXT DEFAULT '',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
-        CREATE TABLE IF NOT EXISTS suggested_questions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            scenario_id TEXT NOT NULL,
-            question TEXT NOT NULL,
-            icon TEXT DEFAULT '💬',
-            sort_order INTEGER DEFAULT 0
-        );
         CREATE TABLE IF NOT EXISTS metrics (
             id TEXT NOT NULL,
             scenario_id TEXT NOT NULL,

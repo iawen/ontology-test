@@ -1,6 +1,4 @@
-"""
-会话管理 + 推荐问题 API
-"""
+"""会话管理 API。"""
 import json
 import uuid
 from datetime import datetime, timezone
@@ -120,14 +118,3 @@ async def get_messages(conv_id: str, request: Request):
     return result
 
 
-@router.get("/api/suggestions/{scenario_id}")
-async def list_suggestions(request: Request, scenario_id: str):
-    """获取当前场景推荐问题"""
-    verify_token(request, Cfg.jwt_secret)
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM suggested_questions WHERE scenario_id=? ORDER BY sort_order ASC",
-        (scenario_id,),
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]

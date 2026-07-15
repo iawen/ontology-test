@@ -188,9 +188,3 @@ export interface Conversation {
   title: string;
   scenario_id: string;
 }
-
-export interface Suggestion {
-  id: number;
-  icon: string;
-  question: string;
-}

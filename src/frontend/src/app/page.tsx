@@ -19,7 +19,7 @@ import PlanProgressCard from "@/components/PlanProgressCard";
 import LoginOverlay from "@/components/LoginOverlay";
 import SidebarPanel from "@/components/SidebarPanel";
 import ToolStepsPanel from "@/components/ToolStepsPanel";
-import type { AnswerDataset, Message, Conversation, Suggestion, ToolStep } from "@/lib/types";
+import type { AnswerDataset, Message, Conversation, ToolStep } from "@/lib/types";
 
 function normalizeQueryResult(value: any): QueryResultData | undefined {
   if (!value || value.error) return undefined;
@@ -127,7 +127,6 @@ function AppContent() {
   const [activeConvId, setActiveConvId] = useState("");
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
   const [currentScenario, setCurrentScenario] = useState("");
-  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const manuallyRenamedConversationIds = useRef(new Set<string>());
@@ -168,7 +167,6 @@ function AppContent() {
 
   useEffect(() => {
     if (currentScenario && token) {
-      loadSuggestions();
       loadConversations();
     }
   }, [currentScenario, token]);
@@ -220,13 +218,6 @@ function AppContent() {
     localStorage.removeItem("chat_username");
     setMessages([]);
     setConversations([]);
-  };
-
-  const loadSuggestions = async () => {
-    try {
-      const d = await api(`/api/suggestions/${currentScenario}`);
-      setSuggestions(d || []);
-    } catch {}
   };
 
   const loadConversations = async () => {
@@ -820,22 +811,8 @@ function AppContent() {
                   开始一次数据分析会话
                 </h2>
                 <p className="text-xs text-slate-400 dark:text-slate-500 max-w-md mb-8">
-                  选择一个推荐问题，或直接输入你想查看的指标、维度和筛选条件。
+                  输入你想查看的指标、维度和筛选条件。
                 </p>
-                
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 w-full">
-                  {suggestions.map((s) => (
-                    <button
-                      key={s.id}
-                      onClick={() => sendMessage(s.question)}
-                      className="p-3 text-left bg-white dark:bg-slate-900 hover:bg-deloitte-green-light/40 dark:hover:bg-deloitte-green/10 border border-slate-200/80 dark:border-slate-800 rounded-lg text-xs transition-all duration-200 hover:border-deloitte-green cursor-pointer group shadow-sm"
-                    >
-                      <span className="font-medium text-slate-700 dark:text-slate-300 group-hover:text-deloitte-green-dark dark:group-hover:text-deloitte-green">
-                        {s.question}
-                      </span>
-                    </button>
-                  ))}
-                </div>
               </div>
             ) : (
               messages.map((m) => renderMessage(m))

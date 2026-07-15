@@ -47,8 +47,6 @@ body { background: var(--bg-primary); color: var(--text-primary); font-family: v
 .typing-dot:nth-child(1) { animation: typing-dot 1.4s ease-in-out infinite 0s; }
 .typing-dot:nth-child(2) { animation: typing-dot 1.4s ease-in-out infinite 0.2s; }
 .typing-dot:nth-child(3) { animation: typing-dot 1.4s ease-in-out infinite 0.4s; }
-.suggestion-chip { background:var(--bg-input); border:1px solid var(--border); border-radius:12px; padding:10px 16px; color:var(--text-secondary); font-size:0.85rem; cursor:pointer; transition:all 0.2s; }
-.suggestion-chip:hover { background:var(--accent-bg); border-color:var(--border-focus); color:var(--accent-light); }
 
 
 @keyframes fadeIn {
