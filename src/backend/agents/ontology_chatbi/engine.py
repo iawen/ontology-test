@@ -98,6 +98,7 @@ class ChatEngineV3:
         session_id = req.session_id or str(shortuuid.random())
         agent_id = req.agent_id or ""
         user_message = req.message or ""
+        checkpoint_id = str((req.options or {}).get("clarification_checkpoint_id") or "").strip()
         print(f"\n\n++++++++++++++++++++++\nuser_message： {user_message}\n++++++++++++++++++++++\n\n")
         history_messages = await self._load_conversation_history(session_id, exclude_query_id=query_id)
         current_user_message = {"role": "user", "content": user_message}
@@ -110,6 +111,13 @@ class ChatEngineV3:
             user_message=user_message,
             messages=cast(list[ChatCompletionMessageParam], llm_messages),
         )
+        resume_checkpoint = self._claim_clarification_checkpoint(checkpoint_id, session_id, agent_id) if checkpoint_id else None
+        if checkpoint_id and not resume_checkpoint:
+            state.error = "澄清会话已失效、已完成或不属于当前会话，请重新发起查询。"
+        elif resume_checkpoint:
+            state = self._restore_clarification_checkpoint(
+                resume_checkpoint, query_id=query_id, session_id=session_id, agent_id=agent_id
+            )
         answers = (req.options or {}).get("clarification_answers") or []
         if isinstance(answers, list):
             state.dimension_selections = {
@@ -141,7 +149,9 @@ class ChatEngineV3:
             State.ERROR: self._handle_error,
         }
 
-        current_state = State.INIT
+        current_state = State.ERROR if state.error else State.INIT
+        if resume_checkpoint:
+            current_state = self._resume_after_clarification(state)
         start_time = time.time()
         transition_count = 0
         max_transitions = 50
@@ -566,16 +576,7 @@ class ChatEngineV3:
         state.query_plan = validation["query_plan"]
         if self._prepare_required_dimension_clarification(state, engine):
             return State.CLARIFY
-        state.planned_query_args = self._with_query_context(
-            "query_ontology_data",
-            {
-                "target_class": state.query_scope["target_class"],
-                "join_classes": state.query_scope["join_classes"],
-                **state.query_plan,
-            },
-            state.user_message,
-            state.glossary_matches,
-        )
+        self._build_planned_query_args(state)
         self._emit_ontology_recognition_event(state, engine)
         logger.info(
             "Query plan validated: session_id=%s target_class=%s metrics=%s dimensions=%s filters=%d joins=%s",
@@ -688,7 +689,11 @@ class ChatEngineV3:
         state.query_scope = query_validation["query_scope"]
         state.query_plan = query_validation["query_plan"]
         if self._prepare_required_dimension_clarification(state, engine):
-            subquestion.update(status="needs_clarification")
+            subquestion.update(
+                status="needs_clarification",
+                query_scope=query_validation["query_scope"],
+                query_plan=query_validation["query_plan"],
+            )
             self._append_metric_plan_step(
                 state,
                 "subquestion_query_plan",
@@ -1325,6 +1330,9 @@ class ChatEngineV3:
         if not clarification:
             state.error = "需要澄清的问题为空。"
             return State.ERROR
+        checkpoint_id = self._create_clarification_checkpoint(state)
+        clarification = {**clarification, "checkpoint_id": checkpoint_id}
+        state.clarification = clarification
         state.assistant_content = str(clarification["question"])
         state.final_reason = "needs_clarification"
         state.sse_events.append(
@@ -1343,6 +1351,116 @@ class ChatEngineV3:
             ),
         )
         return State.DONE
+
+    def _build_planned_query_args(self, state: AgentState) -> None:
+        """Build the controlled query payload from an already validated query plan."""
+        state.planned_query_args = self._with_query_context(
+            "query_ontology_data",
+            {
+                "target_class": state.query_scope["target_class"],
+                "join_classes": state.query_scope["join_classes"],
+                **state.query_plan,
+            },
+            state.user_message,
+            state.glossary_matches,
+        )
+
+    def _resume_after_clarification(self, state: AgentState) -> State:
+        """Apply governed answers to a paused single-query plan without replanning it."""
+        if state.execution_mode == "metric_plan_execute":
+            paused = next(
+                (item for item in state.metric_subquestions if item.get("status") == "needs_clarification"),
+                None,
+            )
+            if not paused:
+                state.error = "未找到等待澄清的指标子问题，请重新发起查询。"
+                return State.ERROR
+            # Keep the completed evidence ledger and retry only the paused subquestion.
+            paused["status"] = "pending"
+            state.clarification = None
+            logger.info(
+                "Metric clarification checkpoint resumed: session_id=%s query_id=%s subquestion_id=%s",
+                state.session_id,
+                state.query_id,
+                paused.get("id"),
+            )
+            return State.METRIC_PLAN_EXECUTE
+        state.clarification = None
+        state.missing_dimension_groups = []
+        state.missing_required_dimensions = []
+        engine = get_engine(state.agent_id)
+        if self._prepare_required_dimension_clarification(state, engine):
+            return State.CLARIFY
+        self._build_planned_query_args(state)
+        self._emit_ontology_recognition_event(state, engine)
+        logger.info(
+            "Clarification checkpoint resumed at tool execution: session_id=%s query_id=%s",
+            state.session_id,
+            state.query_id,
+        )
+        return State.TOOL_EXECUTE
+
+    @staticmethod
+    def _checkpoint_state_fields() -> tuple[str, ...]:
+        return (
+            "user_message", "ontology_context", "glossary_matches", "skill_matches", "entity_hints",
+            "schema_context", "metric_context", "metric_candidates", "query_scope", "query_plan",
+            "scope_validation", "plan_validation", "planning_attempts", "dimension_resolution",
+            "execution_mode", "metric_plan", "metric_plan_phase", "metric_plan_iteration",
+            "metric_subquestions", "metric_plan_judgments", "metric_plan_terminal_reason",
+            "metric_query_attempts", "all_tool_results", "tool_timings", "tool_reasoning_steps",
+            "analysis_payload", "analysis_processed_count", "transition_log",
+        )
+
+    def _create_clarification_checkpoint(self, state: AgentState) -> str:
+        """Store only the validated planning state required to continue a governed query."""
+        checkpoint_id = f"clarify_{shortuuid.random()}"
+        snapshot = {
+            field: self._make_json_safe(getattr(state, field))
+            for field in self._checkpoint_state_fields()
+        }
+        db = get_db()
+        try:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS chat_clarification_checkpoints ("
+                "id TEXT PRIMARY KEY, session_id TEXT NOT NULL, agent_id TEXT NOT NULL, "
+                "state_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', "
+                "created_at TEXT DEFAULT CURRENT_TIMESTAMP, consumed_at TEXT DEFAULT '')"
+            )
+            db.execute(
+                "INSERT INTO chat_clarification_checkpoints (id, session_id, agent_id, state_json, status) VALUES (?, ?, ?, ?, 'pending')",
+                (checkpoint_id, state.session_id, state.agent_id, json.dumps(snapshot, ensure_ascii=False)),
+            )
+            db.commit()
+            return checkpoint_id
+        finally:
+            db.close()
+
+    def _claim_clarification_checkpoint(self, checkpoint_id: str, session_id: str, agent_id: str) -> dict | None:
+        """Atomically consume a checkpoint so duplicate Continue clicks cannot execute it twice."""
+        db = get_db()
+        try:
+            row = db.execute(
+                "SELECT state_json FROM chat_clarification_checkpoints WHERE id = ? AND session_id = ? AND agent_id = ? AND status = 'pending'",
+                (checkpoint_id, session_id, agent_id),
+            ).fetchone()
+            if not row:
+                return None
+            claimed = db.execute(
+                "UPDATE chat_clarification_checkpoints SET status = 'consumed', consumed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'",
+                (checkpoint_id,),
+            ).rowcount
+            db.commit()
+            return json.loads(row["state_json"]) if claimed else None
+        finally:
+            db.close()
+
+    def _restore_clarification_checkpoint(self, snapshot: dict, *, query_id: str, session_id: str, agent_id: str) -> AgentState:
+        state = AgentState(agent_id=agent_id, session_id=session_id, query_id=query_id)
+        for field in self._checkpoint_state_fields():
+            if field in snapshot:
+                setattr(state, field, snapshot[field])
+        return state
 
     async def _handle_final_stream(self, state: AgentState) -> State:
         """最终流式输出"""

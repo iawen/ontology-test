@@ -297,7 +297,7 @@ function AppContent() {
   const sendMessage = async (
     text: string,
     clarificationAnswers?: ClarificationAnswer[],
-    continuationMessageId?: string,
+    clarificationCheckpointId?: string,
   ) => {
     if (!text.trim() || isTyping) return;
 
@@ -317,7 +317,7 @@ function AppContent() {
       }
     }
 
-    const isClarificationContinuation = Boolean(continuationMessageId && clarificationAnswers?.length);
+    const isClarificationContinuation = Boolean(clarificationCheckpointId && clarificationAnswers?.length);
     const continuationText = "已确认维度条件，继续查询。";
     const userMsg: Message = {
       id: `u-${Date.now()}`,
@@ -356,6 +356,7 @@ function AppContent() {
             source: "frontend",
             conversation_id: convId,
             clarification_answers: clarificationAnswers,
+            clarification_checkpoint_id: clarificationCheckpointId,
             clarification_continuation: isClarificationContinuation,
             clarification_display: isClarificationContinuation ? continuationText : undefined,
           },
@@ -731,7 +732,7 @@ function AppContent() {
               onSubmitAnswers={(answers) => sendMessage(
                 originalQuestion || "请按已确认的维度口径继续原查询。",
                 answers,
-                msg.id,
+                msg.clarification?.checkpoint_id,
               )}
             />
           )}

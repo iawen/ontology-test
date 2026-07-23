@@ -23,6 +23,12 @@ from core.db.db import get_db
 from pydantic import ValidationError
 from core.ontology.ontology_asset_validator import validate_schema_assets
 from core.ontology.schema_context import load_schema_reference_context
+from core.ontology.prompt import (
+    build_global_correction_prompt,
+    build_optimization_batch_prompt,
+    build_quality_assessment_prompt,
+    build_schema_optimization_retry_prompt,
+)
 
 from core.models.schema_model import (
     OptimizationBatchResult,
@@ -614,69 +620,17 @@ class SchemaOptimizer:
             "semantics": "本阶段仅优化 Relationship 和 Metric。Class 与分析维度组均已确定，classes、dimension_groups、concepts 必须输出空数组。Metric 必须采用 V1 structured definition，target_class 必须等于 definition.anchor_class，并且 dimension_group_ids 只能引用前置阶段已确定的维度组。",
             "concepts": "本阶段仅优化 Concept 层级。Class、Relationship、Metric 已确定，classes、relationships、metrics 必须输出空数组；不得重新生成或改写它们。",
         }.get(stage, "仅修改当前批次内的资产。")
-        return f"""你是数据仓库建模与本体论专家。请根据以下业务文档和当前 Schema 资产，优化实体类、指标、关系和概念。
-
-## 业务文档片段（RAG 检索）
-{doc_context}
-
-## 已有本体资产参考（已压缩）
-reviewed 中的资产是人工审核确认过的高可信业务口径，只能学习和参考，不得改写、覆盖或生成与其冲突的 Class、Metric、Relationship、Concept。
-existing_unreviewed 中的资产是此前提取或优化得到的已有上下文，后续优化应增量更新或合并，不要因为当前批次未覆盖就删除、重建或改名。
-{schema_reference}
-
-## 已确定的前置阶段资产
-{json.dumps(stage_context, ensure_ascii=False, indent=2)}
-
-## 当前批次 Schema 资产
-{json.dumps(batch, ensure_ascii=False, indent=2)}
-
-## 优化要求
-1. {stage_rules}
-2. **去重与合并**：不得生成与当前批次、前置阶段资产、reviewed 或 existing_unreviewed 中语义相同或高度相似（同义词、缩写、仅措辞不同）的资产；应复用最合适的已有未审核 ID 并增量修正。
-3. **Class 优化**：根据文档修正 name_cn、description，fields 只输出需优化的字段（排除已正确的）。
-4. **维度组优化与发现**：根据文档修正业务名称、选项、别名、默认值与 Class 逻辑字段映射；当 dimension_discovery 为 true 时，额外识别当前系统缺失、可被多个 Metric 复用的时间/分类/层级维度组并输出。已有维度组必须保留原 ID；新维度组必须提供稳定英文下划线 ID、至少一个选项和至少一条映射。不允许使用物理字段名替代业务字段，也不得把临时过滤条件建成维度组。
-5. **Metric 优化**：根据文档修正 name、description、definition、dimensions、required_dimensions、dimension_group_ids；definition.inputs 中每项均需包含 id、output_name、class_id、source_shape、field、aggregation、filters。long 输入必须有固定 filters。
-5. **Relationship 优化**：根据文档补充或修正 source_key/target_key。
-6. **Concept 优化**：根据文档补充概念层级，parent_id 只能引用当前或前置阶段已存在的 Concept。
-7. **已有资产保护**：如果优化建议与 reviewed 冲突，必须以 reviewed 为准；不得输出 reviewed 的 ID。
-
-## 输出要求
-输出标准 JSON，结构如下：
-{{
-  "classes": [
-    {{"id": "原ID", "name_cn": "优化后中文名", "description": "优化后描述", "primary_key": "", "csv_file": "", "fields": []}}
-  ],
-  "relationships": [
-    {{"source": "类ID", "target": "类ID", "type": "belongs_to", "source_key": "源键", "target_key": "目标键", "join_key": ""}}
-  ],
-  "metrics": [
-        {{"id": "原ID", "name": "优化后名称", "description": "优化后描述", "category": "", "target_class": "类ID", "definition": {{"version": 1, "anchor_class": "类ID", "expression_operator": "ADD", "inputs": []}}, "dimensions": ["col1"], "required_dimensions": [], "dimension_group_ids": ["time_granularity"], "chart_type": "bar"}}
-    ],
-    "dimension_groups": [
-        {{"id": "已有组使用原ID；新组使用英文下划线ID", "name": "时间粒度", "description": "业务说明", "group_type": "time", "is_required": true, "default_option": "month", "clarification_policy": "auto_fill", "options": [{{"value": "month", "label": "按月", "aliases": [], "is_default": true}}], "field_mappings": [{{"option_value": "month", "class_id": "类ID", "field_name": "逻辑字段名", "display_name": "月份", "priority": 0}}]}}
-  ],
-  "concepts": [
-    {{"id": "原ID", "name": "", "description": "", "parent_id": "", "level": 0, "concept_type": "entity", "related_class": ""}}
-  ],
-  "summary": "本批次优化摘要"
-}}
-
-严禁输出 JSON 以外的内容。"""
+        return build_optimization_batch_prompt(
+            doc_context=doc_context,
+            schema_reference=schema_reference,
+            stage_context=json.dumps(stage_context, ensure_ascii=False, indent=2),
+            batch=json.dumps(batch, ensure_ascii=False, indent=2),
+            stage_rules=stage_rules,
+        )
 
     def _build_retry_prompt(self, original_prompt: str, error: str, retry_type: str = "syntax") -> str:
         """构建自校正重试提示词（区分错误类型）"""
-        base = f"""{original_prompt}
-
-## 上次输出验证失败
-你的上一次输出存在以下错误：
-{error}
-"""
-        if retry_type == "semantic":
-            base += "\n## 特别提醒（语义错误）\n检测到字段缺失，请确保所有必填字段（如 id、source、target 等）都已完整输出，且值不为空。"
-        else:
-            base += "\n## 特别提醒（格式错误）\n请确保输出是合法的 JSON 格式，注意引号、逗号、括号匹配。"
-        base += "\n请修正错误并重新输出符合要求的 JSON。"
-        return base
+        return build_schema_optimization_retry_prompt(original_prompt, error, retry_type)
 
     # --------------------------------------------------------
     # 阶段二：全局校正（扩展版）
@@ -707,37 +661,12 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
         compressed_metrics = [{"id": m.id, "name": m.name, "target_class": m.target_class, "definition": m.definition} for m in all_metrics]
         compressed_concepts = [{"id": c.id, "name": c.name, "parent_id": c.parent_id, "level": c.level} for c in all_concepts]
 
-        prompt = f"""你是数据仓库建模专家。请对以下三阶段优化结果进行全局一致性核验。
-
-## 所有 Class 摘要
-{json.dumps(compressed_classes, ensure_ascii=False, indent=2)}
-
-## 所有 Metric 摘要
-{json.dumps(compressed_metrics, ensure_ascii=False, indent=2)}
-
-## 所有 Relationship
-{json.dumps([r.model_dump() for r in all_rels], ensure_ascii=False, indent=2)}
-
-## 所有 Concept
-{json.dumps(compressed_concepts, ensure_ascii=False, indent=2)}
-
-## 检查项
-1. **去重核验**：是否有重复或近似命名的 Class、Metric、Relationship、Concept？将风险写入 warning，不得直接重命名。
-2. **关系悬空**：Relationship 的 source/target 是否引用了不存在的 Class？
-3. **指标悬空**：Metric 的 target_class 是否引用了不存在的 Class？
-4. **概念树完整性**：Concept 的 parent_id 是否引用了不存在的概念？是否存在循环引用？
-5. **指标口径一致性**：同名的 Metric 是否使用了相同的 definition？不一致的需要标记警告。
-
-## 输出 JSON
-{{
-    "class_renames": [],
-    "relationship_corrections": [],
-    "metric_corrections": [],
-    "concept_corrections": [],
-    "metric_consistency_warnings": ["指标 '销售额' 在不同批次中 definition 不一致"],
-  "concept_tree_warnings": ["概念 '订单' 的父级 '交易' 不存在"],
-  "summary": "全局校正摘要"
-}}"""
+        prompt = build_global_correction_prompt(
+            classes=json.dumps(compressed_classes, ensure_ascii=False, indent=2),
+            metrics=json.dumps(compressed_metrics, ensure_ascii=False, indent=2),
+            relationships=json.dumps([r.model_dump() for r in all_rels], ensure_ascii=False, indent=2),
+            concepts=json.dumps(compressed_concepts, ensure_ascii=False, indent=2),
+        )
 
         try:
             response = await get_async_client().chat.completions.create(
@@ -778,33 +707,11 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
         for m in merged.get("metrics", [])[:5]:
             metric_summary.append(f"{m.get('id')}: {m.get('name')} = {json.dumps(m.get('definition', {}), ensure_ascii=False)}")
 
-        prompt = f"""你是一名数据建模质量评审专家。请评估以下 Schema 优化结果的质量。
-
-## 优化摘要
-{diff.summary}
-
-## 新增/修改的 Class（前5个）
-{json.dumps(class_summary, ensure_ascii=False, indent=2)}
-
-## 新增/修改的 Metric（前5个）
-{json.dumps(metric_summary, ensure_ascii=False, indent=2)}
-
-## 评估维度
-1. **业务准确性**：优化建议是否贴合业务文档语义？
-2. **命名规范性**：名称是否符合业务术语习惯？
-3. **结构完整性**：Class-Metric-Relationship 引用关系是否完整？
-4. **可执行性**：definition、dimensions 是否合理可执行？
-
-## 输出 JSON
-{{
-  "overall_score": 8.5,
-  "confidence": 0.85,
-  "strengths": ["维度划分清晰", "指标口径一致"],
-  "weaknesses": ["部分 Class 描述仍偏技术化"],
-  "high_risk_items": ["指标 'gmv' 缺少 required_dimensions"],
-  "summary": "整体质量较高，建议重点审核 high_risk_items"
-}}
-"""
+        prompt = build_quality_assessment_prompt(
+            diff_summary=diff.summary,
+            classes=json.dumps(class_summary, ensure_ascii=False, indent=2),
+            metrics=json.dumps(metric_summary, ensure_ascii=False, indent=2),
+        )
         try:
             response = await get_async_client().chat.completions.create(
                 model=get_model_name(),

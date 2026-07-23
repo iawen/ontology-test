@@ -93,6 +93,7 @@ export interface ClarificationAnswer {
 export interface ClarificationData {
   question: string;
   options: ClarificationOption[];
+  checkpoint_id?: string;
   version?: number;
   reason?: string;
   questions?: ClarificationQuestion[];

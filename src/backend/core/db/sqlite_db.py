@@ -108,6 +108,15 @@ def init_db():
             action_confirm TEXT DEFAULT '',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS chat_clarification_checkpoints (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            state_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            consumed_at TEXT DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS metrics (
             id TEXT NOT NULL,
             scenario_id TEXT NOT NULL,
