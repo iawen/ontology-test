@@ -1,0 +1,1 @@
+"""Component-recognition adapters and symbol dictionaries."""

@@ -1,0 +1,1 @@
+"""DXF entity parsing and CAD-coordinate services."""

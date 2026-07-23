@@ -1,0 +1,1 @@
+"""Stable domain contracts shared by all drawing-recognition layers."""

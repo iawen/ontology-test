@@ -1,0 +1,2 @@
+# Optional P2 runtime. Install only after P0 model/licence evaluation is complete.
+ultralytics>=8.3.0

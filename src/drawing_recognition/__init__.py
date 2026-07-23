@@ -1,0 +1,1 @@
+"""Electrical drawing recognition domain package."""
