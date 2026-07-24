@@ -58,7 +58,10 @@ class OntologyAssetValidator:
             for field in cls.get("fields", []):
                 if not isinstance(field, dict):
                     continue
-                physical_name = str(field.get("physical_name") or field.get("name") or "").strip()
+                is_legacy_field = bool(field.get("physical_name"))
+                physical_name = str(
+                    field.get("physical_name") if is_legacy_field else field.get("name") or ""
+                ).strip()
                 if not physical_name:
                     continue
                 if physical_name not in physical_columns:
@@ -67,7 +70,10 @@ class OntologyAssetValidator:
                 if physical_name in seen:
                     continue
                 seen.add(physical_name)
-                fields.append({**field, "physical_name": physical_name})
+                logical_name = str(
+                    field.get("name") if is_legacy_field else field.get("name_cn") or physical_name
+                ).strip()
+                fields.append({**field, "name_cn": logical_name, "name": physical_name})
 
             if not fields:
                 self._log_asset_drop("class", cid, "没有任何有效物理字段")
@@ -80,7 +86,7 @@ class OntologyAssetValidator:
             cls["primary_key"] = ",".join(primary_key)
             class_fields[cid] = seen
             class_metric_fields[cid] = seen | {
-                str(field.get("name") or "").strip()
+                str(field.get("name_cn") or field.get("name") or "").strip()
                 for field in fields
                 if str(field.get("name") or "").strip()
             }
@@ -368,7 +374,7 @@ class OntologyAssetValidator:
         return summary_index
 
     def _resolve_class_source(self, cls: dict) -> str:
-        for key in ("_source_origin", "csv_file", "table_name"):
+        for key in ("_source_origin", "table_name", "table_name"):
             value = str(cls.get(key, "")).strip()
             if value:
                 return value

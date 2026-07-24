@@ -108,7 +108,7 @@ def _validate_payload(conn, scenario_id: str, payload: dict) -> None:
         names = set(row.get("properties") and json.loads(row.get("properties") or "[]") or [])
         for field in fields:
             if isinstance(field, dict):
-                names.update(filter(None, [field.get("name"), field.get("physical_name")]))
+                names.update(filter(None, [field.get("name_cn"), field.get("name")]))
         class_fields[row["id"]] = names
     for mapping in payload.get("field_mappings") or []:
         item = mapping.model_dump() if hasattr(mapping, "model_dump") else mapping

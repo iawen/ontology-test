@@ -66,7 +66,7 @@ class DataQueryEngine:
 
     def _quote_table(self, table_name: str) -> str:
         if table_name is None or str(table_name).strip() == "":
-            raise ValueError("SQL 表名为空：请检查 class 的 table_name/csv_file 配置")
+            raise ValueError("SQL 表名为空：请检查 class 的 table_name/table_name 配置")
         table_name = str(table_name)
         return ".".join(self._quote_ident(part) for part in table_name.split("."))
 
@@ -278,17 +278,16 @@ class DataQueryEngine:
             self._registered_tables.add(class_id)
             logger.debug("DataQuery CSV registration skipped for external db: class=%s", class_id)
             return
-        info = self.oe.get_class_info(class_id)
-        csv_file = info.get("csv_file", "")
-        if not csv_file:
-            logger.debug("DataQuery CSV skipped: class=%s reason=no_csv_file", class_id)
+        source_file = self.oe.get_source_file(class_id)
+        if not source_file:
+            logger.debug("DataQuery CSV skipped: class=%s reason=no_csv_source_file", class_id)
             return
-        csv_path = self.oe.data_dir / csv_file
+        csv_path = self.oe.data_dir / source_file
         if not csv_path.exists():
             logger.warning(
-                "DataQuery CSV skipped: class=%s csv_file=%s path=%s reason=file_not_found",
+                "DataQuery CSV skipped: class=%s source_file=%s path=%s reason=file_not_found",
                 class_id,
-                csv_file,
+                source_file,
                 str(csv_path),
             )
             return
@@ -298,8 +297,9 @@ class DataQueryEngine:
         df.to_sql(table_name, conn, if_exists="replace", index=False)
         self._registered_tables.add(class_id)
         logger.info(
-            "DataQuery CSV registered: class=%s table=%s rows=%d columns=%d",
+            "DataQuery CSV registered: class=%s source_file=%s table=%s rows=%d columns=%d",
             class_id,
+            source_file,
             table_name,
             len(df),
             len(df.columns),
@@ -521,14 +521,19 @@ class DataQueryEngine:
             if isinstance(item, dict) and str(item.get("class_id") or "").strip()
         ))
 
-    def _definition_input_expr(self, item: dict, alias_map: dict) -> str:
+    def _definition_input_expr(self, item: dict, alias_map: dict, metric_id: str = "") -> str:
+        metric_context = f"Metric {metric_id}: " if metric_id else "Metric definition: "
         if not isinstance(item, dict):
-            raise ValueError("Metric definition 组成项无效")
+            raise ValueError(f"{metric_context}组成项无效")
         class_id = str(item.get("class_id") or "").strip()
         field = str(item.get("field") or "").strip()
         aggregation = str(item.get("aggregation") or "").upper()
         if class_id not in alias_map or not field or aggregation not in {"SUM", "AVG", "MIN", "MAX", "COUNT", "COUNT_DISTINCT"}:
-            raise ValueError("Metric definition 组成项不完整或来源类未加入查询范围")
+            raise ValueError(
+                f"{metric_context}组成项不完整或来源类未加入查询范围："
+                f"class_id={class_id or '<empty>'}, field={field or '<empty>'}, "
+                f"aggregation={aggregation or '<empty>'}"
+            )
         alias = alias_map[class_id]
         value_expr = self._col_ref(alias, self._ensure_query_field(class_id, field, "Metric 组成项字段"))
         conditions = [self._build_filter_clause(class_id, filter_item, alias) for filter_item in item.get("filters", []) if isinstance(filter_item, dict)]
@@ -548,7 +553,9 @@ class DataQueryEngine:
             return None
         expressions = []
         for item in inputs:
-            expressions.append(self._definition_input_expr(item, alias_map))
+            expressions.append(
+                self._definition_input_expr(item, alias_map, str(metric_info.get("id") or ""))
+            )
         if operator == "DIVIDE":
             expression = "(" + " / ".join(
                 [expressions[0], *[f"NULLIF({item}, 0)" for item in expressions[1:]]]
@@ -574,13 +581,13 @@ class DataQueryEngine:
         operator = "+" if offset > 0 else "-"
         return f"({expression} {operator} {abs(offset):g})"
 
-    def _definition_output_expr(self, output: dict, alias_map: dict) -> str:
+    def _definition_output_expr(self, output: dict, alias_map: dict, metric_id: str = "") -> str:
         """Compile one independently named V2 Metric output."""
         inputs = output.get("inputs", [])
         operator = str(output.get("expression_operator") or "").upper()
         if not isinstance(inputs, list) or not inputs or operator not in {"ADD", "SUBTRACT", "MULTIPLY", "DIVIDE"}:
-            raise ValueError("Metric 并列输出定义无效")
-        expressions = [self._definition_input_expr(item, alias_map) for item in inputs]
+            raise ValueError(f"Metric {metric_id or '<unknown>'} 并列输出定义无效")
+        expressions = [self._definition_input_expr(item, alias_map, metric_id) for item in inputs]
         if operator == "DIVIDE":
             if len(expressions) != 2:
                 raise ValueError("相除的并列输出必须恰好包含两个组成项")
@@ -599,7 +606,7 @@ class DataQueryEngine:
         alias_map: dict,
     ) -> str:
         if output is not None:
-            return self._definition_output_expr(output, alias_map)
+            return self._definition_output_expr(output, alias_map, str(metric_info.get("id") or ""))
         return self._metric_expr(metric_info, metric_name, default_class, alias_map)
 
     def _structured_metric_expr(self, metric_info: dict, default_class: str, alias_map: dict) -> Optional[str]:
@@ -748,7 +755,7 @@ class DataQueryEngine:
         if definition.get("version") == 2:
             return [
                 (
-                    self._definition_output_expr(output, alias_map),
+                    self._definition_output_expr(output, alias_map, str(metric_info.get("id") or "")),
                     str(output.get("output_name") or f"{metric_name}_{index + 1}").strip(),
                 )
                 for index, output in enumerate(definition.get("outputs", []))
@@ -757,7 +764,7 @@ class DataQueryEngine:
         if definition.get("version") == 1 and str(definition.get("expression_operator") or "").upper() == "CONCAT":
             return [
                 (
-                    self._definition_input_expr(item, alias_map),
+                    self._definition_input_expr(item, alias_map, str(metric_info.get("id") or "")),
                     str(item.get("output_name") or item.get("field") or f"{metric_name}_{index + 1}").strip(),
                 )
                 for index, item in enumerate(definition.get("inputs", []))
@@ -777,7 +784,7 @@ class DataQueryEngine:
     ) -> list[tuple[str, str]]:
         if output is not None:
             return [(
-                self._definition_output_expr(output, alias_map),
+                self._definition_output_expr(output, alias_map, str(metric_info.get("id") or "")),
                 str(output.get("output_name") or metric_name).strip(),
             )]
         return self._metric_exprs(metric_info, metric_name, default_class, alias_map)

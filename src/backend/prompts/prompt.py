@@ -31,12 +31,12 @@ def _build_ontology_context(engine: OntologyEngine, scenario_id: str) -> str:
     classes_lines = []
     for c in engine.list_classes():
         cls_info = engine.classes.get(c["id"], {})
-        csv_file = cls_info.get("csv_file", "")
+        table_name = cls_info.get("table_name", "")
         props = c.get("properties", [])
         metric_lines = metrics_by_class.get(c["id"], [])
         metrics_text = "\n".join(metric_lines) if metric_lines else "    关联指标: （暂无）"
         classes_lines.append(
-            f"  - **{c['id']}**（{c.get('name_cn', '')}）→ {csv_file}\n"
+            f"  - **{c['id']}**（{c.get('name_cn', '')}）→ {table_name}\n"
             f"    字段: {', '.join(props[:15])}\n"
             f"{metrics_text}"
         )

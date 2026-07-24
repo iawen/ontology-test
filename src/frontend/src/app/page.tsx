@@ -537,8 +537,11 @@ function AppContent() {
                 }
                 const result = parseToolPayload(event.payload);
                 const startedAt = parseEventTimestamp(event.begin_time);
-                const durationMs = Math.round(Number(event.duration || 0) * 1000);
-                const finishedAt = startedAt + durationMs;
+                const rawDuration = Number(event.duration);
+                const durationMs = Number.isFinite(rawDuration) && rawDuration > 0
+                  ? Math.round(rawDuration * 1000)
+                  : undefined;
+                const finishedAt = durationMs === undefined ? Date.now() : startedAt + durationMs;
                 const failed = Boolean(
                   result && typeof result === "object" && "error" in result && result.error,
                 );
@@ -625,6 +628,7 @@ function AppContent() {
                           answerDatasets: answerDatasets.length > 0 ? answerDatasets : m.answerDatasets,
                           steps: currentSteps,
                           plan: currentPlan || m.plan,
+                          totalDurationMs: Number(event.total_duration_ms) || undefined,
                         }
                       : m
                   )
@@ -699,7 +703,7 @@ function AppContent() {
           )}
 
           {msg.steps && msg.steps.length > 0 && (
-            <ToolStepsPanel steps={msg.steps} />
+            <ToolStepsPanel steps={msg.steps} totalDurationMs={msg.totalDurationMs} />
           )}
 
           {msg.isLoading && !msg.content && (!msg.steps || msg.steps.length === 0) && (

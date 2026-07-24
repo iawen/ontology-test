@@ -63,12 +63,16 @@ class ToolExecutor:
         """
         try:
             if tool_name == "query_ontology_data":
-                arguments = await self.entity_agent.prepare_query_ontology_data_args(
+                prepared_arguments = await self.entity_agent.prepare_query_ontology_data_args(
                     arguments,
                     query_engine,
                     engine,
                     scenario_id=self.scenario_id,
                 )
+                # The caller's subquestion ledger must retain the actual resolved
+                # filter fields used for SQL, not the pre-alignment LLM proposal.
+                arguments.clear()
+                arguments.update(prepared_arguments)
                 if arguments.get("error"):
                     return arguments
 

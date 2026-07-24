@@ -10,7 +10,6 @@ from openai.types.chat import ChatCompletionMessageParam
 from agents.ontology_chatbi.helper import (
     metric_context_summary,
     metric_definition,
-    metric_target_classes,
     resolve_metric_reference,
 )
 from agents.ontology_chatbi.prompt import (
@@ -35,52 +34,70 @@ class OntologyAgent:
         schema_context: str,
         glossary_matches: list[dict],
         ontology_engine,
-        preferred_metric_ids: list[str] | None = None,
+        candidate_class_ids: list[str] | None = None,
         feedback: str = "",
         session_id: str = "",
     ) -> dict:
         """Identify and validate the target class plus explicit join classes.
 
-        Metric anchors supplied by Plan-Execute are presented as a preferred
-        target-class signal, not an unconditional override.
+        This stage intentionally does not receive Metric information. Metric
+        selection and Metric-driven dependency expansion happen only after the
+        Schema Scope has been validated.
         """
-        preferred_metrics = self._preferred_metric_context(
-            preferred_metric_ids or [], ontology_engine
+        candidate_ids = self._valid_candidate_class_ids(
+            candidate_class_ids or [], ontology_engine
         )
         payload = await self._request_planning_json(
             "schema_scope",
             get_schema_scope_planning_prompt(
                 user_message,
-                schema_context,
+                self._candidate_schema_context(ontology_engine, candidate_ids) if candidate_ids else schema_context,
                 self._json_dumps(glossary_matches),
-                preferred_metrics,
             ),
             feedback,
             session_id,
         )
-        return self.validate_query_scope(payload, ontology_engine)
+        return self.validate_query_scope(
+            payload, ontology_engine, allowed_class_ids=candidate_ids or None
+        )
 
     @staticmethod
-    def _preferred_metric_context(metric_ids: list[str], ontology_engine) -> str:
-        """Render valid candidate Metrics and their primary (anchor) Class."""
-        summaries = []
-        seen = set()
-        for metric_id in metric_ids:
-            metric = ontology_engine.get_metric_info(str(metric_id).strip())
-            if not metric:
-                continue
-            resolved_id = str(metric.get("id") or "").strip()
-            if not resolved_id or resolved_id in seen:
-                continue
-            seen.add(resolved_id)
-            target_classes = metric_target_classes(metric)
-            anchor_class = target_classes[0] if target_classes else ""
-            summaries.append(
-                f"- {metric_context_summary(metric)}; "
-                f"主实体（锚点类）={anchor_class}; "
-                f"关联来源类={target_classes[1:]}"
+    def _valid_candidate_class_ids(candidate_class_ids: list[str], ontology_engine) -> list[str]:
+        known_classes = {str(item.get("id") or "") for item in ontology_engine.list_classes()}
+        return list(
+            dict.fromkeys(
+                class_id
+                for item in candidate_class_ids
+                if (class_id := str(item or "").strip()) in known_classes
             )
-        return "\n".join(summaries)
+        )
+
+    @staticmethod
+    def _candidate_schema_context(ontology_engine, candidate_class_ids: list[str]) -> str:
+        """Render only routing-selected classes for the Schema Scope planner."""
+        class_by_id = {
+            str(item.get("id") or ""): item for item in ontology_engine.list_classes()
+        }
+        parts = ["## 路由候选实体类（仅可从此集合选择）"]
+        for class_id in candidate_class_ids:
+            schema_class = class_by_id[class_id]
+            parts.append(
+                f"- **{class_id}**({schema_class.get('name_cn', '')}): "
+                f"{schema_class.get('description', '')}"
+            )
+        relationships = [
+            relationship
+            for relationship in ontology_engine.list_relationships()
+            if relationship.get("source") in candidate_class_ids
+            and relationship.get("target") in candidate_class_ids
+        ]
+        if relationships:
+            parts.append("## 候选实体间关系")
+            parts.extend(
+                f"- {relationship['source']} --[{relationship.get('type', '')}]--> {relationship['target']}"
+                for relationship in relationships
+            )
+        return "\n".join(parts)
 
     async def plan_query_details(
         self,
@@ -89,6 +106,9 @@ class OntologyAgent:
         metric_candidates: list[str],
         ontology_engine,
         query_engine,
+        reusable_query_plan: dict | None = None,
+        reuse_metrics: bool = False,
+        trusted_reusable_filters: list[dict] | None = None,
         feedback: str = "",
         session_id: str = "",
     ) -> dict:
@@ -96,17 +116,53 @@ class OntologyAgent:
         scope_context = self.build_scope_context(query_scope, ontology_engine, metric_candidates)
         payload = await self._request_planning_json(
             "query_details",
-            get_query_details_planning_prompt(user_message, scope_context),
+            get_query_details_planning_prompt(
+                user_message,
+                scope_context,
+                self._json_dumps(reusable_query_plan) if reusable_query_plan else "",
+                reuse_metrics,
+            ),
             feedback,
             session_id,
         )
+        if reusable_query_plan:
+            payload = self._merge_reusable_query_plan(
+                reusable_query_plan, payload, reuse_metrics
+            )
         return self.validate_query_plan(
             payload,
             query_scope,
             metric_candidates,
             ontology_engine,
             query_engine,
+            trusted_filters=trusted_reusable_filters,
         )
+
+    @staticmethod
+    def _merge_reusable_query_plan(
+        parent_plan: dict, delta_plan: dict, reuse_metrics: bool
+    ) -> dict:
+        """Build a complete child plan from a validated parent plus LLM delta.
+
+        Parent conditions are intentionally retained. The executor later enforces
+        their resolved field/value pairs while it aligns only the new conditions.
+        """
+        parent = parent_plan if isinstance(parent_plan, dict) else {}
+        delta = delta_plan if isinstance(delta_plan, dict) else {}
+
+        def merge_list(key: str) -> list:
+            base = parent.get(key) if isinstance(parent.get(key), list) else []
+            additions = delta.get(key) if isinstance(delta.get(key), list) else []
+            return [*base, *additions]
+
+        return {
+            "query_mode": delta.get("query_mode") or parent.get("query_mode") or "aggregate",
+            "metrics": list(parent.get("metrics") or []) if reuse_metrics else list(delta.get("metrics") or []),
+            "dimensions": merge_list("dimensions"),
+            "filters": merge_list("filters"),
+            "having": merge_list("having"),
+            "order_by": delta.get("order_by") or parent.get("order_by") or "",
+        }
 
     async def _request_planning_json(self, stage: str, instruction: str, feedback: str, session_id: str) -> dict:
         if self.client is None:
@@ -150,11 +206,16 @@ class OntologyAgent:
         return parsed if isinstance(parsed, dict) else {}
 
     @staticmethod
-    def validate_query_scope(payload: dict, engine) -> dict:
+    def validate_query_scope(
+        payload: dict, engine, allowed_class_ids: list[str] | None = None
+    ) -> dict:
         target_class = str(payload.get("target_class") or "").strip()
         known_classes = {str(item.get("id") or "") for item in engine.list_classes()}
+        allowed_classes = set(allowed_class_ids or known_classes)
         if not target_class or target_class not in known_classes:
             return {"valid": False, "error": f"target_class 不存在：{target_class or '<empty>'}"}
+        if target_class not in allowed_classes:
+            return {"valid": False, "error": f"target_class 不属于路由候选实体：{target_class}"}
         raw_join_classes = payload.get("join_classes") or []
         if not isinstance(raw_join_classes, list):
             return {"valid": False, "error": "join_classes 必须是数组"}
@@ -166,6 +227,8 @@ class OntologyAgent:
                 continue
             if class_id not in known_classes:
                 return {"valid": False, "error": f"join_class 不存在：{class_id}"}
+            if class_id not in allowed_classes:
+                return {"valid": False, "error": f"join_class 不属于路由候选实体：{class_id}"}
             path = engine.get_join_path(target_class, class_id)
             if not path:
                 return {"valid": False, "error": f"{target_class} 与 {class_id} 不存在 JOIN 路径"}
@@ -174,7 +237,14 @@ class OntologyAgent:
         return {"valid": True, "target_class": target_class, "join_classes": join_classes, "join_paths": join_paths}
 
     @staticmethod
-    def validate_query_plan(payload: dict, scope: dict, metric_candidates: list[str], engine, query_engine) -> dict:
+    def validate_query_plan(
+        payload: dict,
+        scope: dict,
+        metric_candidates: list[str],
+        engine,
+        query_engine,
+        trusted_filters: list[dict] | None = None,
+    ) -> dict:
         target_class = str(scope.get("target_class") or "")
         query_mode = str(payload.get("query_mode") or "aggregate").lower()
         if query_mode not in {"aggregate", "detail"}:
@@ -198,81 +268,32 @@ class OntologyAgent:
         join_classes = list(scope.get("join_classes") or [])
         join_paths = dict(scope.get("join_paths") or {})
         allowed_classes = [target_class, *join_classes]
+        trusted_filter_keys = {
+            OntologyAgent._filter_key(item)
+            for item in trusted_filters or []
+            if isinstance(item, dict)
+        }
 
         def is_scope_field(field_name: str) -> bool:
             return any(field_name in engine.get_field_map(class_id) for class_id in allowed_classes)
 
-        def infer_metric_from_field(field_name: str) -> tuple[dict, dict | None] | None:
-            """Resolve a Metric from a structured component name or input field.
-
-            `output_name` is the governed user-facing name of a component (and the
-            output column for CONCAT Metrics). Structured input `field` names are
-            also safe to recognize when they identify exactly one Metric. Formula
-            text is legacy metadata and must never be used for inference.
-            """
-            normalized_name = field_name.casefold()
-            matched_metrics = []
-            seen_metric_ids = set()
-            for metric in available_metrics:
-                definition = metric_definition(metric)
-                if definition.get("version") == 2:
-                    for output in definition.get("outputs", []):
-                        if not isinstance(output, dict):
-                            continue
-                        output_names = {
-                            str(output.get("id") or "").casefold(),
-                            str(output.get("output_name") or "").casefold(),
-                        }
-                        input_fields = {
-                            str(item.get("field") or "").casefold()
-                            for item in output.get("inputs", [])
-                            if isinstance(item, dict)
-                        }
-                        if normalized_name in output_names or normalized_name in input_fields:
-                            matched_metrics.append((metric, output))
-                    continue
-                output_names = {
-                    str(input_item.get("output_name") or "").strip().casefold()
-                    for input_item in metric_definition(metric).get("inputs", [])
-                    if isinstance(input_item, dict) and str(input_item.get("output_name") or "").strip()
-                }
-                input_fields = {
-                    str(input_item.get("field") or "").strip().casefold()
-                    for input_item in metric_definition(metric).get("inputs", [])
-                    if isinstance(input_item, dict) and str(input_item.get("field") or "").strip()
-                }
-                metric_id = str(metric.get("id") or "")
-                if normalized_name in output_names | input_fields and metric_id not in seen_metric_ids:
-                    matched_metrics.append((metric, None))
-                    seen_metric_ids.add(metric_id)
-            return matched_metrics[0] if len(matched_metrics) == 1 else None
-
         def validate_candidate_metric(metric_name: str, source: str) -> tuple[dict | None, str]:
             metric_info, output = resolve_metric_reference(metric_name, available_metrics)
-            if metric_info and str(metric_info.get("id") or "") in available_metric_ids:
+            resolved_id = str(output.get("id") or "") if output else str(metric_info.get("id") or "") if metric_info else ""
+            if (
+                metric_info
+                and str(metric_info.get("id") or "") in available_metric_ids
+                and str(metric_name).strip() == resolved_id
+            ):
                 return None, str(output.get("id")) if output else str(metric_info.get("id") or metric_name)
-            inferred_metric = infer_metric_from_field(metric_name)
-            if inferred_metric:
-                parent_metric, inferred_output = inferred_metric
-                resolved_metric = str(
-                    inferred_output.get("id") if inferred_output else parent_metric.get("id") or parent_metric.get("name") or metric_name
-                )
-                logger.info(
-                    "Query metric inferred from definition input output_name: target_class=%s source=%s output_name=%s metric=%s",
-                    target_class,
-                    source,
-                    metric_name,
-                    resolved_metric,
-                )
-                return None, resolved_metric
             if not metric_info:
                 return {
                     "valid": False,
-                    "error": f"{source} 必须从当前 Class 的 Metrics 列表中选择，且组成项名称无法反推唯一 Metric：{metric_name}",
+                    "error": f"{source} 必须填写当前 Class 的 Metrics 列表中展示的 Metric 或并列输出 ID：{metric_name}",
                 }, metric_name
             return {
                 "valid": False,
-                "error": f"{source} 不属于当前 Class 的 Metrics 列表：{metric_name}",
+                "error": f"{source} 必须填写 Metric 或并列输出 ID，不能填写名称：{metric_name}",
             }, metric_name
 
         resolved_metrics = []
@@ -286,13 +307,7 @@ class OntologyAgent:
             field = str(item.get("field") or "").strip()
             error, resolved_metric = validate_candidate_metric(field, "having.field")
             if error:
-                logger.warning(
-                    "Preserving invalid HAVING metric for downstream handling: target_class=%s field=%s error=%s",
-                    target_class,
-                    field,
-                    error["error"],
-                )
-                continue
+                return error
             item["field"] = resolved_metric
 
         for field in dimensions:
@@ -304,6 +319,8 @@ class OntologyAgent:
                 )
 
         for item in filters:
+            if OntologyAgent._filter_key(item) in trusted_filter_keys:
+                continue
             field = str(item.get("field") or "").strip()
             resolved_metric, _ = resolve_metric_reference(field, available_metrics)
             if resolved_metric or not is_scope_field(field):
@@ -355,6 +372,20 @@ class OntologyAgent:
         }
 
     @staticmethod
+    def _filter_key(item: dict) -> str:
+        """Stable condition identity used to exempt already-executed parent filters."""
+        return json.dumps(
+            {
+                "field": item.get("field"),
+                "operator": str(item.get("operator") or "").upper(),
+                "value": item.get("value"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+
+    @staticmethod
     def build_scope_context(scope: dict, engine, metric_candidates: list[str] | None = None) -> str:
         scope_classes = [scope.get("target_class"), *(scope.get("join_classes") or [])]
         class_blocks = []
@@ -364,7 +395,7 @@ class OntologyAgent:
             info = engine.get_class_info(class_id)
             field_types = engine.get_field_types(class_id)
             fields = [
-                f"{logical}(表字段={physical}; {field_types.get(logical, 'text')})"
+                f"{logical}(表字段={physical}; {field_types.get(physical, 'text')})"
                 for logical, physical in engine.get_field_map(class_id).items()
             ]
             class_blocks.append(

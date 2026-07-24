@@ -1,5 +1,6 @@
 from .analysis_organizer import AnalysisOrganizerTool
 from .clarify_agent import ClarifyAgent
+from .concept_metric_planner import ConceptMetricPlanner
 from .context_compressor import ContextCompressorAgent
 from .entity_disambiguator import EntityDisambiguatorAgent
 from .glossary_matcher import GlossaryMatcherAgent
@@ -20,4 +21,5 @@ __all__ = [
     "ToolExecutor",
     "AnalysisOrganizerTool",
     "ClarifyAgent",
+    "ConceptMetricPlanner",
 ]

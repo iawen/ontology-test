@@ -39,16 +39,21 @@ def _normalize_fields(fields: list) -> list[dict]:
     for item in fields or []:
         if not isinstance(item, dict):
             continue
+        # Canonical shape: name_cn is the logical label and name is the
+        # physical column. Accept the prior shape while existing rows migrate.
         name = str(item.get("name", "")).strip()
-        physical_name = str(item.get("physical_name", "")).strip()
-        if not name and not physical_name:
+        legacy_physical_name = str(item.get("physical_name", "")).strip()
+        name_cn = str(item.get("name_cn", "")).strip()
+        physical_name = legacy_physical_name or name
+        logical_name = name if legacy_physical_name else (name_cn or physical_name)
+        if not physical_name:
             continue
         field_type = str(item.get("type", "text")).strip() or "text"
         if field_type not in {"text", "numeric", "date", "boolean"}:
             field_type = "text"
         normalized.append({
-            "name": name or physical_name,
-            "physical_name": physical_name or name,
+            "name_cn": logical_name,
+            "name": physical_name,
             "type": field_type,
             "description": str(item.get("description", "")).strip(),
             "is_primary_key": bool(item.get("is_primary_key", False)),
@@ -58,17 +63,20 @@ def _normalize_fields(fields: list) -> list[dict]:
 
 
 def _field_names(fields: list[dict]) -> list[str]:
-    return [f.get("name") or f.get("physical_name") for f in fields if f.get("name") or f.get("physical_name")]
+    return [f.get("name_cn") or f.get("name") for f in fields if f.get("name_cn") or f.get("name")]
 
 
 def _field_map(fields: list[dict], properties: list[str]) -> dict:
     if fields:
-        return {f.get("name") or f.get("physical_name"): f.get("physical_name") or f.get("name") for f in fields}
+        return {
+            (f.get("name") if f.get("physical_name") else f.get("name_cn") or f.get("name")): f.get("physical_name") or f.get("name")
+            for f in fields
+        }
     return {p: p for p in properties}
 
 
 def _field_types(fields: list[dict]) -> dict:
-    return {f.get("physical_name") or f.get("name"): f.get("type", "text") for f in fields}
+    return {f.get("name"): f.get("type", "text") for f in fields}
 
 
 def _reviewed_value(value) -> bool:
@@ -145,12 +153,12 @@ async def admin_create_class(scenario_id: str, req: SchemaClassEdit):
     try:
         conn.execute(
             """INSERT INTO schema_classes
-                    (id, scenario_id, name_cn, description, properties, fields, csv_file, primary_key, is_reviewed, review_status, created_at, updated_at)
+                    (id, scenario_id, name_cn, description, properties, fields, table_name, primary_key, is_reviewed, review_status, created_at, updated_at)
                     VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
             (req.id, scenario_id, req.name_cn, req.description,
              json.dumps(properties, ensure_ascii=False),
              json.dumps(fields, ensure_ascii=False),
-                 req.csv_file, req.primary_key, _is_reviewed_status(review_status), review_status),
+                 req.table_name, req.primary_key, _is_reviewed_status(review_status), review_status),
         )
         conn.commit()
     except Exception as e:
@@ -192,12 +200,12 @@ async def admin_update_class(scenario_id: str, class_id: str, req: SchemaClassEd
 
         conn.execute(
             """UPDATE schema_classes
-                      SET id=?, name_cn=?, description=?, properties=?, fields=?, csv_file=?, primary_key=?, is_reviewed=?, review_status=?, updated_at=CURRENT_TIMESTAMP
+                      SET id=?, name_cn=?, description=?, properties=?, fields=?, table_name=?, primary_key=?, is_reviewed=?, review_status=?, updated_at=CURRENT_TIMESTAMP
                WHERE id=? AND scenario_id=?""",
             (new_class_id, req.name_cn, req.description,
              json.dumps(properties, ensure_ascii=False),
              json.dumps(fields, ensure_ascii=False),
-             req.csv_file, req.primary_key, _is_reviewed_status(review_status), review_status,
+             req.table_name, req.primary_key, _is_reviewed_status(review_status), review_status,
              class_id, scenario_id),
         )
         if new_class_id != class_id:
@@ -480,7 +488,7 @@ def _sync_schema_files(scenario_id: str):
             "description": c["description"],
             "properties": properties,
             "primary_key": c["primary_key"],
-            "csv_file": c["csv_file"],
+            "table_name": c["table_name"],
             "fields": fields,
             "is_reviewed": _is_reviewed_status(
                 _review_status(c.get("review_status"), c.get("is_reviewed", 0))
@@ -488,13 +496,13 @@ def _sync_schema_files(scenario_id: str):
             "review_status": _review_status(c.get("review_status"), c.get("is_reviewed", 0)),
         })
         mapping_classes[c["id"]] = {
-            "csv_file": c["csv_file"],
-            "table_name": c["csv_file"].replace(".csv", "") if c["csv_file"] else c["id"],
+            "table_name": c["table_name"],
+            "table_name": c["table_name"].replace(".csv", "") if c["table_name"] else c["id"],
             "primary_key": c["primary_key"],
             "name_cn": c["name_cn"],
             "field_map": _field_map(fields, properties),
             "field_types": _field_types(fields),
-            "data_source": "csv" if c["csv_file"].endswith(".csv") else "database",
+            "data_source": "csv" if c["table_name"].endswith(".csv") else "database",
             "is_reviewed": _is_reviewed_status(
                 _review_status(c.get("review_status"), c.get("is_reviewed", 0))
             ),

@@ -20,12 +20,11 @@ const TOOL_NAMES_MAP: Record<string, string> = {
   python_analyze: "Python 数据分析",
   explore_schema: "探索数据模型",
   query_data: "多维指标查询",
-  query_raw_data: "原始明细检索",
   lookup_metric: "指标口径匹配",
   drill_down: "维度下钻",
   python_analyst: "Python 数据分析",
   execute_action: "执行动作",
-  list_available_actions: "可用动作甄选",
+  concept_metric_analysis_plan: "生成候选分析域、指标组合与分析轴",
 };
 
 function formatDetail(value: unknown) {
@@ -57,8 +56,11 @@ function formatClock(timestamp?: number) {
   });
 }
 
-function formatDuration(durationMs?: number) {
-  if (durationMs === undefined) return "执行中";
+function formatDuration(durationMs?: number, isRunning = false) {
+  if (durationMs === undefined || durationMs <= 0) {
+    return isRunning ? "执行中" : "未计时";
+  }
+  if (durationMs < 1000) return `${durationMs}毫秒`;
   const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
@@ -120,7 +122,7 @@ function buildStepTree(steps: ToolStepsPanelProps["steps"]): StepTreeNode[] {
 }
 
 
-export default function ToolStepsPanel({ steps }: ToolStepsPanelProps) {
+export default function ToolStepsPanel({ steps, totalDurationMs }: ToolStepsPanelProps) {
   const [isOpen, setIsOpen] = useState(true);
   const [expandedIndex, setExpandedIndex] = useState<string | null>(null);
   const [collapsedNodes, setCollapsedNodes] = useState<Set<string>>(new Set());
@@ -163,7 +165,7 @@ export default function ToolStepsPanel({ steps }: ToolStepsPanelProps) {
               {TOOL_NAMES_MAP[step.name] || step.name}
             </div>
             {step.description && <div className="mt-0.5 text-xs leading-relaxed text-slate-500 dark:text-slate-400">{step.description}</div>}
-            {!depth && <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-normal text-slate-400 dark:text-slate-500"><span>开始 {formatClock(step.startedAt)}</span><span>总耗时 {formatDuration(step.durationMs)}</span></div>}
+            {!depth && <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-normal text-slate-400 dark:text-slate-500"><span>开始 {formatClock(step.startedAt)}</span><span>总耗时 {formatDuration(step.durationMs, isRunning)}</span></div>}
           </div>
           <div className="flex shrink-0 items-center gap-2">
             {hasChildren && <button onClick={toggleChildren} className="whitespace-nowrap text-xs text-slate-500 hover:text-deloitte-green-dark dark:text-slate-400 dark:hover:text-deloitte-green font-medium cursor-pointer">{isCollapsed ? `展开子任务 (${children.length})` : "收起子任务"}</button>}
@@ -199,7 +201,7 @@ export default function ToolStepsPanel({ steps }: ToolStepsPanelProps) {
               }`}
             ></span>
           </span>
-          <span>工具执行路径 ({steps.length} 步)</span>
+          <span>工具执行路径 ({steps.length} 步{totalDurationMs && totalDurationMs > 0 ? ` · 会话总耗时 ${formatDuration(totalDurationMs)}` : ""})</span>
         </div>
         <span className="text-[10px] opacity-70">{isOpen ? "收起" : "展开"}</span>
       </button>

@@ -114,6 +114,24 @@ def metric_context_summary(metric: dict) -> str:
     )
 
 
+def metric_plan_context_summary(metric: dict) -> str:
+    """Return the minimal Metric contract needed during evidence decomposition."""
+    definition = metric_definition(metric)
+    components = metric_component_names(metric)
+    anchor_class = (
+        definition.get("anchor_class")
+        or metric.get("target_class")
+        or metric.get("class_id")
+        or ""
+    )
+    return (
+        f"id={metric.get('id', '')}; "
+        f"名称={metric.get('name') or metric.get('name_cn', '')}; "
+        f"锚点类={anchor_class}; "
+        f"组成项名称={components or []}"
+    )
+
+
 def resolve_metric_reference(reference: str, metrics: list[dict]) -> tuple[dict | None, dict | None]:
     """Resolve a parent Metric or a V2 output ID/name within a Metric collection."""
     value = str(reference or "").strip()

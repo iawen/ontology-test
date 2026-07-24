@@ -56,27 +56,23 @@ ONTOLOGY_PLANNING_SYSTEM_PROMPT = "严格只输出一个 JSON 对象，不要 Ma
 
 
 def get_query_mode_routing_prompt(
-        user_message: str,
-        schema_context: str,
-        metric_context: str,
-        glossary_matches: str,
+    user_message: str,
+    schema_entities: str,
+    glossary_matches: str,
 ) -> str:
-        """Build a constrained semantic router prompt for single-query versus Plan-Execute."""
-        return f"""你是企业数据查询路由器。判断用户问题能否由一条受控聚合查询完整回答，还是必须拆为多份独立数据证据。
+    """Build a constrained router prompt from Glossary and Schema entity summaries."""
+    return f"""你是企业数据查询路由器。判断用户问题能否由一条受控聚合查询完整回答，还是必须拆为多份独立数据证据。
 不得输出 SQL、字段名、表名、class ID、metric ID、公式或查询参数。
 
 {__COMMON_KG}
 
 用户问题：{user_message}
 
-术语匹配：
+术语匹配（用于识别企业业务口径，不含查询参数）：
 {glossary_matches}
 
-相关 Schema 摘要：
-{schema_context}
-
-候选 Metric 摘要：
-{metric_context}
+候选业务实体（仅含实体名及业务描述）：
+{schema_entities}
 
 只输出 JSON：
 {{
@@ -84,22 +80,27 @@ def get_query_mode_routing_prompt(
     "reason":"简短业务原因",
     "single_query_sufficient":true,
     "required_evidence":["回答问题必须获得的一项独立业务证据"],
+    "candidate_class_ids":["可能与问题相关的候选实体 ID，最多 5 个"],
     "confidence":"high | medium | low"
 }}
 
 规则：
-1. 判定标准是“单条受控查询能否覆盖全部必要业务证据”，不是问题字面长度或是否含特定关键词。
-2. 仅需同一业务对象、同一指标口径和可在同一聚合结果中获得的维度/筛选/对比时，mode=single_query 且 single_query_sufficient=true。
-3. 只有确实需要至少两项互补、不可由同一查询安全覆盖的独立证据时，mode=plan_execute 且 single_query_sufficient=false，并列出至少两项不重复的 required_evidence。
-4. 对于“同比、环比、对比、变化”等问题，必须列出当前期间和对比期间两项业务证据，并选择 plan_execute；由执行引擎分别验证，避免遗漏对比期间或口径不一致。
-5. 原因、归因、诊断、驱动、构成等问题如果需要分别验证多项业务证据，才选择 plan_execute。"""
+1. 判定标准是用户的完整业务语义：单条受控查询能否覆盖全部必要业务证据，以及用户是否提出多个需要分别给出结论的问题；不是问题字面长度或是否含特定关键词。
+2. 只能根据用户问题、术语匹配和候选业务实体判断任务复杂度；不得假设任何未提供的指标、字段、时间或业务口径。
+3. 必须优先阅读实体描述中的边界、限制、不适用场景、排除条件或“不能用于”的说明；不得因为名称相似就把不适用实体列入 `candidate_class_ids`。
+4. 实体描述明确不支持用户所需业务对象、时间范围、分析粒度或用途时，应排除该实体；信息不足时宁可保留为宽松候选，也不得把它当作已确认适用。
+5. 仅需同一业务对象、同一指标口径和可在同一聚合结果中获得的维度/筛选/对比时，mode=single_query 且 single_query_sufficient=true。
+6. 只有确实需要至少两项互补、不可由同一查询安全覆盖的独立证据时，mode=plan_execute 且 single_query_sufficient=false，并列出至少两项不重复的 required_evidence。
+7. 必须基于完整业务语境做语义判断，不能根据标点、连接词或词面关键词机械判定是否拆分。需要跨期间验证、解释结果成因或验证多个互补事实时，若一条查询无法安全覆盖，选择 plan_execute，并逐项列出 required_evidence。
+8. 必须结合完整语境识别用户是否同时提出两个或以上需要分别作答的相关问题。即使主题相关，只要每个子问题有独立的对象、时间、口径、分析动作或预期结论，且无法由一条查询安全、清晰地分别覆盖，就选择 plan_execute，并在 required_evidence 中逐项列出；不要仅因它们主题相关而合并遗漏。
+9. 用户先问一个整体范围的结果、再明确追问该范围内某个子集/分组/对象的结果时，这是两个独立问题，必须选择 plan_execute，即使它们使用同一指标、实体和期间，或技术上可用一条带分组的查询取回。例如“卞哲 2026 Q1 QTD 达成率是多少？其中 T40 的达成率是多少？”必须拆为“卞哲 2026 Q1 QTD 达成率”和“卞哲 2026 Q1 T40 QTD 达成率”两项 required_evidence。相反，用户只要求把同一个结果按多个维度或对象列示、且没有要求分别解释或下结论时，仍可保持 single_query。
+10. `candidate_class_ids` 只能从“候选业务实体”中选择，允许保留稍宽的相关候选；它只供后续检索缩小范围，不表示已确认查询实体。"""
 
 
 def get_schema_scope_planning_prompt(
     user_message: str,
     schema_context: str,
     glossary_matches: str,
-    preferred_metrics: str = "",
 ) -> str:
     """Build the first-stage prompt for target and join-class selection."""
     return f"""你是 Schema Scope 规划器。只根据用户问题和候选 Schema 决定查询范围，不要选择指标、字段或过滤条件。
@@ -114,20 +115,31 @@ def get_schema_scope_planning_prompt(
 术语匹配：
 {glossary_matches}
 
-任务拆解已关联的 Metric（必须结合其锚点类和组成项口径规划主实体）：
-{preferred_metrics or '（无）'}
-
 只输出 JSON：
 {{"target_class":"主实体 class ID","join_classes":["用户问题明确涉及的关联 class ID"]}}
 
 规则：
 1. target_class 必须来自候选 Schema；join_classes 只能包含用户问题确实涉及的实体，不能重复 target_class。
-2. 如果提供了“任务拆解已关联的 Metric”，必须优先根据该 Metric 的业务口径、锚点类和组成项来源确定 target_class。即使窄表的字段/表描述与子问题关键词关联较弱，也不得忽略已关联 Metric 的锚点类。
-3. 已关联 Metric 的锚点类应作为 target_class；只有子问题明确以其他实体为分析主体，且该实体是锚点类的必要关联维度时，才选择其他主实体，并将锚点类加入 join_classes。"""
+2. 必须优先阅读候选 Schema 中实体描述的边界、限制、不适用场景、排除条件或“不能用于”的说明；名称相似不能覆盖这些限制。
+3. 若实体描述明确不支持用户所需业务对象、时间范围、分析粒度或用途，则不能选择为 target_class 或 join_classes；信息不足时不要扩展为关联实体。
+4. 只能根据用户问题、术语匹配和候选 Schema 选择实体；不得基于未提供的 Metric、字段、计算口径或数据表作推断。
+5. 本阶段只确定实体范围，不选择 Metric、维度、过滤条件或 Join 参数。"""
 
 
-def get_query_details_planning_prompt(user_message: str, scope_context: str) -> str:
+def get_query_details_planning_prompt(
+    user_message: str,
+    scope_context: str,
+    reusable_query_plan: str = "",
+    reuse_metrics: bool = False,
+) -> str:
     """Build the second-stage prompt for metrics, dimensions, and conditions."""
+    reusable_plan_context = (
+        f"\n同一实体的已验证参考查询参数（只可复用与当前子问题语义一致的部分）：\n"
+        f"{reusable_query_plan}\n"
+        f"本次指标是否复用：{str(reuse_metrics).lower()}。\n"
+        if reusable_query_plan
+        else ""
+    )
     return f"""你是查询参数规划器。只能使用已验证 Schema Scope 中列出的逻辑字段与指标，绝不输出 SQL。
 
 {__COMMON_KG}
@@ -136,28 +148,31 @@ def get_query_details_planning_prompt(user_message: str, scope_context: str) -> 
 
 已验证 Schema Scope：
 {scope_context}
+{reusable_plan_context}
 
 只输出 JSON：
 {{
-  "query_mode":"aggregate 或 detail",
-  "metrics":["指标逻辑名"],
-  "dimensions":["逻辑字段名"],
-  "filters":[{{"field":"逻辑字段名","operator":"=","value":"值"}}],
-  "having":[{{"field":"指标逻辑名","operator":">","value":0}}],
-  "order_by":"逻辑字段名 DESC 或空字符串"
+    "query_mode":"aggregate 或 detail",
+    "metrics":["Metric 或并列输出 ID"],
+    "dimensions":["表字段名"],
+    "filters":[{{"field":"表字段名","operator":"=","value":"值"}}],
+    "having":[{{"field":"Metric 或并列输出 ID","operator":">","value":0}}],
+    "order_by":"Metric/并列输出 ID 或表字段名，后接 DESC；或空字符串"
 }}
 
 规则：
-1. metrics 和 having.field 只能从上方 “Metrics（当前 target_class 可用指标）” 列表中选择。普通 Metric 可填写指标逻辑名或 id；对于“并列输出”，可填写输出名称或输出 id，系统会执行该独立计算。若用户要求该 Metric 的全部并列结果，填写父 Metric 的 id。V1 CONCAT 的组成项名称仍会反推为父 Metric。绝不能把 “Class” 中的字段名填入 metrics 或 having.field。
-2. dimensions、filters.field、order_by 只能使用 “Class” 中的逻辑字段名。Class 字段展示为“逻辑字段名(表字段=物理列名; 类型)”，JSON 中必须填逻辑字段名，不能填写表字段/物理列名。
+1. metrics 和 having.field 只能从上方 “Metrics（当前 target_class 可用指标）” 列表中选择，且必须填写列表中展示的 ID；不得填写指标名称、并列输出名称、组成项名称、字段名或物理列名。若用户要求某个“并列输出”，填写该输出的 id；若要求该 Metric 的全部并列结果，填写父 Metric 的 id。后续执行器将只通过该 ID 获取对应 Metric 定义。
+2. dimensions、filters.field 只能使用 “Class” 中的表字段名。order_by 如按指标排序，必须使用 metrics 中的 Metric/并列输出 ID；如按维度排序，使用 Class 中的表字段名。Class 字段展示为“表字段名(表字段=物理列名; 类型)”，JSON 中不能填写表字段/物理列名。
 3. 聚合指标条件只能放 having；filters 只能放明细字段。除非用户明确要求明细，
-query_mode 必须是 aggregate 且至少选择一个 metrics 或 dimensions。"""
+query_mode 必须是 aggregate 且至少选择一个 metrics 或 dimensions。
+4. 如提供“已验证参考查询参数”，它来自 LLM 已确认可复用的前序子问题。人员、时间、组织层级等共同 filters 会由系统锁定继承：filters 中只能输出当前子问题新增的条件，不能重复、删除或替换继承条件。若“本次指标是否复用”为 true，metrics 必须输出空数组；系统会继承前序 metrics。若为 false，metrics 只输出当前子问题重新选择的 Metric/并列输出 ID。dimensions、having、order_by 仅输出需要新增或改变的部分；系统会在校验前与参考参数合并。"""
 
 
 def get_metric_plan_prompt(
         user_message: str,
         glossary_matches: str,
         metric_context: str,
+        analysis_plan: str,
         iteration: int = 0,
         evidence_gap: str = "",
 ) -> str:
@@ -177,6 +192,9 @@ def get_metric_plan_prompt(
 相关候选指标摘要：
 {metric_context}
 
+已验证的 Concept-Metric 分析计划：
+{analysis_plan or '（未命中可用 Concept 计划，按候选指标规划）'}
+
 当前迭代：{iteration}
 {gap_instruction}
 只输出 JSON：
@@ -184,7 +202,7 @@ def get_metric_plan_prompt(
     "objective":"本轮要回答的业务目标",
     "coverage_requirements":["最终回答必须具备的证据"],
     "subquestions":[
-        {{"id":"sq-简短唯一标识","intent":"自然语言业务子问题","metric_ids":["候选指标 ID"],"expected_evidence":"该问题补充的证据","priority":1}}
+        {{"id":"sq-简短唯一标识","intent":"自然语言业务子问题","metric_ids":["候选指标 ID"],"metric_bundle_ids":["已验证 Bundle ID"],"analysis_role":"baseline | comparison | decomposition | risk_or_efficiency","expected_evidence":"该问题补充的证据","priority":1}}
     ]
 }}
 
@@ -193,7 +211,40 @@ def get_metric_plan_prompt(
 2. 每个子问题只问一个清晰、可查询的业务事实，必须服务于原始问题。
 3. 子问题必须与术语匹配和候选指标口径一致；术语不支持的推测不要扩展。
 4. `metric_ids` 仅能填“相关候选指标摘要”中与该子问题相关的 id；若无法确定可为空数组。它用于后续优先选择指标锚点类，不能臆造。
-5. 子问题之间不可重复。"""
+5. 若提供了“已验证的 Concept-Metric 分析计划”，优先引用其中的 `metric_bundle_ids` 和 `analysis_role`；不得编造 Bundle ID。Bundle 内指标可作为同一证据问题的候选，但后续仍会由受控查询校验。
+6. 子问题之间不可重复。"""
+
+
+def get_subquestion_reuse_prompt(
+        original_question: str,
+        subquestion_intent: str,
+        previous_subquestions: str,
+) -> str:
+        """Build an LLM decision prompt for inheriting a prior Plan-Execute query."""
+        return f"""你是 Plan-Execute 子问题复用判定器。判断当前子问题是否应复用一个已执行子问题的查询范围、指标或共同过滤条件。
+不得输出 SQL、表名、字段名、class ID、metric ID、公式或查询参数；只能从“可复用的前序子问题”中选择 id。
+
+原始用户问题：{original_question}
+
+当前子问题：{subquestion_intent}
+
+可复用的前序子问题（包含其业务意图、已验证范围、指标和实际执行过滤条件）：
+{previous_subquestions}
+
+只输出 JSON：
+{{
+    "reuse_subquestion_id":"前序子问题 id；无可复用项时为空字符串",
+    "reuse_scope_and_filters":true,
+    "reuse_metrics":true,
+    "reason":"简短业务原因"
+}}
+
+规则：
+1. 必须根据完整业务语义判断，不得仅凭相同人名、期间或相近指标名称复用。
+2. 当前问题是前序问题的同口径子集/补充范围时（例如整体结果后询问其中 T40），选择该前序 id，reuse_scope_and_filters=true；后续规划只提取新增或变化的条件，前序的人员、时间、组织层级等共同过滤条件必须原样保留。
+3. 当前问题与前序问题使用同一业务口径时 reuse_metrics=true；若当前问题需要不同指标口径，reuse_metrics=false，后续只重新提取指标，仍可复用 scope_and_filters。
+4. 只要人员角色、组织层级、时间口径、统计对象或业务含义可能不同，就不要复用 scope_and_filters，返回空 id。
+5. 不允许把前序已执行过滤条件中的字段替换为其他角色字段；例如 bd 人员与 rm 人员不是同一过滤条件。"""
 
 
 def get_metric_evidence_judge_prompt(
@@ -249,7 +300,7 @@ def _build_ontology_context(engine: OntologyEngine, scenario_id: str) -> str:
     for c in engine.list_classes():
         class_id = c["id"]
         cls_info = engine.classes.get(class_id, {})
-        table_name = cls_info.get("table_name") or cls_info.get("csv_file", "")
+        table_name = cls_info.get("table_name") or cls_info.get("table_name", "")
         props = c.get("properties", [])
         class_block = [f"  - **{class_id}**（{c.get('name_cn', '')}）→ {table_name}"]
         class_block.append(f"    字段: {', '.join(props[:15])}")

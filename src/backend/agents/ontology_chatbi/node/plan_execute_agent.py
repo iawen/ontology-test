@@ -7,13 +7,14 @@ from typing import cast
 
 from openai.types.chat import ChatCompletionMessageParam
 
-from agents.ontology_chatbi.constants import COMPARISON_QUERY_KEYWORDS
 from agents.ontology_chatbi.prompt import (
     ONTOLOGY_PLANNING_SYSTEM_PROMPT,
     get_metric_evidence_judge_prompt,
     get_metric_plan_prompt,
     get_query_mode_routing_prompt,
+    get_subquestion_reuse_prompt,
 )
+from agents.ontology_chatbi.helper import metric_plan_context_summary
 from tools.logger import logger
 
 
@@ -37,10 +38,16 @@ class PlanExecuteAgent:
         has_metric_evidence: bool,
         session_id: str = "",
     ) -> dict:
-        """Choose execution mode using deterministic multi-task rules before LLM fallback."""
+        """Choose execution mode from the LLM's semantic reading of the full request.
+
+        The only deterministic decision is the safety fallback for insufficient
+        ontology evidence. In particular, whether related clauses are independent
+        questions is a semantic decision and must not be inferred from punctuation
+        or keyword matching.
+        """
         has_schema_evidence = bool(schema_context.strip())
         if not has_schema_evidence or not has_metric_evidence:
-            return {
+            return self._with_candidate_class_ids({
                 "mode": "single_query",
                 "reason": "候选本体证据不足，无法安全拆分为多个受控查询。",
                 "single_query_sufficient": True,
@@ -48,42 +55,22 @@ class PlanExecuteAgent:
                 "confidence": "high",
                 "decision_source": "rule",
                 "matched_rule": "insufficient_ontology_evidence",
-            }
-
-        question = user_message.lower()
-        comparison_terms = [term for term in COMPARISON_QUERY_KEYWORDS if term in question]
-        if comparison_terms:
-            return self._rule_decision(
-                "comparison_evidence",
-                f"检测到比较任务关键词：{'、'.join(comparison_terms)}。",
-                ["当前期间的同口径指标", "对比期间的同口径指标"],
-            )
-
-        diagnostic_terms = ("为什么", "原因", "归因", "驱动", "影响因素", "诊断", "健康度", "构成", "拆解")
-        matched_diagnostic_terms = [term for term in diagnostic_terms if term in question]
-        if matched_diagnostic_terms:
-            return self._rule_decision(
-                "diagnostic_evidence",
-                f"检测到诊断/归因任务关键词：{'、'.join(matched_diagnostic_terms)}。",
-                ["目标结果指标", "用于验证原因、构成或驱动的补充证据"],
-            )
+            }, user_message, schema_context)
 
         routing = await self._decide_query_mode_with_llm(
             user_message,
             schema_context,
-            metric_context,
             glossary_matches,
             session_id,
         )
         routing["decision_source"] = "llm"
         routing["matched_rule"] = ""
-        return routing
+        return self._with_candidate_class_ids(routing, user_message, schema_context)
 
     async def _decide_query_mode_with_llm(
         self,
         user_message: str,
         schema_context: str,
-        metric_context: str,
         glossary_matches: list[dict],
         session_id: str,
     ) -> dict:
@@ -91,8 +78,7 @@ class PlanExecuteAgent:
             "query_mode_routing",
             get_query_mode_routing_prompt(
                 user_message,
-                schema_context,
-                metric_context,
+                self._schema_entities_for_routing(schema_context),
                 self._json_dumps(glossary_matches),
             ),
             session_id,
@@ -109,25 +95,94 @@ class PlanExecuteAgent:
             "single_query_sufficient": payload.get("single_query_sufficient") is True,
             "required_evidence": list(dict.fromkeys(required_evidence)),
             "confidence": str(payload.get("confidence") or "low").lower(),
+            "candidate_class_ids": self._valid_candidate_class_ids(
+                payload.get("candidate_class_ids"), schema_context
+            ),
         }
 
+    def _with_candidate_class_ids(
+        self, decision: dict, user_message: str, schema_context: str
+    ) -> dict:
+        """Preserve LLM candidates, or provide a relaxed deterministic fallback."""
+        candidates = self._valid_candidate_class_ids(
+            decision.get("candidate_class_ids"), schema_context
+        )
+        if not candidates:
+            candidates = self._heuristic_candidate_class_ids(user_message, schema_context)
+        return {**decision, "candidate_class_ids": candidates}
+
     @staticmethod
-    def _rule_decision(rule: str, reason: str, required_evidence: list[str]) -> dict:
-        return {
-            "mode": "plan_execute",
-            "reason": reason,
-            "single_query_sufficient": False,
-            "required_evidence": required_evidence,
-            "confidence": "high",
-            "decision_source": "rule",
-            "matched_rule": rule,
+    def _valid_candidate_class_ids(value, schema_context: str) -> list[str]:
+        available = {
+            entity_id
+            for entity_id, _, _ in PlanExecuteAgent._schema_entity_records(schema_context)
         }
+        candidates = value if isinstance(value, list) else []
+        return list(
+            dict.fromkeys(
+                class_id
+                for item in candidates
+                if (class_id := str(item).strip()) in available
+            )
+        )[:5]
+
+    @staticmethod
+    def _heuristic_candidate_class_ids(user_message: str, schema_context: str) -> list[str]:
+        question = (user_message or "").lower()
+        matches = []
+        for entity_id, name, description in PlanExecuteAgent._schema_entity_records(schema_context):
+            entity_text = f"{entity_id} {name} {description}".lower()
+            if any(token in entity_text for token in PlanExecuteAgent._question_terms(question)):
+                matches.append(entity_id)
+        return list(dict.fromkeys(matches))[:5]
+
+    @staticmethod
+    def _question_terms(question: str) -> list[str]:
+        terms = re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z_]{3,}", question)
+        expanded = []
+        for term in terms:
+            if re.fullmatch(r"[\u4e00-\u9fff]+", term):
+                expanded.extend(
+                    term[start:end]
+                    for start in range(len(term))
+                    for end in range(start + 2, len(term) + 1)
+                )
+            else:
+                expanded.append(term)
+        return list(dict.fromkeys(expanded))
+
+    @staticmethod
+    def _schema_entities_for_routing(schema_context: str) -> str:
+        """Keep the Schema portion of routing free of Metric details and physical fields."""
+        entities = PlanExecuteAgent._schema_entity_records(schema_context)
+        if not entities:
+            return "（未检索到带描述的候选实体）"
+        return "\n".join(
+            f"- {entity_id}（{name or entity_id}）：{description or '无描述'}"
+            for entity_id, name, description in entities
+        )
+
+    @staticmethod
+    def _schema_entity_records(schema_context: str) -> list[tuple[str, str, str]]:
+        entities = []
+        for entity_id, name, description in re.findall(
+            r"-\s+\*\*([^*]+)\*\*\(([^)]*)\):\s*([^\n]*)",
+            schema_context or "",
+        ):
+            entity_id = entity_id.strip()
+            name = name.strip()
+            description = description.strip()
+            if entity_id:
+                entities.append((entity_id, name, description))
+        return list(dict.fromkeys(entities))
 
     async def plan_metric_subquestions(
         self,
         user_message: str,
         glossary_matches: list[dict],
         metric_context: str,
+        candidate_metrics: list[dict] | None = None,
+        analysis_plan: dict | None = None,
         iteration: int = 0,
         evidence_gap: str = "",
         session_id: str = "",
@@ -137,12 +192,47 @@ class PlanExecuteAgent:
             get_metric_plan_prompt(
                 user_message,
                 self._json_dumps(glossary_matches),
-                metric_context,
+                self._metric_plan_context(candidate_metrics, metric_context),
+                self._json_dumps(analysis_plan or {}),
                 iteration,
                 evidence_gap,
             ),
             session_id,
         )
+
+    @staticmethod
+    def _metric_plan_context(candidate_metrics: list[dict] | None, fallback: str) -> str:
+        """Avoid injecting query-definition details into evidence decomposition."""
+        summaries = [
+            metric_plan_context_summary(metric)
+            for metric in candidate_metrics or []
+            if isinstance(metric, dict) and metric.get("id")
+        ]
+        return "\n".join(f"- {summary}" for summary in summaries) or fallback
+
+    async def decide_subquestion_reuse(
+        self,
+        original_question: str,
+        subquestion_intent: str,
+        previous_subquestions: list[dict],
+        session_id: str = "",
+    ) -> dict:
+        """Use semantic context to decide whether a later evidence query inherits a parent."""
+        payload = await self._request_json(
+            "subquestion_reuse",
+            get_subquestion_reuse_prompt(
+                original_question,
+                subquestion_intent,
+                self._json_dumps(previous_subquestions),
+            ),
+            session_id,
+        )
+        return {
+            "reuse_subquestion_id": str(payload.get("reuse_subquestion_id") or "").strip(),
+            "reuse_scope_and_filters": payload.get("reuse_scope_and_filters") is True,
+            "reuse_metrics": payload.get("reuse_metrics") is True,
+            "reason": str(payload.get("reason") or ""),
+        }
 
     async def judge_metric_evidence(
         self,

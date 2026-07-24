@@ -174,7 +174,7 @@ def split_wide_table_shards(summary: dict, max_cols: int = SHARD_MAX_COLS) -> li
     # 抽取全表轻量级元数据目录作只读参考
     full_table_catalog = [
         {
-            "physical_name": c,
+            "name": c,
             "type": t,
             "comment": col_comments.get(c, ""),
         }
@@ -477,8 +477,8 @@ class OntologyExtractor:
                 "_source_origin": c.get("_source_origin"),
                 "fields": [
                     {
-                        "physical_name": f.get("physical_name"),
                         "name": f.get("name"),
+                        "name_cn": f.get("name_cn") or "",
                         "type": f.get("type"),
                         "is_primary_key": f.get("is_primary_key", False),
                         "is_foreign_key": f.get("is_foreign_key", False)
@@ -554,8 +554,8 @@ class OntologyExtractor:
                 class_id_map[temp_id] = target_primary.get("id")
                 
                 # 融合物理字段集
-                exist_fields = {f["physical_name"]: f for f in target_primary.get("fields", [])}
-                new_fields = {f["physical_name"]: f for f in c.get("fields", [])}
+                exist_fields = {f["name"]: f for f in target_primary.get("fields", [])}
+                new_fields = {f["name"]: f for f in c.get("fields", [])}
                 exist_fields.update(new_fields)
                 target_primary["fields"] = list(exist_fields.values())
                 
@@ -591,8 +591,8 @@ class OntologyExtractor:
                     class_id_map[current_primary_id] = target_key
                     
                     # 合并字段资产
-                    exist_fields = {f["physical_name"]: f for f in exist.get("fields", [])}
-                    new_fields = {f["physical_name"]: f for f in c.get("fields", [])}
+                    exist_fields = {f["name"]: f for f in exist.get("fields", [])}
+                    new_fields = {f["name"]: f for f in c.get("fields", [])}
                     exist_fields.update(new_fields)
                     exist["fields"] = list(exist_fields.values())
                     
@@ -630,7 +630,7 @@ class OntologyExtractor:
                 existing_fields = []
 
             existing_physical_names = {
-                str(f.get("physical_name") or f.get("name") or "").strip()
+                str(f.get("name") or "").strip()
                 for f in existing_fields
                 if isinstance(f, dict)
             }
@@ -665,7 +665,7 @@ class OntologyExtractor:
         return summary_index
 
     def _resolve_class_source(self, cls: dict) -> str:
-        for key in ("_source_origin", "csv_file", "table_name"):
+        for key in ("_source_origin", "table_name", "table_name"):
             value = str(cls.get(key, "")).strip()
             if value:
                 return value
@@ -678,8 +678,8 @@ class OntologyExtractor:
         primary_key = str(cls.get("primary_key", "")).strip()
         primary_key_parts = {part.strip() for part in primary_key.split(",") if part.strip()}
         return {
-            "name": comment or column_name,
-            "physical_name": column_name,
+            "name_cn": comment or column_name,
+            "name": column_name,
             "type": column_types.get(column_name, "text"),
             "description": comment or "底层数据源字段，模型初始提取遗漏后自动补齐",
             "is_primary_key": column_name in primary_key_parts,
@@ -805,15 +805,15 @@ class OntologyExtractor:
             physical_columns = {str(col) for col in summary.get("columns", [])}
             fields = [
                 f for f in c.get("fields", [])
-                if not physical_columns or f.get("physical_name") in physical_columns
+                if not physical_columns or f.get("name") in physical_columns
             ]
             mapping["classes"][cid] = {
-                "csv_file": origin if origin.endswith(".csv") else "",
+                "table_name": origin if origin.endswith(".csv") else "",
                 "table_name": file_to_table.get(origin, origin.lower()),
-                "primary_key": ",".join([f["physical_name"] for f in fields if f.get("is_primary_key")]),
+                "primary_key": ",".join([f["name"] for f in fields if f.get("is_primary_key")]),
                 "name_cn": c.get("name_cn", ""),
-                "field_map": {f["name"]: f["physical_name"] for f in fields},
-                "field_types": {f["physical_name"]: f["type"] for f in fields},
+                "field_map": {f.get("name_cn") or f["name"]: f["name"] for f in fields},
+                "field_types": {f["name"]: f["type"] for f in fields},
                 "data_source": "csv" if origin.endswith(".csv") else "database",
             }
         with open(out / "schema_mapping.json", "w", encoding="utf-8") as f:

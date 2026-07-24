@@ -800,7 +800,7 @@ class SchemaOptimizer:
         dimension_group_ids = set()
 
         for item in assets.get("classes", []):
-            source = str(item.get("csv_file") or item.get("table_name") or "").strip().lower()
+            source = str(item.get("table_name") or item.get("table_name") or "").strip().lower()
             signature = self._normalized_similarity_text(item.get("name_cn"), item.get("description"))
             duplicate = any(
                 existing_source == source and self._is_highly_similar(existing_signature, signature)
@@ -912,8 +912,8 @@ class SchemaOptimizer:
                 merged_item["fields"] = base.get("fields")
             if not item.get("properties") and base.get("properties"):
                 merged_item["properties"] = base.get("properties")
-            if not item.get("csv_file") and base.get("csv_file"):
-                merged_item["csv_file"] = base.get("csv_file")
+            if not item.get("table_name") and base.get("table_name"):
+                merged_item["table_name"] = base.get("table_name")
             if not item.get("table_name") and base.get("table_name"):
                 merged_item["table_name"] = base.get("table_name")
             class_context[cid] = self._normalize_class_for_validation(merged_item)
@@ -959,14 +959,14 @@ class SchemaOptimizer:
         fields = _json_list(item.get("fields"))
         properties = _json_list(item.get("properties"))
         if not fields and properties:
-            fields = [{"name": field, "physical_name": field, "type": "text"} for field in properties]
-        csv_file = item.get("csv_file", "")
+            fields = [{"name_cn": field, "name": field, "type": "text"} for field in properties]
+        table_name = item.get("table_name", "")
         return {
             **item,
-            "csv_file": csv_file,
-            "table_name": item.get("table_name", "") or (csv_file.replace(".csv", "") if csv_file else item.get("id", "")),
+            "table_name": table_name,
+            "table_name": item.get("table_name", "") or (table_name.replace(".csv", "") if table_name else item.get("id", "")),
             "fields": fields,
-            "properties": properties or [field.get("name") or field.get("physical_name") for field in fields if isinstance(field, dict)],
+            "properties": properties or [field.get("name_cn") or field.get("name") for field in fields if isinstance(field, dict)],
             "primary_key": item.get("primary_key", ""),
         }
 
@@ -974,19 +974,19 @@ class SchemaOptimizer:
         summaries = []
         for item in classes:
             cid = item.get("id", "")
-            csv_file = item.get("csv_file", "")
-            table_name = item.get("table_name", "") or (csv_file.replace(".csv", "") if csv_file else cid)
-            source = csv_file or table_name
+            table_name = item.get("table_name", "")
+            table_name = item.get("table_name", "") or (table_name.replace(".csv", "") if table_name else cid)
+            source = table_name or table_name
             fields = [field for field in item.get("fields", []) if isinstance(field, dict)]
-            columns = [str(field.get("physical_name") or field.get("name") or "").strip() for field in fields]
+            columns = [str(field.get("name") or "").strip() for field in fields]
             columns = [column for column in columns if column]
             summaries.append({
                 "file": source,
                 "columns": columns,
                 "column_types": {
-                    str(field.get("physical_name") or field.get("name") or "").strip(): field.get("type", "text")
+                    str(field.get("name") or "").strip(): field.get("type", "text")
                     for field in fields
-                    if str(field.get("physical_name") or field.get("name") or "").strip()
+                    if str(field.get("name") or "").strip()
                 },
                 "total_rows": -1,
             })
@@ -1086,16 +1086,16 @@ class SchemaOptimizer:
             return False
         values = (
             item.get("name_cn", ""), item.get("description", ""),
-            item.get("primary_key", ""), item.get("csv_file", ""),
+            item.get("primary_key", ""), item.get("table_name", ""),
         )
         if exists:
             conn.execute(
-                "UPDATE schema_classes SET name_cn=?, description=?, primary_key=?, csv_file=?, is_reviewed=FALSE, review_status='pending', updated_at=CURRENT_TIMESTAMP WHERE id=? AND scenario_id=?",
+                "UPDATE schema_classes SET name_cn=?, description=?, primary_key=?, table_name=?, is_reviewed=FALSE, review_status='pending', updated_at=CURRENT_TIMESTAMP WHERE id=? AND scenario_id=?",
                 (*values, cid, sid),
             )
         else:
             conn.execute(
-                "INSERT INTO schema_classes (id, scenario_id, name_cn, description, primary_key, csv_file, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,FALSE,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO schema_classes (id, scenario_id, name_cn, description, primary_key, table_name, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,FALSE,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 (cid, sid, *values),
             )
         return True

@@ -53,6 +53,7 @@ from core.models.models import ChatRequest
 from .node import (
     AnalysisOrganizerTool,
     ClarifyAgent,
+    ConceptMetricPlanner,
     ContextCompressorAgent,
     EntityDisambiguatorAgent,
     GlossaryMatcherAgent,
@@ -85,6 +86,7 @@ class ChatEngineV3:
         self.entity_agent = EntityDisambiguatorAgent()
         self.ontology_agent = OntologyAgent(self.client, self.model_name)
         self.plan_execute_agent = PlanExecuteAgent(self.client, self.model_name)
+        self.concept_metric_planner = ConceptMetricPlanner()
         self.clarify_agent = ClarifyAgent()
         self.analysis_tool = AnalysisOrganizerTool(self.client, self.model_name)
 
@@ -286,15 +288,30 @@ class ChatEngineV3:
             for metric_id in schema_result.get("relevant_metrics", [])
             if isinstance(metric_id, str) and metric_id
         ]
+        state.concept_metric_plan_started_at_ms = int(time.time() * 1000)
+        concept_retrieval = self.concept_metric_planner.build_retrieval_context(
+            state.user_message, engine
+        )
+        state.concept_context = str(concept_retrieval.get("concept_context") or "")
+        state.concept_candidates = list(concept_retrieval.get("relevant_concepts") or [])
+        state.analysis_plan = self.concept_metric_planner.build_analysis_plan(
+            state.user_message,
+            engine,
+            state.metric_candidates,
+            concept_retrieval,
+        )
         state.ontology_context = state.schema_context
 
         logger.info(
-            "Chat planning context ready: session_id=%s glossary=%d schema_context_len=%d metric_context_len=%d",
+            "Chat planning context ready: session_id=%s glossary=%d schema_context_len=%d metric_context_len=%d concept_candidates=%d bundles=%d",
             state.session_id,
             len(glossary_matches),
             len(state.schema_context),
             len(state.metric_context),
+            len(state.concept_candidates),
+            len(state.analysis_plan.get("metric_bundles", [])),
         )
+        state.execution_mode_started_at_ms = int(time.time() * 1000)
         try:
             routing = await self.plan_execute_agent.decide_execution_mode(
                 state.user_message,
@@ -320,8 +337,19 @@ class ChatEngineV3:
                 "matched_rule": "",
             }
         state.execution_mode = "metric_plan_execute" if routing.get("mode") == "plan_execute" else "single_query"
+        state.routing_candidate_class_ids = self._string_list(
+            routing.get("candidate_class_ids")
+        ) or list(schema_result.get("relevant_classes") or [])
         self._emit_execution_mode_routing_event(state, routing)
         if state.execution_mode == "metric_plan_execute":
+            if state.analysis_plan:
+                self._append_metric_plan_step(
+                    state,
+                    "concept_metric_analysis_plan",
+                    "已根据业务 Concept 生成候选分析域、指标组合与分析轴。",
+                    state.analysis_plan,
+                    started_at_ms=state.concept_metric_plan_started_at_ms,
+                )
             logger.info(
                 "Metric Plan-Execute selected: session_id=%s glossary_matches=%d metric_candidates=%d routing=%s",
                 state.session_id,
@@ -341,6 +369,7 @@ class ChatEngineV3:
 
         if not state.metric_plan:
             state.metric_plan_phase = "planning"
+            metric_plan_started_at_ms = int(time.time() * 1000)
             logger.info(
                 "Metric Plan-Execute planning started: session_id=%s glossary_terms=%s candidate_metrics=%s",
                 state.session_id,
@@ -351,12 +380,19 @@ class ChatEngineV3:
                 state.user_message,
                 state.glossary_matches,
                 state.metric_context,
+                [
+                    metric
+                    for metric_id in state.metric_candidates
+                    if (metric := engine.get_metric_info(metric_id))
+                ],
+                state.analysis_plan,
                 session_id=state.session_id,
             )
             accepted = self._accept_metric_subquestions(
                 initial_plan.get("subquestions"),
                 state,
                 allowed_metric_ids=state.metric_candidates,
+                allowed_bundles=state.analysis_plan.get("metric_bundles", []),
             )
             if not accepted:
                 logger.info(
@@ -370,6 +406,7 @@ class ChatEngineV3:
                 "plan_id": f"metric-plan-{shortuuid.random()}",
                 "objective": str(initial_plan.get("objective") or state.user_message),
                 "coverage_requirements": self._string_list(initial_plan.get("coverage_requirements")),
+                "analysis_plan": state.analysis_plan,
             }
             state.metric_subquestions.extend(accepted)
             logger.info(
@@ -379,10 +416,16 @@ class ChatEngineV3:
                 self._json_dumps([item["intent"] for item in accepted]),
                 self._json_dumps(state.metric_plan["coverage_requirements"]),
             )
-            self._append_metric_plan_step(state, "metric_plan", "已基于企业术语与候选指标生成数据证据计划。", {
-                "plan": state.metric_plan,
-                "subquestions": accepted,
-            })
+            self._append_metric_plan_step(
+                state,
+                "metric_plan",
+                "已基于企业术语与候选指标生成数据证据计划。",
+                {
+                    "plan": state.metric_plan,
+                    "subquestions": accepted,
+                },
+                started_at_ms=metric_plan_started_at_ms,
+            )
             return State.METRIC_PLAN_EXECUTE
 
         pending = next((item for item in state.metric_subquestions if item.get("status") == "pending"), None)
@@ -418,6 +461,7 @@ class ChatEngineV3:
         can_expand = state.metric_plan_iteration < METRIC_PLAN_MAX_ITERATIONS and (
             state.metric_query_attempts < METRIC_PLAN_MAX_QUERY_ATTEMPTS
         )
+        metric_plan_started_at_ms = int(time.time() * 1000)
         judgment = await self.plan_execute_agent.judge_metric_evidence(
             state.user_message,
             state.metric_plan,
@@ -449,6 +493,7 @@ class ChatEngineV3:
                 state,
                 limit=2,
                 allowed_metric_ids=state.metric_candidates,
+                allowed_bundles=state.analysis_plan.get("metric_bundles", []),
             )
             if additions:
                 state.metric_plan_iteration += 1
@@ -468,6 +513,7 @@ class ChatEngineV3:
                     "metric_plan",
                     "当前证据不足，已追加补充数据子问题。",
                     {"iteration": state.metric_plan_iteration, "subquestions": additions, "gaps": judgment.get("missing_evidence", [])},
+                    started_at_ms=metric_plan_started_at_ms,
                 )
                 return State.METRIC_PLAN_EXECUTE
 
@@ -508,7 +554,7 @@ class ChatEngineV3:
             state.schema_context,
             state.glossary_matches,
             engine,
-            preferred_metric_ids=state.metric_candidates,
+            candidate_class_ids=state.routing_candidate_class_ids,
             feedback=feedback,
             session_id=state.session_id,
         )
@@ -627,29 +673,54 @@ class ChatEngineV3:
             self._json_dumps(metric_candidates),
         )
 
+        reuse_decision = await self._decide_metric_subquestion_reuse(state, subquestion)
+        reusable_plan = self._reusable_subquestion_by_id(
+            state, reuse_decision.get("reuse_subquestion_id")
+        ) if reuse_decision.get("reuse_scope_and_filters") else None
+
         scope_validation: dict = {}
-        for attempt in range(2):
-            scope_validation = await self.ontology_agent.plan_schema_scope(
-                focused_question,
-                schema_context,
-                state.glossary_matches,
-                engine,
-                preferred_metric_ids=preferred_metric_ids,
-                feedback=str(scope_validation.get("error") or ""),
-                session_id=state.session_id,
-            )
-            if scope_validation.get("valid"):
-                break
+        if reusable_plan:
+            # A completed parent stores the normalized query scope, not the
+            # transient validator envelope. Reconstruct that envelope before
+            # the common validation branch below so reuse does not fail merely
+            # because `query_scope` has no `valid` field.
+            scope_validation = {
+                **reusable_plan["query_scope"],
+                "valid": True,
+                "error": "",
+            }
+        else:
+            for attempt in range(2):
+                scope_validation = await self.ontology_agent.plan_schema_scope(
+                    focused_question,
+                    schema_context,
+                    state.glossary_matches,
+                    engine,
+                    candidate_class_ids=state.routing_candidate_class_ids,
+                    feedback=str(scope_validation.get("error") or ""),
+                    session_id=state.session_id,
+                )
+                if scope_validation.get("valid"):
+                    break
         if not scope_validation.get("valid"):
             subquestion.update(status="failed", error=str(scope_validation.get("error") or "无法确定 Schema 范围"))
             self._append_metric_plan_step(state, "subquestion_scope", "子问题 Schema 范围校验失败。", subquestion)
             return
+        scope_validation = self._align_scope_to_metric_candidates(
+            scope_validation, metric_candidates, engine
+        )
+        if reusable_plan and reuse_decision.get("reuse_metrics"):
+            metric_candidates = list(dict.fromkeys([
+                *self._string_list(reusable_plan["query_plan"].get("metrics")),
+                *metric_candidates,
+            ]))
         logger.info(
-            "Metric subquestion scope validated: session_id=%s subquestion_id=%s target_class=%s join_classes=%s",
+            "Metric subquestion scope validated: session_id=%s subquestion_id=%s target_class=%s join_classes=%s reused_from=%s",
             state.session_id,
             subquestion.get("id"),
             scope_validation["target_class"],
             self._json_dumps(scope_validation["join_classes"]),
+            reusable_plan.get("subquestion_id") if reusable_plan else "",
         )
         self._append_metric_plan_step(
             state,
@@ -677,6 +748,9 @@ class ChatEngineV3:
                 metric_candidates,
                 engine,
                 query_engine,
+                reusable_query_plan=reusable_plan.get("query_plan") if reusable_plan else None,
+                reuse_metrics=bool(reusable_plan and reuse_decision.get("reuse_metrics")),
+                trusted_reusable_filters=reusable_plan.get("locked_filters") if reusable_plan else None,
                 feedback=str(query_validation.get("error") or ""),
                 session_id=state.session_id,
             )
@@ -715,11 +789,12 @@ class ChatEngineV3:
         self._append_metric_plan_step(
             state,
             "subquestion_query_plan",
-            "子问题查询参数已验证。",
+            "子问题查询参数已验证。" if not reusable_plan else "子问题查询参数已验证，并复用了同实体参考参数。",
             {
                 "subquestion_id": subquestion.get("id"),
                 "intent": intent,
                 "query_plan": query_validation["query_plan"],
+                "reused_from_subquestion_id": reusable_plan.get("subquestion_id") if reusable_plan else "",
             },
         )
 
@@ -733,6 +808,8 @@ class ChatEngineV3:
             focused_question,
             state.glossary_matches,
         )
+        if reusable_plan and reusable_plan.get("locked_filters"):
+            arguments["_locked_shared_filters"] = reusable_plan["locked_filters"]
         fingerprint = self._metric_query_fingerprint(arguments)
         if any(item.get("query_fingerprint") == fingerprint for item in state.metric_subquestions if item is not subquestion):
             subquestion.update(status="skipped", error="受控查询参数与已有子问题重复。", query_fingerprint=fingerprint)
@@ -745,6 +822,8 @@ class ChatEngineV3:
             query_plan=query_validation["query_plan"],
             arguments=arguments,
             query_fingerprint=fingerprint,
+            reused_query_plan_from=reusable_plan.get("subquestion_id") if reusable_plan else "",
+            reuse_decision=reuse_decision,
         )
         state.metric_query_attempts += 1
         started_at = int(time.time() * 1000)
@@ -821,11 +900,17 @@ class ChatEngineV3:
         state: AgentState,
         limit: int = METRIC_PLAN_MAX_INITIAL_SUBQUESTIONS,
         allowed_metric_ids: list[str] | None = None,
+        allowed_bundles: list[dict] | None = None,
     ) -> list[dict]:
         if not isinstance(raw_subquestions, list):
             return []
         accepted = []
         allowed_metrics = set(allowed_metric_ids or [])
+        bundle_by_id = {
+            str(bundle.get("id")): bundle
+            for bundle in allowed_bundles or []
+            if isinstance(bundle, dict) and bundle.get("id")
+        }
         known_intents = {str(item.get("intent") or "").strip().lower() for item in state.metric_subquestions}
         for index, raw in enumerate(raw_subquestions):
             if len(accepted) >= limit or not isinstance(raw, dict):
@@ -841,11 +926,22 @@ class ChatEngineV3:
                 for metric_id in self._string_list(raw.get("metric_ids"))
                 if not allowed_metrics or metric_id in allowed_metrics
             ]
+            metric_bundle_ids = [
+                bundle_id
+                for bundle_id in self._string_list(raw.get("metric_bundle_ids"))
+                if bundle_id in bundle_by_id
+            ]
+            for bundle_id in metric_bundle_ids:
+                for metric_id in bundle_by_id[bundle_id].get("metric_ids", []):
+                    if not allowed_metrics or metric_id in allowed_metrics:
+                        metric_ids.append(metric_id)
             accepted.append(
                 {
                     "id": subquestion_id,
                     "intent": intent,
                     "metric_ids": list(dict.fromkeys(metric_ids)),
+                    "metric_bundle_ids": list(dict.fromkeys(metric_bundle_ids)),
+                    "analysis_role": str(raw.get("analysis_role") or ""),
                     "expected_evidence": str(raw.get("expected_evidence") or ""),
                     "priority": int(raw.get("priority") or index + 1),
                     "iteration": state.metric_plan_iteration,
@@ -867,6 +963,138 @@ class ChatEngineV3:
             default=str,
         )
 
+    async def _decide_metric_subquestion_reuse(
+        self, state: AgentState, subquestion: dict
+    ) -> dict:
+        """Ask the LLM to select a semantic parent before planning a later subquestion."""
+        candidates = self._reusable_subquestion_candidates(state, subquestion)
+        if not candidates:
+            return {}
+        try:
+            decision = await self.plan_execute_agent.decide_subquestion_reuse(
+                state.user_message,
+                str(subquestion.get("intent") or ""),
+                candidates,
+                session_id=state.session_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Subquestion reuse decision failed; using independent plan: session_id=%s subquestion_id=%s error=%s",
+                state.session_id, subquestion.get("id"), str(exc),
+            )
+            return {}
+        valid_ids = {str(item["id"]) for item in candidates}
+        if decision.get("reuse_subquestion_id") not in valid_ids:
+            return {}
+        return decision
+
+    @staticmethod
+    def _reusable_subquestion_candidates(state: AgentState, current_subquestion: dict) -> list[dict]:
+        candidates = []
+        for previous in state.metric_subquestions:
+            if previous is current_subquestion or previous.get("status") != "completed":
+                continue
+            arguments = previous.get("arguments")
+            query_scope = previous.get("query_scope")
+            query_plan = previous.get("query_plan")
+            if not isinstance(arguments, dict) or not isinstance(query_scope, dict) or not isinstance(query_plan, dict):
+                continue
+            candidates.append({
+                "id": str(previous.get("id") or ""),
+                "intent": str(previous.get("intent") or ""),
+                "target_class": query_scope.get("target_class"),
+                "join_classes": query_scope.get("join_classes") or [],
+                "metrics": query_plan.get("metrics") or [],
+                "executed_filters": arguments.get("filters") or [],
+            })
+        return candidates[-3:]
+
+    @classmethod
+    def _reusable_subquestion_by_id(cls, state: AgentState, subquestion_id: str) -> dict | None:
+        for previous in state.metric_subquestions:
+            if str(previous.get("id") or "") != str(subquestion_id or ""):
+                continue
+            if previous.get("status") != "completed":
+                return None
+            arguments = previous.get("arguments")
+            query_scope = previous.get("query_scope")
+            query_plan = previous.get("query_plan")
+            if not isinstance(arguments, dict) or not isinstance(query_scope, dict) or not isinstance(query_plan, dict):
+                return None
+            locked_filters = cls._string_filter_dicts(arguments.get("filters"))
+            return {
+                "subquestion_id": str(previous.get("id") or ""),
+                "query_scope": query_scope,
+                # Query planning originally stores model-proposed filters. Replace
+                # them with the executor-resolved values so the reusable base and
+                # the trusted-filter exemption describe the same SQL semantics.
+                "query_plan": {**query_plan, "filters": locked_filters},
+                "locked_filters": locked_filters,
+            }
+        return None
+
+    @staticmethod
+    def _find_reusable_subquestion_plan(
+        state: AgentState,
+        current_subquestion: dict,
+        query_scope: dict,
+        metric_candidates: list[str],
+    ) -> dict | None:
+        """Find a compatible validated plan to seed a later subquestion.
+
+        This is intentionally a planning hint rather than a final argument cache.
+        The current subquestion still gets a new LLM plan, ontology validation and
+        deterministic filter alignment, so a child condition such as ``T40`` can
+        safely extend the parent query instead of inheriting it unchanged.
+        """
+        target_class = str(query_scope.get("target_class") or "")
+        join_classes = sorted(str(value) for value in query_scope.get("join_classes") or [])
+        current_metrics = set(metric_candidates) | set(
+            ChatEngineV3._string_list(current_subquestion.get("metric_ids"))
+        )
+        if not target_class or not current_metrics:
+            return None
+
+        for previous in reversed(state.metric_subquestions):
+            if previous is current_subquestion or previous.get("status") not in {
+                "completed", "executing", "needs_clarification",
+            }:
+                continue
+            previous_scope = previous.get("query_scope")
+            previous_plan = previous.get("query_plan")
+            if not isinstance(previous_scope, dict) or not isinstance(previous_plan, dict):
+                continue
+            if str(previous_scope.get("target_class") or "") != target_class:
+                continue
+            previous_joins = sorted(
+                str(value) for value in previous_scope.get("join_classes") or []
+            )
+            if previous_joins != join_classes:
+                continue
+            previous_metrics = set(ChatEngineV3._string_list(previous.get("metric_ids")))
+            previous_metrics.update(ChatEngineV3._string_list(previous_plan.get("metrics")))
+            if current_metrics.isdisjoint(previous_metrics):
+                continue
+            return {
+                "subquestion_id": str(previous.get("id") or ""),
+                "query_plan": previous_plan,
+                "locked_filters": ChatEngineV3._string_filter_dicts(
+                    previous.get("arguments", {}).get("filters")
+                    if isinstance(previous.get("arguments"), dict)
+                    else previous_plan.get("filters")
+                ),
+            }
+        return None
+
+    @staticmethod
+    def _string_filter_dicts(value) -> list[dict]:
+        """Copy only complete parent filters for the child shared-parameter contract."""
+        return [
+            dict(item)
+            for item in value or []
+            if isinstance(item, dict) and item.get("field") and item.get("operator")
+        ]
+
     def _build_metric_evidence_packet(self, state: AgentState) -> list[dict]:
         evidence = []
         for item in state.metric_subquestions:
@@ -886,39 +1114,51 @@ class ChatEngineV3:
             )
         return evidence
 
-    def _append_metric_plan_step(self, state: AgentState, name: str, description: str, result: dict) -> None:
+    def _append_metric_plan_step(
+        self,
+        state: AgentState,
+        name: str,
+        description: str,
+        result: dict,
+        started_at_ms: int | None = None,
+    ) -> None:
         now_ms = int(time.time() * 1000)
         arguments = {
             "plan_id": state.metric_plan.get("plan_id"),
             "iteration": state.metric_plan_iteration,
             "execution_mode": state.execution_mode,
         }
-        state.all_tool_results.append(
-            {
-                "name": name,
-                "description": description,
-                "arguments": arguments,
-                "result": self._make_json_safe(result),
-                "started_at": now_ms,
-                "planning_finished_at": now_ms,
-                "planning_duration_ms": 0,
-                "execution_started_at": now_ms,
-                "execution_duration_ms": 0,
-                "finished_at": now_ms,
-                "duration_ms": 0,
-            }
-        )
-        state.sse_events.append(
-            {
-                "type": "tools",
-                "tool_name": name,
-                "description": description,
-                "begin_time": self._format_event_time(now_ms),
-                "payload": result,
-                "duration": 0,
-                "step": self._build_persisted_tool_steps(state.all_tool_results)[-1],
-            }
-        )
+        record = {
+            "name": name,
+            "description": description,
+            "arguments": arguments,
+            "result": self._make_json_safe(result),
+        }
+        if started_at_ms is not None:
+            duration_ms = max(0, now_ms - started_at_ms)
+            record.update(
+                {
+                    "started_at": started_at_ms,
+                    "planning_finished_at": now_ms,
+                    "planning_duration_ms": duration_ms,
+                    "execution_started_at": now_ms,
+                    "execution_duration_ms": 0,
+                    "finished_at": now_ms,
+                    "duration_ms": duration_ms,
+                }
+            )
+        state.all_tool_results.append(record)
+        event = {
+            "type": "tools",
+            "tool_name": name,
+            "description": description,
+            "begin_time": self._format_event_time(started_at_ms or now_ms),
+            "payload": result,
+            "step": self._build_persisted_tool_steps(state.all_tool_results)[-1],
+        }
+        if started_at_ms is not None:
+            event["duration"] = round(max(0, now_ms - started_at_ms) / 1000, 3)
+        state.sse_events.append(event)
 
     async def _handle_llm_call(self, state: AgentState) -> State:
         """调用 LLM"""
@@ -1607,6 +1847,8 @@ class ChatEngineV3:
     def _emit_execution_mode_routing_event(self, state: AgentState, routing: dict) -> None:
         """Publish exactly one execution-mode decision event for every request."""
         now_ms = int(time.time() * 1000)
+        started_at = state.execution_mode_started_at_ms or now_ms
+        duration_ms = max(0, now_ms - started_at)
         is_plan_execute = state.execution_mode == "metric_plan_execute"
         description = (
             "已识别为多任务，进入 Plan-Execute 证据拆解。"
@@ -1630,13 +1872,13 @@ class ChatEngineV3:
                 "description": description,
                 "arguments": {"user_question": state.user_message},
                 "result": payload,
-                "started_at": now_ms,
+                "started_at": started_at,
                 "planning_finished_at": now_ms,
-                "planning_duration_ms": 0,
+                "planning_duration_ms": duration_ms,
                 "execution_started_at": now_ms,
                 "execution_duration_ms": 0,
                 "finished_at": now_ms,
-                "duration_ms": 0,
+                "duration_ms": duration_ms,
             }
         )
         state.sse_events.append(
@@ -1644,9 +1886,9 @@ class ChatEngineV3:
                 "type": "tools",
                 "tool_name": "任务路由",
                 "description": description,
-                "begin_time": self._format_event_time(now_ms),
+                "begin_time": self._format_event_time(started_at),
                 "payload": payload,
-                "duration": 0,
+                "duration": round(duration_ms / 1000, 3),
                 "status": "completed",
                 "stage": "execution_mode_routing",
                 "step": self._build_persisted_tool_steps(state.all_tool_results)[-1],
@@ -2134,7 +2376,7 @@ class ChatEngineV3:
 
     @staticmethod
     def _compact_data_sources(data_sources: list, include_description: bool = False) -> list[dict]:
-        keys = ["class_id", "name_cn", "table_name", "table_alias", "csv_file", "data_source"]
+        keys = ["class_id", "name_cn", "table_name", "table_alias", "table_name", "data_source"]
         if include_description:
             keys.append("description")
 

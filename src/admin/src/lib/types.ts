@@ -20,7 +20,7 @@ export interface SchemaClass {
   description: string;
   properties: string[];
   fields: SchemaField[];
-  csv_file: string;
+  table_name: string;
   primary_key: string;
   is_reviewed: boolean;
   review_status?: ReviewStatus;
@@ -28,7 +28,7 @@ export interface SchemaClass {
 
 export interface SchemaField {
   name: string;
-  physical_name: string;
+  name_cn: string;
   type: "text" | "numeric" | "date" | "boolean";
   description: string;
   is_primary_key: boolean;

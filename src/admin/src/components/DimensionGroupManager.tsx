@@ -639,7 +639,7 @@ export default function DimensionGroupManager() {
                     {(availableFields.get(mapping.class_id) || []).map(
                       (field) => (
                         <option key={field.name} value={field.name}>
-                          {field.name} ({field.physical_name})
+                          {field.name_cn || field.name} ({field.name})
                         </option>
                       ),
                     )}

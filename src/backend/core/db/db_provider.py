@@ -280,6 +280,18 @@ def _parse_mysql_dsn(dsn):
 
 
 def _migrate_db(conn, dialect):
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS metric_concept_bindings (
+            metric_id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            concept_id TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'outcome',
+            priority INTEGER DEFAULT 0,
+            is_primary INTEGER DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            PRIMARY KEY (metric_id, scenario_id, concept_id)
+        )"""
+    )
     if dialect == "sqlite3":
         migrations = [
             ("SELECT required_dimensions FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN required_dimensions TEXT DEFAULT '[]'"),
@@ -291,7 +303,7 @@ def _migrate_db(conn, dialect):
             ("SELECT is_reviewed FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
             ("SELECT review_status FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN review_status TEXT DEFAULT 'pending'"),
             ("SELECT fields FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN fields TEXT DEFAULT '[]'"),
-            ("SELECT csv_file FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN csv_file TEXT DEFAULT ''"),
+            ("SELECT table_name FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN table_name TEXT DEFAULT ''"),
             ("SELECT primary_key FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN primary_key TEXT DEFAULT ''"),
             ("SELECT is_reviewed FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
             ("SELECT review_status FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN review_status TEXT DEFAULT 'pending'"),
@@ -350,7 +362,7 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS fields TEXT DEFAULT '[]'",
-            "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS csv_file TEXT DEFAULT ''",
+            "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS table_name TEXT DEFAULT ''",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS primary_key TEXT DEFAULT ''",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
@@ -390,7 +402,7 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS fields TEXT DEFAULT '[]'",
-            "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS csv_file TEXT DEFAULT ''",
+            "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS table_name TEXT DEFAULT ''",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS primary_key TEXT DEFAULT ''",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
@@ -448,7 +460,7 @@ def _schema_sql(dialect):
             description TEXT DEFAULT '',
             properties TEXT DEFAULT '[]',
             fields TEXT DEFAULT '[]',
-            csv_file TEXT DEFAULT '',
+            table_name TEXT DEFAULT '',
             primary_key TEXT DEFAULT '',
             is_reviewed INTEGER DEFAULT 0,
             review_status TEXT DEFAULT 'pending',
@@ -598,6 +610,16 @@ def _schema_sql(dialect):
             scenario_id TEXT NOT NULL,
             group_id TEXT NOT NULL,
             PRIMARY KEY (metric_id, scenario_id, group_id)
+        );
+        CREATE TABLE IF NOT EXISTS metric_concept_bindings (
+            metric_id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            concept_id TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'outcome',
+            priority INTEGER DEFAULT 0,
+            is_primary INTEGER DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            PRIMARY KEY (metric_id, scenario_id, concept_id)
         );
         CREATE TABLE IF NOT EXISTS chart_rules (
             id {serial_pk},

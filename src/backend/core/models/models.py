@@ -50,7 +50,7 @@ class SchemaClassEdit(BaseModel):
     description: str = ""
     properties: list[str] = []
     fields: list[dict] = []
-    csv_file: str = ""
+    table_name: str = ""
     primary_key: str = ""
     # 管理端使用 -1 / 0 / 1 表示不通过、待审核、已通过；兼容旧客户端的 bool。
     is_reviewed: int | bool = 0
@@ -193,6 +193,14 @@ class ConceptUpdate(BaseModel):
     sort_order: int | None = None
     is_reviewed: bool | None = None
     review_status: ReviewStatus | None = None
+
+
+class MetricConceptBinding(BaseModel):
+    concept_id: str
+    role: str = "outcome"
+    priority: int = 0
+    is_primary: bool = False
+    status: str = "pending"
 
 
 # ============================================================

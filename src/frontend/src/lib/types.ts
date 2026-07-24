@@ -186,6 +186,7 @@ export interface ToolStep {
 
 export interface ToolStepsPanelProps {
   steps: ToolStep[];
+  totalDurationMs?: number;
 }
 
 
@@ -198,6 +199,7 @@ export interface Message {
   answerDatasets?: AnswerDataset[];
   isLoading?: boolean; // 代表该消息正在生成/思考中
   steps?: ToolStep[];
+  totalDurationMs?: number;
   clarification?: ClarificationData;
   drilldown?: DrilldownData;
   actionConfirm?: ActionConfirmData;

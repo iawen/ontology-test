@@ -61,7 +61,7 @@ const tooltipText = (value: unknown, fallback = "未设置") =>
 const genFieldUid = () => `f_${crypto.randomUUID()}`;
 
 type SortDirection = "asc" | "desc";
-type ClassSortKey = "id" | "name_cn" | "csv_file" | "is_reviewed" | "fields";
+type ClassSortKey = "id" | "name_cn" | "table_name" | "is_reviewed" | "fields";
 type RelationshipSortKey =
   | "source"
   | "target"
@@ -73,7 +73,7 @@ type RelationshipSortKey =
 const CLASS_SORT_COLUMNS: Array<{ key: ClassSortKey; label: string }> = [
   { key: "id", label: "ID" },
   { key: "name_cn", label: "中文名" },
-  { key: "csv_file", label: "数据表" },
+  { key: "table_name", label: "数据表" },
   { key: "is_reviewed", label: "审核" },
   { key: "fields", label: "字段" },
 ];
@@ -125,7 +125,7 @@ function relationshipSortValue(
 const emptyField = (): SchemaField => ({
   _uid: genFieldUid(),
   name: "",
-  physical_name: "",
+  name_cn: "",
   type: "text",
   description: "",
   is_primary_key: false,
@@ -133,15 +133,15 @@ const emptyField = (): SchemaField => ({
 });
 
 const schemaFieldOptionValue = (field: SchemaField) =>
-  field.physical_name || field.name || "";
+  field.name || "";
 
 const schemaFieldOptionLabel = (field: SchemaField) => {
+  const nameCn = field.name_cn || "";
   const name = field.name || "";
-  const physicalName = field.physical_name || "";
-  if (name && physicalName && name !== physicalName) {
-    return `${name} (${physicalName})`;
+  if (nameCn && name && nameCn !== name) {
+    return `${nameCn} (${name})`;
   }
-  return name || physicalName || "未命名字段";
+  return nameCn || name || "未命名字段";
 };
 
 export default function SchemaManager() {
@@ -195,7 +195,7 @@ export default function SchemaManager() {
     const fields = [...(editClass?.fields || [])];
     fields[index] = { ...fields[index], ...patch } as SchemaField;
     const properties = fields
-      .map((field) => field.name || field.physical_name)
+      .map((field) => field.name_cn || field.name)
       .filter(Boolean);
     setEditClass({ ...editClass!, fields, properties });
   };
@@ -210,7 +210,7 @@ export default function SchemaManager() {
   const removeEditField = (index: number) => {
     const fields = (editClass?.fields || []).filter((_, i) => i !== index);
     const properties = fields
-      .map((field) => field.name || field.physical_name)
+      .map((field) => field.name_cn || field.name)
       .filter(Boolean);
     setEditClass({ ...editClass!, fields, properties });
   };
@@ -367,7 +367,7 @@ export default function SchemaManager() {
     }
     const isEdit = originalClassId !== null;
     const fields = (editClass.fields || [])
-      .filter((field) => field.name || field.physical_name)
+      .filter((field) => field.name_cn || field.name)
       .map((field) => {
         const rest = { ...field };
         delete rest._uid;
@@ -379,7 +379,7 @@ export default function SchemaManager() {
       properties: editClass.properties?.length
         ? editClass.properties
         : fields
-            .map((field) => field.name || field.physical_name)
+            .map((field) => field.name_cn || field.name)
             .filter(Boolean),
     };
     try {
@@ -494,14 +494,14 @@ export default function SchemaManager() {
       const fieldText = (schemaClass.fields || [])
         .map(
           (field) =>
-            `${field.name} ${field.physical_name} ${field.description}`,
+            `${field.name_cn} ${field.name} ${field.description}`,
         )
         .join(" ");
       return [
         schemaClass.id,
         schemaClass.name_cn,
         schemaClass.description,
-        schemaClass.csv_file,
+        schemaClass.table_name,
         schemaClass.primary_key,
         reviewStatusLabel(schemaClass.is_reviewed),
         fieldText,
@@ -642,7 +642,7 @@ export default function SchemaManager() {
             <div style="color:#cbd5e1;margin-bottom:8px">${tooltipText(schemaClass.id)}</div>
             <div style="color:#e2e8f0;line-height:1.7">字段: ${fieldCount} · 关系: ${connectionCount}</div>
             <div style="color:#94a3b8;line-height:1.7">主键: ${tooltipText(schemaClass.primary_key)}</div>
-            <div style="color:#94a3b8;line-height:1.7">文件: ${tooltipText(schemaClass.csv_file, "未绑定")}</div>
+            <div style="color:#94a3b8;line-height:1.7">文件: ${tooltipText(schemaClass.table_name, "未绑定")}</div>
             <div style="color:${reviewTooltipColor(schemaClass.is_reviewed)};line-height:1.7">${reviewStatusLabel(schemaClass.is_reviewed)}</div>
           </div>
         `;
@@ -827,7 +827,7 @@ export default function SchemaManager() {
                 scenario_id: activeScenario,
                 properties: [],
                 fields: [],
-                csv_file: "",
+                table_name: "",
                 primary_key: "",
                 is_reviewed: 0,
               });
@@ -1014,9 +1014,9 @@ export default function SchemaManager() {
                       </td>
                       <td
                         className="whitespace-normal break-words text-xs leading-relaxed"
-                        title={c.csv_file}
+                        title={c.table_name}
                       >
-                        {c.csv_file}
+                        {c.table_name}
                       </td>
                       <td>
                         <span
@@ -1222,9 +1222,9 @@ export default function SchemaManager() {
                 数据文件
               </label>
               <input
-                value={editClass?.csv_file || ""}
+                value={editClass?.table_name || ""}
                 onChange={(e) =>
-                  setEditClass({ ...editClass!, csv_file: e.target.value })
+                  setEditClass({ ...editClass!, table_name: e.target.value })
                 }
                 className="w-full"
                 placeholder="sale.csv"
@@ -1317,9 +1317,9 @@ export default function SchemaManager() {
                       <tr key={field._uid ?? index}>
                         <td>
                           <input
-                            value={field.name || ""}
+                            value={field.name_cn || ""}
                             onChange={(e) =>
-                              updateEditField(index, { name: e.target.value })
+                              updateEditField(index, { name_cn: e.target.value })
                             }
                             className="w-full text-xs"
                             placeholder="销售金额"
@@ -1327,10 +1327,10 @@ export default function SchemaManager() {
                         </td>
                         <td>
                           <input
-                            value={field.physical_name || ""}
+                            value={field.name || ""}
                             onChange={(e) =>
                               updateEditField(index, {
-                                physical_name: e.target.value,
+                                name: e.target.value,
                               })
                             }
                             className="w-full font-mono text-xs"

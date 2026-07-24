@@ -366,11 +366,11 @@ def _sync_schema_db(scenario_id: str):
             continue
         fields = c.get("fields", [])
         properties = c.get("properties") or [
-            f.get("name") or f.get("physical_name") for f in fields if isinstance(f, dict) and (f.get("name") or f.get("physical_name"))
+            f.get("name_cn") or f.get("name") for f in fields if isinstance(f, dict) and (f.get("name_cn") or f.get("name"))
         ]
         classes.append((
             c["id"], scenario_id, c.get("name_cn", c["id"]), c.get("description", ""),
-            _json_text(properties), c.get("primary_key", ""), c.get("csv_file", ""),
+            _json_text(properties), c.get("primary_key", ""), c.get("table_name", ""),
             _json_text(fields), _reviewed_value(c.get("is_reviewed", False)),
         ))
 
@@ -469,13 +469,13 @@ def _sync_schema_db(scenario_id: str):
         if class_id in existing_classes:
             conn.execute(
                 """UPDATE schema_classes
-                   SET name_cn=?, description=?, properties=?, primary_key=?, csv_file=?, fields=?, is_reviewed=?, review_status='pending', updated_at=CURRENT_TIMESTAMP
+                   SET name_cn=?, description=?, properties=?, primary_key=?, table_name=?, fields=?, is_reviewed=?, review_status='pending', updated_at=CURRENT_TIMESTAMP
                    WHERE id=? AND scenario_id=? AND is_reviewed IS NOT TRUE AND COALESCE(review_status, 'pending') NOT IN ('approved','rejected')""",
                 (item[2], item[3], item[4], item[5], item[6], item[7], item[8], class_id, scenario_id),
             )
         else:
             conn.execute(
-                "INSERT INTO schema_classes (id, scenario_id, name_cn, description, properties, primary_key, csv_file, fields, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO schema_classes (id, scenario_id, name_cn, description, properties, primary_key, table_name, fields, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 item,
             )
 

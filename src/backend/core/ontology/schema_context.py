@@ -57,9 +57,10 @@ def _compact_fields(fields_value: Any, limit: int) -> list[dict]:
     for field in fields[:limit]:
         if not isinstance(field, dict):
             continue
+        is_legacy_field = bool(field.get("physical_name"))
         compacted.append({
-            "name": field.get("name") or field.get("physical_name") or "",
-            "physical_name": field.get("physical_name") or field.get("name") or "",
+            "name_cn": field.get("name") if is_legacy_field else field.get("name_cn") or field.get("name") or "",
+            "name": field.get("physical_name") if is_legacy_field else field.get("name") or "",
             "type": field.get("type", "text"),
         })
     return compacted
@@ -91,7 +92,7 @@ def load_schema_reference_context(
     conn = get_db()
     try:
         class_rows = [_row_to_dict(row) for row in conn.execute(
-                """SELECT id, name_cn, description, primary_key, csv_file, fields, is_reviewed, review_status
+                """SELECT id, name_cn, description, primary_key, table_name, fields, is_reviewed, review_status
                FROM schema_classes WHERE scenario_id=?
                ORDER BY is_reviewed DESC, updated_at DESC, id""",
             (scenario_id,),
@@ -190,7 +191,7 @@ def _compact_class(row: dict, limits: dict) -> dict:
         "name_cn": row.get("name_cn", ""),
         "description": _compact_text(row.get("description", "")),
         "primary_key": row.get("primary_key", ""),
-        "csv_file": row.get("csv_file", ""),
+        "table_name": row.get("table_name", ""),
         "fields": _compact_fields(row.get("fields"), limits["fields_per_class"]),
     }
 

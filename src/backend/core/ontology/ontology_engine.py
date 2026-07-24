@@ -92,6 +92,11 @@ class OntologyEngine:
                 metric_binding_rows = conn.execute(
                     "SELECT metric_id, group_id FROM metric_dimension_bindings WHERE scenario_id=? ORDER BY metric_id, group_id", (scenario_id,)
                 ).fetchall()
+                metric_concept_binding_rows = conn.execute(
+                    """SELECT metric_id, concept_id, role, priority, is_primary, status
+                       FROM metric_concept_bindings WHERE scenario_id=? ORDER BY metric_id, priority, concept_id""",
+                    (scenario_id,),
+                ).fetchall()
             finally:
                 conn.close()
         except Exception:
@@ -110,21 +115,30 @@ class OntologyEngine:
             for field in fields:
                 if not isinstance(field, dict):
                     continue
-                logical_name = str(field.get("name") or field.get("physical_name") or "").strip()
-                physical_name = str(field.get("physical_name") or field.get("name") or "").strip()
+                # New rows use {name_cn: logical, name: physical}; existing
+                # rows remain {name: logical, physical_name: physical} until
+                # the database migration has been run.
+                is_legacy_field = bool(field.get("physical_name"))
+                physical_name = str(
+                    field.get("physical_name") if is_legacy_field else field.get("name")
+                    or ""
+                ).strip()
+                logical_name = str(
+                    field.get("name") if is_legacy_field else field.get("name_cn") or physical_name
+                ).strip()
                 if not logical_name or not physical_name:
                     continue
                 normalized = {
                     **field,
-                    "name": logical_name,
-                    "physical_name": physical_name,
+                    "name_cn": logical_name,
+                    "name": physical_name,
                     "type": str(field.get("type") or "text"),
                 }
                 normalized_fields.append(normalized)
                 field_map[logical_name] = physical_name
                 field_types[physical_name] = normalized["type"]
             if not properties:
-                properties = [field["name"] for field in normalized_fields]
+                properties = [field["name_cn"] for field in normalized_fields]
             review_status = self._review_status(item)
             classes.append(
                 {
@@ -133,21 +147,24 @@ class OntologyEngine:
                     "description": item.get("description", ""),
                     "properties": properties,
                     "primary_key": item.get("primary_key", ""),
-                    "csv_file": item.get("csv_file", ""),
+                    "table_name": item.get("table_name", ""),
                     "fields": normalized_fields,
                     "is_reviewed": item.get("is_reviewed", 0),
                     "review_status": review_status,
                 }
             )
-            csv_file = str(item.get("csv_file") or "")
+            table_name = str(item.get("table_name") or "")
             mapping_classes[str(item.get("id") or "")] = {
-                "csv_file": csv_file,
-                "table_name": csv_file.removesuffix(".csv") if csv_file else item.get("id", ""),
+                # `table_name` in schema_classes is the authoritative source
+                # identifier. For CSV-backed classes it includes the .csv suffix;
+                # retain it separately because SQLite uses the suffix-free name.
+                "source_file": table_name if table_name.lower().endswith(".csv") else "",
+                "table_name": table_name.removesuffix(".csv") if table_name else item.get("id", ""),
                 "primary_key": item.get("primary_key", ""),
                 "name_cn": item.get("name_cn", ""),
                 "field_map": field_map,
                 "field_types": field_types,
-                "data_source": "csv" if csv_file.endswith(".csv") else "database",
+                "data_source": "csv" if table_name.endswith(".csv") else "database",
                 "is_reviewed": item.get("is_reviewed", 0),
                 "review_status": review_status,
             }
@@ -174,6 +191,19 @@ class OntologyEngine:
         metric_group_ids: dict[str, list[str]] = {}
         for binding in metric_binding_rows:
             metric_group_ids.setdefault(str(binding["metric_id"]), []).append(str(binding["group_id"]))
+        metric_concept_bindings: dict[str, list[dict]] = {}
+        for binding in metric_concept_binding_rows:
+            item = dict(binding)
+            if str(item.get("status") or "pending") != "approved":
+                continue
+            metric_concept_bindings.setdefault(str(item["metric_id"]), []).append(
+                {
+                    "concept_id": str(item["concept_id"]),
+                    "role": str(item.get("role") or "outcome"),
+                    "priority": int(item.get("priority") or 0),
+                    "is_primary": bool(item.get("is_primary")),
+                }
+            )
 
         metrics = []
         for row in metric_rows:
@@ -190,6 +220,7 @@ class OntologyEngine:
                     "dimensions": self._json_list(item.get("dimensions")),
                     "required_dimensions": self._json_list(item.get("required_dimensions")),
                     "dimension_group_ids": metric_group_ids.get(str(item.get("id") or ""), []),
+                    "concept_bindings": metric_concept_bindings.get(str(item.get("id") or ""), []),
                     "chart_type": item.get("chart_type") or "bar",
                     "sort_order": item.get("sort_order") or 0,
                     "is_reviewed": item.get("is_reviewed", 0),
@@ -273,7 +304,10 @@ class OntologyEngine:
     def _database_concept(item: dict) -> dict:
         return {
             key: item.get(key, "")
-            for key in ("id", "name", "description", "parent_id", "level", "concept_type", "related_class", "sort_order")
+            for key in (
+                "id", "name", "description", "parent_id", "level", "concept_type",
+                "related_class", "sort_order", "is_reviewed", "review_status",
+            )
         }
 
     def _filter_rejected_assets(self) -> None:
@@ -368,12 +402,12 @@ class OntologyEngine:
         return self.classes.get(class_id, {})
 
     def get_table_name(self, class_id: str) -> str:
-        """获取 class 对应的物理表名"""
+        """获取 class 对应的标准化物理表名。"""
         info = self.classes.get(class_id, {})
-        table_name = info.get("table_name") or info.get("csv_file") or ""
+        table_name = str(info.get("table_name") or "").strip()
         if not table_name:
             raise ValueError(f"class {class_id} 未配置固定物理表映射，请检查 schema_mapping.json")
-        return table_name.replace(".csv", "") if table_name.endswith(".csv") else table_name
+        return table_name
 
     def get_field_map(self, class_id: str) -> dict:
         """获取 class 的字段映射（逻辑名 -> 物理列名）"""
@@ -408,10 +442,16 @@ class OntologyEngine:
         info = self.classes.get(class_id, {})
         return info.get("primary_key", "")
 
-    def get_csv_file(self, class_id: str) -> str:
-        """获取 class 对应的 CSV 文件名"""
+    def get_source_file(self, class_id: str) -> str:
+        """Return the CSV source filename for an in-memory class, when present."""
         info = self.classes.get(class_id, {})
-        return info.get("csv_file", "")
+        source_file = str(info.get("source_file") or "").strip()
+        if source_file:
+            return source_file
+        # Compatibility for legacy mappings that stored a CSV filename directly
+        # under `table_name`.
+        table_name = str(info.get("table_name") or "").strip()
+        return table_name if table_name.lower().endswith(".csv") else ""
 
     def get_data_source(self, class_id: str) -> str:
         """获取 class 的数据源类型"""
@@ -523,6 +563,22 @@ class OntologyEngine:
 
     def list_metrics(self) -> list:
         return self.metrics
+
+    def list_concepts(self) -> list[dict]:
+        """Return Concepts that have not been explicitly rejected."""
+        return [
+            concept
+            for concept in self.schema.get("concepts", [])
+            if self._review_status(concept) != "rejected"
+        ]
+
+    def list_dimension_groups(self) -> list[dict]:
+        """Return runtime-available governed DimensionGroups."""
+        return [
+            group
+            for group in self.schema.get("dimension_groups", [])
+            if str(group.get("status") or "draft") == "approved"
+        ]
 
     def list_relationships(self) -> list:
         return self.relationships

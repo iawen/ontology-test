@@ -72,12 +72,18 @@ class AgentState:
     schema_context: str = ""
     metric_context: str = ""
     metric_candidates: list[str] = field(default_factory=list)
+    routing_candidate_class_ids: list[str] = field(default_factory=list)
+    concept_context: str = ""
+    concept_candidates: list[dict] = field(default_factory=list)
+    analysis_plan: dict = field(default_factory=dict)
+    concept_metric_plan_started_at_ms: int | None = None
     query_scope: dict = field(default_factory=dict)
     query_plan: dict = field(default_factory=dict)
     scope_validation: dict = field(default_factory=dict)
     plan_validation: dict = field(default_factory=dict)
     planning_attempts: dict[str, int] = field(default_factory=dict)
     ontology_planning_started_at_ms: int | None = None
+    execution_mode_started_at_ms: int | None = None
     planned_query_args: dict | None = None
     query_executed: bool = False
     clarification: dict | None = None
@@ -136,6 +142,8 @@ class AgentState:
             "scope_validation": self.scope_validation,
             "plan_validation": self.plan_validation,
             "execution_mode": self.execution_mode,
+            "routing_candidate_class_ids": self.routing_candidate_class_ids,
+            "analysis_plan": self.analysis_plan,
             "metric_plan_iteration": self.metric_plan_iteration,
             "metric_plan_phase": self.metric_plan_phase,
             "metric_subquestions_count": len(self.metric_subquestions),

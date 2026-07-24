@@ -1019,7 +1019,7 @@ export default function MetricManager() {
                         </select>
                         <select value={input.field} disabled={!inputClass} onChange={(event) => updateParallelInput(outputIndex, inputIndex, { field: event.target.value })}>
                           <option value="">选择字段</option>
-                          {(inputClass?.fields || []).map((field) => <option key={field.physical_name || field.name} value={field.physical_name || field.name}>{field.name}（{field.physical_name}）</option>)}
+                          {(inputClass?.fields || []).map((field) => <option key={field.name} value={field.name}>{field.name_cn || field.name}（{field.name}）</option>)}
                         </select>
                         <select value={input.aggregation} onChange={(event) => updateParallelInput(outputIndex, inputIndex, { aggregation: event.target.value as MetricInput["aggregation"] })}>
                           <option value="SUM">求和</option><option value="AVG">平均</option><option value="MIN">最小</option><option value="MAX">最大</option><option value="COUNT">计数</option><option value="COUNT_DISTINCT">去重计数</option>
@@ -1169,22 +1169,22 @@ export default function MetricManager() {
                           onChange={(event) => {
                             const field = inputClass?.fields.find(
                               (item) =>
-                                (item.physical_name || item.name) ===
+                                item.name ===
                                 event.target.value,
                             );
                             updateMetricInput(index, {
                               field: event.target.value,
-                              output_name: field?.name || "",
+                              output_name: field?.name_cn || field?.name || "",
                             });
                           }}
                         >
                           <option value="">选择字段</option>
                           {(inputClass?.fields || []).map((field) => (
                             <option
-                              key={field.physical_name || field.name}
-                              value={field.physical_name || field.name}
+                              key={field.name}
+                              value={field.name}
                             >
-                              {field.name}（{field.physical_name}）
+                              {field.name_cn || field.name}（{field.name}）
                             </option>
                           ))}
                         </select>
@@ -1295,13 +1295,13 @@ export default function MetricManager() {
                                         (field) => (
                                           <option
                                             key={
-                                              field.physical_name || field.name
+                                              field.name
                                             }
                                             value={
-                                              field.physical_name || field.name
+                                              field.name
                                             }
                                           >
-                                            {field.name}（{field.physical_name}）
+                                            {field.name_cn || field.name}（{field.name}）
                                           </option>
                                         ),
                                       )}

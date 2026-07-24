@@ -2,6 +2,7 @@ import json
 import re
 from collections import Counter
 from datetime import datetime
+from numbers import Integral, Real
 
 from agents.ontology_chatbi.constants import (
     BARE_QUARTER_VALUE_PATTERN,
@@ -254,68 +255,8 @@ class EntityDisambiguatorAgent:
         engine,
         scenario_id: str = "",
     ) -> dict:
-        """query_ontology_data 失败后的参数再对齐入口。"""
-        corrected = dict(arguments)
-        target_class = str(corrected.get("target_class") or "")
-        allowed_classes = self._query_scope_classes(corrected, target_class)
-        query_selection = self._query_selection_context(corrected)
-        new_filters = []
-        field_replacements: dict[str, str] = {}
-        for item in corrected.get("filters") or []:
-            if not isinstance(item, dict):
-                new_filters.append(item)
-                continue
-            field = str(item.get("field") or "")
-            value = item.get("value", "")
-
-            if isinstance(value, str) and value.strip():
-                class_id, _ = self._resolve_filter_field_type(
-                    engine,
-                    target_class,
-                    field,
-                    query_engine=query_engine,
-                    allowed_classes=allowed_classes,
-                )
-                fixed_filter = await self._disambiguate_text_filter(
-                    query_engine,
-                    item,
-                    value,
-                    target_class=target_class,
-                    class_id=class_id,
-                    allowed_classes=allowed_classes,
-                    query_selection=query_selection,
-                    scenario_id=scenario_id,
-                )
-                fixed_field = str(fixed_filter.get("field") or "")
-                if field and fixed_field and fixed_field != field:
-                    field_replacements[field] = fixed_field
-                new_filters.append(fixed_filter)
-                continue
-
-            candidate_class, candidates = self._value_candidates_for_filter(
-                query_engine,
-                target_class,
-                field,
-                str(value),
-                allowed_classes=allowed_classes,
-                scenario_id=scenario_id,
-            )
-            if candidates:
-                best_match, score, _ = await self._match_value(
-                    str(value),
-                    candidates,
-                    field_name=field,
-                    class_id=candidate_class,
-                    selection_context=query_selection,
-                )
-                new_filters.append({**item, "value": best_match} if best_match and score >= 0.75 else item)
-            else:
-                new_filters.append(item)
-
-        corrected["filters"] = new_filters
-        if field_replacements:
-            corrected["dimensions"] = self._replace_dimensions(corrected.get("dimensions"), field_replacements)
-        return corrected
+        """Reapply the controlled type-specific alignment rules after one failed query."""
+        return await self._deterministic_pre_process(arguments, query_engine, engine, scenario_id)
 
     async def _deterministic_pre_process(self, arguments: dict, query_engine, engine, scenario_id: str = "") -> dict:
         corrected = dict(arguments or {})
@@ -324,15 +265,38 @@ class EntityDisambiguatorAgent:
             corrected["target_class"] = target_class
         allowed_classes = self._query_scope_classes(corrected, target_class)
         query_selection = self._query_selection_context(corrected)
-        filters = corrected.get("filters") or []
+        locked_filters = self._complete_filter_dicts(corrected.get("_locked_shared_filters"))
+        filters = self._merge_locked_filters(corrected.get("filters") or [], locked_filters)
+        filters_to_align = [
+            item for item in filters
+            if not isinstance(item, dict) or not self._is_locked_filter(item, locked_filters)
+        ]
         having = list(corrected.get("having") or [])
         corrected_filters = []
         field_replacements: dict[str, str] = {}
+        filter_plans = await self._classify_and_select_filter_columns(
+            filters_to_align,
+            query_engine,
+            engine,
+            allowed_classes,
+            str(corrected.get("user_question") or ""),
+            query_selection,
+            scenario_id,
+        )
 
+        alignment_index = 0
         for item in filters:
             if not isinstance(item, dict):
                 corrected_filters.append(item)
                 continue
+            if self._is_locked_filter(item, locked_filters):
+                # Parent anchors (for example BD employee + quarter) are a
+                # semantic contract for subset subquestions, not candidates for
+                # the alignment model to reinterpret as a different hierarchy.
+                corrected_filters.append(item)
+                continue
+            current_alignment_index = alignment_index
+            alignment_index += 1
             item = self._normalize_quarter_filter(item, target_class, engine, scenario_id)
             field = item.get("field", "")
             metric_info, _ = resolve_metric_reference(field, engine.list_metrics())
@@ -345,6 +309,12 @@ class EntityDisambiguatorAgent:
                     json.dumps(item, ensure_ascii=False, default=str)[:500],
                 )
                 continue
+            alignment_plan = filter_plans.get(current_alignment_index, {})
+            value_type = str(alignment_plan.get("value_type") or "other")
+            selected_columns = alignment_plan.get("columns") or []
+            if value_type == "numeric":
+                corrected_filters.append(item)
+                continue
             class_id, field_type = self._resolve_filter_field_type(
                 engine,
                 target_class,
@@ -352,23 +322,20 @@ class EntityDisambiguatorAgent:
                 query_engine=query_engine,
                 allowed_classes=allowed_classes,
             )
-            value = self._coerce_filter_value(item.get("value"), field_type)
-            fixed = {**item, "value": value}
-
-            if field_type == "text":
-                fixed = await self._disambiguate_text_filter(
-                    query_engine,
-                    item,
-                    value,
-                    target_class=target_class,
-                    class_id=class_id,
-                    allowed_classes=allowed_classes,
-                    query_selection=query_selection,
-                    scenario_id=scenario_id,
-                )
-                fixed_field = str(fixed.get("field") or "")
-                if field and fixed_field and fixed_field != field:
-                    field_replacements[str(field)] = fixed_field
+            fixed = await self._align_filter_by_type(
+                item,
+                value_type,
+                selected_columns,
+                query_engine,
+                engine,
+                target_class,
+                class_id,
+                allowed_classes,
+                scenario_id,
+            )
+            fixed_field = str(fixed.get("field") or "")
+            if field and fixed_field and fixed_field != field:
+                field_replacements[str(field)] = fixed_field
             corrected_filters.append(fixed)
 
         corrected["filters"] = corrected_filters
@@ -376,6 +343,316 @@ class EntityDisambiguatorAgent:
             corrected["dimensions"] = self._replace_dimensions(corrected.get("dimensions"), field_replacements)
         corrected["having"] = having
         return corrected
+
+    @staticmethod
+    def _complete_filter_dicts(value) -> list[dict]:
+        return [
+            dict(item)
+            for item in value or []
+            if isinstance(item, dict) and item.get("field") and item.get("operator")
+        ]
+
+    @classmethod
+    def _merge_locked_filters(cls, filters: list, locked_filters: list[dict]) -> list:
+        """Keep parent filters unchanged while allowing a child to add a subset.
+
+        A child LLM may express the same person/time value through another column
+        (for example ``rm_employee_name`` instead of ``bd_employee_name``). Such
+        a competing filter is removed before alignment and the parent's canonical
+        field/value pair is retained.
+        """
+        if not locked_filters:
+            return list(filters)
+        merged = [dict(item) for item in locked_filters]
+        for item in filters:
+            if not isinstance(item, dict) or not cls._conflicts_with_locked_filter(item, locked_filters):
+                merged.append(item)
+        return merged
+
+    @staticmethod
+    def _filter_value_key(value):
+        if isinstance(value, list):
+            return tuple(EntityDisambiguatorAgent._filter_value_key(item) for item in value)
+        return str(value).strip() if value is not None else None
+
+    @classmethod
+    def _conflicts_with_locked_filter(cls, candidate: dict, locked_filters: list[dict]) -> bool:
+        operator = str(candidate.get("operator") or "").upper()
+        value = cls._filter_value_key(candidate.get("value"))
+        for locked in locked_filters:
+            if str(locked.get("operator") or "").upper() != operator:
+                continue
+            if cls._filter_value_key(locked.get("value")) != value:
+                continue
+            return True
+        return False
+
+    @classmethod
+    def _is_locked_filter(cls, candidate: dict, locked_filters: list[dict]) -> bool:
+        return any(
+            str(candidate.get("field") or "") == str(locked.get("field") or "")
+            and str(candidate.get("operator") or "").upper() == str(locked.get("operator") or "").upper()
+            and cls._filter_value_key(candidate.get("value")) == cls._filter_value_key(locked.get("value"))
+            for locked in locked_filters
+        )
+
+    async def _classify_and_select_filter_columns(
+        self,
+        filters: list,
+        query_engine,
+        engine,
+        allowed_classes: list[str],
+        user_message: str,
+        query_selection: dict,
+        scenario_id: str,
+    ) -> dict[int, dict]:
+        """Classify every filter value and select up to three sample-backed columns."""
+        eligible = [
+            {"index": index, "field": item.get("field"), "operator": item.get("operator"), "value": item.get("value")}
+            for index, item in enumerate(filters)
+            if isinstance(item, dict)
+        ]
+        if not eligible:
+            return {}
+        samples = self._build_alignment_samples(query_engine, engine, allowed_classes, scenario_id)
+        if not samples:
+            return {
+                item["index"]: {"value_type": self._fallback_filter_value_type(item), "columns": []}
+                for item in eligible
+            }
+        try:
+            response = await get_async_client().chat.completions.create(
+                model=get_model_name(),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是受控查询参数对齐规划器。先将每个过滤值分类为 person、date、numeric、other；"
+                            "随后仅从下方实体字段清单中，为每个过滤选择多个可能承载该值的列。"
+                            "person 指人名，date 指日期/月份/季度编码，numeric 指数值。不得修改查询意图或虚构列。"
+                            '只输出 JSON：{"filters":[{"index":number,"value_type":"person|date|numeric|other",'
+                            '"columns":[{"class_id":string,"field":string}]}]}。'
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"用户问题：{user_message}\n\n"
+                            f"待对齐过滤条件：{json.dumps(eligible, ensure_ascii=False, default=str)}\n\n"
+                            f"{self._format_alignment_examples(samples)}"
+                        ),
+                    },
+                ],
+                temperature=0,
+                max_tokens=1600,
+            )
+            payload = self._parse_llm_json(response.choices[0].message.content or "{}")
+        except Exception as exc:
+            logger.warning("Filter alignment planning failed: scenario_id=%s error=%s", scenario_id, str(exc))
+            return {
+                item["index"]: {"value_type": self._fallback_filter_value_type(item), "columns": []}
+                for item in eligible
+            }
+
+        valid_columns = {
+            (sample["class_id"], field)
+            for sample in samples
+            for field in sample["selection_fields"]
+        }
+        sample_field_map = {
+            (sample["class_id"], physical_field): logical_field
+            for sample in samples
+            for physical_field, logical_field in sample["physical_to_logical"].items()
+        }
+        plans = {}
+        for plan in payload.get("filters", []) if isinstance(payload.get("filters"), list) else []:
+            if not isinstance(plan, dict) or not isinstance(plan.get("index"), int):
+                continue
+            value_type = str(plan.get("value_type") or "other").lower()
+            if value_type not in {"person", "date", "numeric", "other"}:
+                value_type = "other"
+            columns = [
+                {
+                    "class_id": str(column.get("class_id") or ""),
+                    "field": sample_field_map[
+                        (str(column.get("class_id") or ""), str(column.get("field") or ""))
+                    ],
+                }
+                for column in plan.get("columns", [])[:3]
+                if isinstance(column, dict)
+                and (str(column.get("class_id") or ""), str(column.get("field") or "")) in valid_columns
+            ]
+            plans[plan["index"]] = {"value_type": value_type, "columns": columns}
+        for item in eligible:
+            plans.setdefault(
+                item["index"],
+                {"value_type": self._fallback_filter_value_type(item), "columns": []},
+            )
+        return plans
+
+    @staticmethod
+    def _fallback_filter_value_type(item: dict) -> str:
+        field = str(item.get("field") or "")
+        value = item.get("value")
+        if re.search(r"人|姓名|负责人|员工|医生|代表|经理", field):
+            return "person"
+        if isinstance(value, (int, float)) or (isinstance(value, str) and re.fullmatch(r"[-+]?\d+(?:\.\d+)?", value.strip())):
+            return "numeric"
+        if isinstance(value, str) and re.fullmatch(r"\d{4}(?:[-/]?\d{2})?(?:[-/]?\d{2})?", value.strip()):
+            return "date"
+        return "other"
+
+    @staticmethod
+    def _build_alignment_samples(query_engine, engine, allowed_classes: list[str], scenario_id: str) -> list[dict]:
+        samples = []
+        class_definitions = {
+            str(schema_class.get("id") or ""): schema_class
+            for schema_class in engine.list_classes()
+        }
+        for class_id in EntityDisambiguatorAgent._dedupe_nonempty(allowed_classes):
+            try:
+                result = query_engine.get_class_sample(class_id, limit=5)
+                rows = [row for row in result.get("data", []) if isinstance(row, dict)][:3]
+                field_map = engine.get_field_map(class_id)
+                physical_to_logical = {str(physical): str(logical) for logical, physical in field_map.items()}
+                selection_fields = list(physical_to_logical)
+                class_definition = class_definitions.get(class_id, {})
+                field_definitions = {
+                    str(field.get("name") or ""): field
+                    for field in class_definition.get("fields", [])
+                    if isinstance(field, dict)
+                }
+                examples_by_field = {
+                    physical_field: [
+                        row.get(physical_field, row.get(physical_to_logical[physical_field]))
+                        for row in rows
+                        if physical_field in row or physical_to_logical[physical_field] in row
+                    ][:3]
+                    for physical_field in selection_fields
+                }
+                selection_fields = [
+                    physical_field
+                    for physical_field in selection_fields
+                    if not EntityDisambiguatorAgent._is_float_example_field(
+                        examples_by_field[physical_field]
+                    )
+                ]
+                if selection_fields:
+                    samples.append(
+                        {
+                            "class_id": class_id,
+                            "class_name": str(class_definition.get("name_cn") or class_id),
+                            "selection_fields": selection_fields,
+                            "physical_to_logical": physical_to_logical,
+                            "field_names": {
+                                field: str(field_definitions.get(field, {}).get("name") or physical_to_logical[field])
+                                for field in selection_fields
+                            },
+                            "field_descriptions": {
+                                field: str(field_definitions.get(field, {}).get("description") or "未提供字段说明")
+                                for field in selection_fields
+                            },
+                            "examples_by_field": examples_by_field,
+                        }
+                    )
+            except Exception as exc:
+                logger.info("Filter alignment samples unavailable: scenario_id=%s class=%s error=%s", scenario_id, class_id, str(exc))
+        return samples
+
+    @staticmethod
+    def _is_float_example_field(examples: list[object]) -> bool:
+        """Exclude fields whose populated Examples are all floating-point values."""
+        populated = [value for value in examples if value is not None]
+        return bool(populated) and all(
+            isinstance(value, Real) and not isinstance(value, Integral)
+            for value in populated
+        )
+
+    @staticmethod
+    def _format_alignment_examples(samples: list[dict]) -> str:
+        """Format sample values as readable field context rather than JSON blobs."""
+        blocks = ["候选实体与字段 Example："]
+        for sample in samples:
+            blocks.append(f"\n{sample['class_name']}（{sample['class_id']}）字段列表如下：")
+            for field in sample["selection_fields"]:
+                examples = sample.get("examples_by_field", {}).get(field, [])[:3]
+                example_text = "、".join(str(value) for value in examples) if examples else "（无样例）"
+                blocks.extend(
+                    [
+                        f"- {field}（{sample.get('field_names', {}).get(field, field)}）：",
+                        f"  字段说明：{sample.get('field_descriptions', {}).get(field, '未提供字段说明')}",
+                        f"  Example（3个）：{example_text}",
+                    ]
+                )
+        return "\n".join(blocks)
+
+    async def _align_filter_by_type(
+        self,
+        item: dict,
+        value_type: str,
+        selected_columns: list[dict],
+        query_engine,
+        engine,
+        target_class: str,
+        default_class: str,
+        allowed_classes: list[str],
+        scenario_id: str,
+    ) -> dict:
+        """Apply the non-negotiable value rules after the LLM has narrowed columns."""
+        value = item.get("value")
+        candidates = selected_columns or [{"class_id": default_class or target_class, "field": str(item.get("field") or "")}]
+        if value_type == "date":
+            for column in candidates:
+                formatted = self._format_date_for_column(value, query_engine, column["class_id"], column["field"])
+                if formatted is not None:
+                    return {**item, "field": column["field"], "value": formatted, "_class_id": column["class_id"]}
+            return item
+        if value_type == "person":
+            for column in candidates:
+                values = self._get_field_values(column["class_id"], column["field"], query_engine, str(value), {})
+                if str(value) in {str(candidate) for candidate in values}:
+                    return {**item, "field": column["field"], "value": value, "_class_id": column["class_id"]}
+            logger.info("Person filter retained without fuzzy rewrite: scenario_id=%s value=%s", scenario_id, value)
+            return item
+        return self._best_other_filter_match(item, candidates, query_engine)
+
+    def _best_other_filter_match(self, item: dict, columns: list[dict], query_engine) -> dict:
+        value = item.get("value")
+        if not isinstance(value, str) or not value.strip():
+            return item
+        best = None
+        for column in columns:
+            values = self._get_field_values(column["class_id"], column["field"], query_engine, value.strip("%"), {})
+            matched, score, _ = self._fuzzy_match(value, [str(candidate) for candidate in values])
+            if matched and (best is None or score > best[0]):
+                best = (score, column, matched)
+        if best and best[0] >= self.LLM_MATCH_THRESHOLD:
+            _, column, matched = best
+            return {**item, "field": column["field"], "value": matched, "_class_id": column["class_id"], "_intercepted": True}
+        return item
+
+    @staticmethod
+    def _format_date_for_column(value, query_engine, class_id: str, field: str):
+        if not isinstance(value, str) or not value.strip():
+            return None
+        examples = EntityDisambiguatorAgent()._get_field_values(class_id, field, query_engine, value, {})
+        text = value.strip()
+        compact = re.sub(r"[^0-9]", "", text)
+        if not re.fullmatch(r"\d{4}(?:\d{2})?(?:\d{2})?", compact):
+            return None
+        for example in examples:
+            example = str(example)
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", example) and len(compact) == 8:
+                return f"{compact[:4]}-{compact[4:6]}-{compact[6:]}"
+            if re.fullmatch(r"\d{4}/\d{2}/\d{2}", example) and len(compact) == 8:
+                return f"{compact[:4]}/{compact[4:6]}/{compact[6:]}"
+            if re.fullmatch(r"\d{8}", example) and len(compact) == 8:
+                return compact
+            if re.fullmatch(r"\d{4}-\d{2}", example) and len(compact) == 6:
+                return f"{compact[:4]}-{compact[4:]}"
+            if re.fullmatch(r"\d{6}", example) and len(compact) == 6:
+                return compact
+        return text
 
     @staticmethod
     def _replace_dimensions(dimensions, field_replacements: dict[str, str]):

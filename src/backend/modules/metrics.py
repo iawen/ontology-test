@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from core.db.db import get_db
 from configs.global_config import Cfg
-from core.models.models import MetricBatchDelete, MetricCreate, MetricUpdate, ConceptCreate, ConceptUpdate
+from core.models.models import MetricBatchDelete, MetricCreate, MetricUpdate, ConceptCreate, ConceptUpdate, MetricConceptBinding
 
 router = APIRouter()
 
@@ -19,6 +19,8 @@ router = APIRouter()
 REVIEW_STATUSES = {"pending", "approved", "rejected"}
 SOURCE_SHAPES = {"wide", "long"}
 METRIC_FILTER_OPERATORS = {"=", "!=", "IN", "NOT IN", "IS NULL", "IS NOT NULL"}
+CONCEPT_BINDING_ROLES = {"outcome", "target", "driver", "risk", "efficiency", "diagnostic"}
+CONCEPT_BINDING_STATUSES = {"pending", "approved", "rejected"}
 
 
 def _normalize_metric_offset(value, label: str) -> float:
@@ -117,8 +119,13 @@ def _validate_metric_definition(scenario_id: str, definition: dict) -> tuple[str
         for item in fields:
             if not isinstance(item, dict):
                 continue
-            physical_name = str(item.get("physical_name") or item.get("name") or "").strip()
-            logical_name = str(item.get("name") or "").strip()
+            is_legacy_field = bool(item.get("physical_name"))
+            physical_name = str(
+                item.get("physical_name") if is_legacy_field else item.get("name") or ""
+            ).strip()
+            logical_name = str(
+                item.get("name") if is_legacy_field else item.get("name_cn") or ""
+            ).strip()
             if not physical_name:
                 continue
             field_map[physical_name] = physical_name
@@ -229,6 +236,50 @@ def _replace_metric_dimension_bindings(conn, scenario_id: str, metric_id: str, g
         )
 
 
+def _metric_concept_bindings(conn, scenario_id: str, metric_id: str) -> list[dict]:
+    rows = conn.execute(
+        """SELECT concept_id, role, priority, is_primary, status
+           FROM metric_concept_bindings WHERE scenario_id=? AND metric_id=?
+           ORDER BY priority, concept_id""",
+        (scenario_id, metric_id),
+    ).fetchall()
+    return [{**dict(row), "is_primary": bool(row["is_primary"])} for row in rows]
+
+
+def _replace_metric_concept_bindings(
+    conn, scenario_id: str, metric_id: str, bindings: list[MetricConceptBinding]
+) -> None:
+    seen_concepts = set()
+    normalized = []
+    for binding in bindings:
+        concept_id = binding.concept_id.strip()
+        role = binding.role.strip().lower()
+        status = binding.status.strip().lower()
+        if not concept_id or concept_id in seen_concepts:
+            raise HTTPException(400, "Concept 绑定必须唯一且 concept_id 非空")
+        if role not in CONCEPT_BINDING_ROLES:
+            raise HTTPException(400, "Concept 绑定角色无效")
+        if status not in CONCEPT_BINDING_STATUSES:
+            raise HTTPException(400, "Concept 绑定状态无效")
+        if not conn.execute(
+            "SELECT 1 FROM concepts WHERE scenario_id=? AND id=?", (scenario_id, concept_id)
+        ).fetchone():
+            raise HTTPException(400, f"关联 Concept 不存在：{concept_id}")
+        seen_concepts.add(concept_id)
+        normalized.append((concept_id, role, binding.priority, int(binding.is_primary), status))
+    conn.execute(
+        "DELETE FROM metric_concept_bindings WHERE scenario_id=? AND metric_id=?",
+        (scenario_id, metric_id),
+    )
+    for concept_id, role, priority, is_primary, status in normalized:
+        conn.execute(
+            """INSERT INTO metric_concept_bindings
+               (metric_id, scenario_id, concept_id, role, priority, is_primary, status)
+               VALUES (?,?,?,?,?,?,?)""",
+            (metric_id, scenario_id, concept_id, role, priority, is_primary, status),
+        )
+
+
 # ============================================================
 # 指标 CRUD
 # ============================================================
@@ -245,9 +296,19 @@ async def list_metrics(scenario_id: str):
         "SELECT metric_id, group_id FROM metric_dimension_bindings WHERE scenario_id=? ORDER BY group_id",
         (scenario_id,),
     ).fetchall()
+    concept_binding_rows = conn.execute(
+        """SELECT metric_id, concept_id, role, priority, is_primary, status
+           FROM metric_concept_bindings WHERE scenario_id=? ORDER BY metric_id, priority, concept_id""",
+        (scenario_id,),
+    ).fetchall()
     bindings: dict[str, list[str]] = {}
     for binding in binding_rows:
         bindings.setdefault(binding["metric_id"], []).append(binding["group_id"])
+    concept_bindings: dict[str, list[dict]] = {}
+    for binding in concept_binding_rows:
+        concept_bindings.setdefault(binding["metric_id"], []).append(
+            {**dict(binding), "is_primary": bool(binding["is_primary"])}
+        )
     conn.close()
     result = []
     for r in rows:
@@ -255,6 +316,7 @@ async def list_metrics(scenario_id: str):
         d["dimensions"] = json.loads(d.get("dimensions", "[]"))
         d["required_dimensions"] = json.loads(d.get("required_dimensions", "[]"))
         d["dimension_group_ids"] = bindings.get(d["id"], [])
+        d["concept_bindings"] = concept_bindings.get(d["id"], [])
         try:
             d["definition"] = json.loads(d.get("definition") or "{}")
         except (TypeError, json.JSONDecodeError):
@@ -273,6 +335,39 @@ async def list_metrics(scenario_id: str):
         d["is_reviewed"] = _is_reviewed_status(d["review_status"])
         result.append(d)
     return result
+
+
+@router.get("/api/admin/scenarios/{scenario_id}/metrics/{metric_id}/concept-bindings")
+async def list_metric_concept_bindings(scenario_id: str, metric_id: str):
+    conn = get_db()
+    try:
+        return _metric_concept_bindings(conn, scenario_id, metric_id)
+    finally:
+        conn.close()
+
+
+@router.put("/api/admin/scenarios/{scenario_id}/metrics/{metric_id}/concept-bindings")
+async def replace_metric_concept_bindings(
+    scenario_id: str, metric_id: str, bindings: list[MetricConceptBinding]
+):
+    conn = get_db()
+    try:
+        if not conn.execute(
+            "SELECT 1 FROM metrics WHERE scenario_id=? AND id=?", (scenario_id, metric_id)
+        ).fetchone():
+            raise HTTPException(404, "指标不存在")
+        _replace_metric_concept_bindings(conn, scenario_id, metric_id, bindings)
+        conn.commit()
+        _sync_ontology_files(scenario_id)
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(400, f"保存 Metric Concept 绑定失败：{exc}")
+    finally:
+        conn.close()
+    return {"status": "ok"}
 
 
 @router.get("/api/scenarios/{scenario_id}/metrics/field-values")

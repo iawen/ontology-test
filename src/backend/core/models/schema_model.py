@@ -10,8 +10,8 @@ from pydantic import BaseModel, Field, field_validator
 
 class FieldOptimization(BaseModel):
     """字段优化建议"""
-    physical_name: str = Field(..., description="物理列名（必须与数据库一致）")
-    name: str = Field("", description="字段业务逻辑中文名")
+    name: str = Field(..., description="物理列名（必须与数据库一致）")
+    name_cn: str = Field("", description="字段业务逻辑中文名")
     description: str = Field("", description="字段业务含义描述")
     type: str = Field("text", description="字段类型: text/numeric/date/boolean")
     is_primary_key: bool = Field(False, description="是否主键")
@@ -30,7 +30,7 @@ class ClassOptimization(BaseModel):
     name_cn: str = Field("", description="中文逻辑名称")
     description: str = Field("", description="实体业务定义与边界描述")
     primary_key: str = Field("", description="主键物理列名")
-    csv_file: str = Field("", description="数据源文件名或表名")
+    table_name: str = Field("", description="数据源文件名或表名")
     fields: List[FieldOptimization] = Field(default_factory=list, description="字段列表（可只包含需优化的字段）")
 
     @field_validator("id")
