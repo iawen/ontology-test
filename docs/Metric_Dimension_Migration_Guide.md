@@ -110,17 +110,16 @@ ALTER TABLE metric_dimension_bindings
 | 字段 | 功能用途 |
 | --- | --- |
 | `id` | Metric 的 `anchor_class`、`inputs[].class_id` 与字段映射的 `class_id` |
-| `fields` | JSON 数组；每项至少要有 `name`、`physical_name`、`type` |
-| `properties` | 旧格式字段名数组；兼容无 `fields` 的历史数据 |
-| `csv_file` / `primary_key` | CSV / 数据库表映射和 Join 执行支持 |
+| `fields` | JSON 数组，是唯一的字段定义来源；每项至少要有逻辑名、物理名和类型 |
+| `table_name` / `primary_key` | CSV / 数据库表映射和 Join 执行支持 |
 | `review_status` | 被拒绝的 Class 不应给 Agent 或 Metric 使用 |
 
 `fields` 项的推荐结构：
 
 ```json
 {
-  "name": "销售金额",
-  "physical_name": "sales_amount",
+  "name_cn": "销售金额",
+  "name": "sales_amount",
   "type": "numeric",
   "description": "含税销售额",
   "is_primary_key": false,

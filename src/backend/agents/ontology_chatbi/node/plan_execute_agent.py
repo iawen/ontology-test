@@ -7,14 +7,14 @@ from typing import cast
 
 from openai.types.chat import ChatCompletionMessageParam
 
-from agents.ontology_chatbi.prompt import (
+from agents.ontology_chatbi.services.prompt import (
     ONTOLOGY_PLANNING_SYSTEM_PROMPT,
     get_metric_evidence_judge_prompt,
     get_metric_plan_prompt,
     get_query_mode_routing_prompt,
     get_subquestion_reuse_prompt,
 )
-from agents.ontology_chatbi.helper import metric_plan_context_summary
+from agents.ontology_chatbi.services.helper import metric_plan_context_summary
 from tools.logger import logger
 
 

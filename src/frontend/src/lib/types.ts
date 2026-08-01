@@ -73,6 +73,7 @@ export interface ClarificationOption {
 }
 
 export interface ClarificationQuestion {
+  requirement_id?: string;
   group_id: string;
   group_name: string;
   group_type: string;
@@ -80,10 +81,21 @@ export interface ClarificationQuestion {
   required: boolean;
   requires_value?: boolean;
   value_label?: string;
+  semantic_role?: string;
+  execution_unit_ids?: string[];
+  candidate_values?: Array<{ option_value?: string; selection_value?: string; source?: string }>;
+  semantic_suggestions?: Array<{
+    candidate_id: string;
+    mapping_id: string;
+    confidence: "high" | "medium";
+    reason?: string;
+  }>;
+  reason?: string;
   options: ClarificationOption[];
 }
 
 export interface ClarificationAnswer {
+  requirement_id?: string;
   group_id: string;
   option_value: string;
   selection_value?: string;
@@ -96,7 +108,11 @@ export interface ClarificationData {
   checkpoint_id?: string;
   version?: number;
   reason?: string;
+  stage?: "early" | "final" | "metric_batch";
+  clarification_version?: number;
   questions?: ClarificationQuestion[];
+  submitted_answers?: ClarificationAnswer[];
+  status?: "submitted";
   field?: string;          // 缺少的字段名，如 time_range / dimension
   multi_select?: boolean;  // 是否多选
 }

@@ -7,12 +7,12 @@ from typing import cast
 
 from openai.types.chat import ChatCompletionMessageParam
 
-from agents.ontology_chatbi.helper import (
+from agents.ontology_chatbi.services.helper import (
     metric_context_summary,
     metric_definition,
     resolve_metric_reference,
 )
-from agents.ontology_chatbi.prompt import (
+from agents.ontology_chatbi.services.prompt import (
     ONTOLOGY_PLANNING_SYSTEM_PROMPT,
     get_ontology_planning_feedback_prompt,
     get_query_details_planning_prompt,
@@ -142,10 +142,11 @@ class OntologyAgent:
     def _merge_reusable_query_plan(
         parent_plan: dict, delta_plan: dict, reuse_metrics: bool
     ) -> dict:
-        """Build a complete child plan from a validated parent plus LLM delta.
+        """Build a child plan from provenance-approved shared context plus an LLM delta.
 
-        Parent conditions are intentionally retained. The executor later enforces
-        their resolved field/value pairs while it aligns only the new conditions.
+        The caller strips parent-local dimensions, filters, and ordering before
+        this method runs. Only explicitly shareable answer-derived filters may
+        be retained and locked by the executor.
         """
         parent = parent_plan if isinstance(parent_plan, dict) else {}
         delta = delta_plan if isinstance(delta_plan, dict) else {}
@@ -277,6 +278,20 @@ class OntologyAgent:
         def is_scope_field(field_name: str) -> bool:
             return any(field_name in engine.get_field_map(class_id) for class_id in allowed_classes)
 
+        def available_metric_id_examples() -> str:
+            """Render a compact, retry-safe list of IDs accepted by this scope."""
+            ids = []
+            for metric in available_metrics:
+                metric_id = str(metric.get("id") or "").strip()
+                if metric_id:
+                    ids.append(metric_id)
+                definition = metric_definition(metric)
+                for output in definition.get("outputs", []):
+                    output_id = str(output.get("id") or "").strip()
+                    if output_id:
+                        ids.append(output_id)
+            return "、".join(dict.fromkeys(ids[:20])) or "（无）"
+
         def validate_candidate_metric(metric_name: str, source: str) -> tuple[dict | None, str]:
             metric_info, output = resolve_metric_reference(metric_name, available_metrics)
             resolved_id = str(output.get("id") or "") if output else str(metric_info.get("id") or "") if metric_info else ""
@@ -289,11 +304,18 @@ class OntologyAgent:
             if not metric_info:
                 return {
                     "valid": False,
-                    "error": f"{source} 必须填写当前 Class 的 Metrics 列表中展示的 Metric 或并列输出 ID：{metric_name}",
+                    "error": (
+                        f"{source} 必须填写当前 Class 的 Metrics 列表中展示的 Metric 或并列输出 ID：{metric_name}。"
+                        f"`{metric_name}` 不是可用 Metric ID；请从以下已验证 ID 中按业务含义选择："
+                        f"{available_metric_id_examples()}"
+                    ),
                 }, metric_name
             return {
                 "valid": False,
-                "error": f"{source} 必须填写 Metric 或并列输出 ID，不能填写名称：{metric_name}",
+                "error": (
+                    f"{source} 必须填写 Metric 或并列输出 ID，不能填写名称：{metric_name}。"
+                    f"请改为以下已验证 ID 中语义对应的一项：{available_metric_id_examples()}"
+                ),
             }, metric_name
 
         resolved_metrics = []

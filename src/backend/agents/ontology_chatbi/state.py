@@ -10,7 +10,7 @@ Chat v3 - 状态定义与轻量状态机
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from openai.types.chat import ChatCompletionMessageParam, ChatCompletionMessageToolCall, ChatCompletionToolParam
+from openai.types.chat import ChatCompletionMessageParam
 
 
 class State(StrEnum):
@@ -21,9 +21,7 @@ class State(StrEnum):
     METRIC_PLAN_EXECUTE = "metric_plan_execute"
     SCHEMA_PLAN = "schema_plan"
     QUERY_PLAN = "query_plan"
-    LLM_CALL = "llm_call"
-    TOOL_DISPATCH = "tool_dispatch"
-    TOOL_EXECUTE = "tool_execute"
+    QUERY_EXECUTE = "query_execute"
     CLARIFY = "clarify"
     ACTION_CONFIRM = "action_confirm"
     ACTION_EXECUTE = "action_execute"
@@ -58,12 +56,6 @@ class AgentState:
     user_message: str = ""
     messages: list[ChatCompletionMessageParam] = field(default_factory=list)  # 发给 LLM 的消息
 
-    # LLM 配置
-    system_prompt: str = ""
-    tools: list[ChatCompletionToolParam] = field(default_factory=list)
-    max_rounds: int = 20
-    current_round: int = 0
-
     # 上下文管理
     ontology_context: str = ""
     glossary_matches: list[dict] = field(default_factory=list)
@@ -88,10 +80,13 @@ class AgentState:
     query_executed: bool = False
     clarification: dict | None = None
     clarification_reason: str = ""
+    clarification_stage: str = ""
     missing_required_dimensions: list[dict] = field(default_factory=list)
     missing_dimension_groups: list[dict] = field(default_factory=list)
-    dimension_selections: dict[str, dict] = field(default_factory=dict)
     dimension_resolution: dict = field(default_factory=dict)
+    clarification_requirements: list[dict] = field(default_factory=list)
+    clarification_answers: list[dict] = field(default_factory=list)
+    clarification_version: int = 3
 
     # Metrics Plan-Execute：复杂指标问题的受控多证据执行账本
     execution_mode: str = "single_query"
@@ -103,14 +98,9 @@ class AgentState:
     metric_plan_terminal_reason: str = ""
     metric_query_attempts: int = 0
 
-    # 工具执行
-    pending_tool_calls: list[ChatCompletionMessageToolCall] = field(default_factory=list)  # LLM 返回的 tool_calls
+    # 受控查询执行记录
     tool_call_records: list[ToolCallRecord] = field(default_factory=list)
     all_tool_results: list[dict] = field(default_factory=list)
-    tool_timings: dict[str, dict] = field(default_factory=dict)
-    tool_reasoning_steps: list[dict] = field(default_factory=list)
-    analysis_payload: list[dict] = field(default_factory=list)
-    analysis_processed_count: int = 0
 
     # 持久化输出
     assistant_content: str = ""
@@ -132,9 +122,6 @@ class AgentState:
         return {
             "agent_id": self.agent_id,
             "session_id": self.session_id,
-            "current_round": self.current_round,
-            "max_rounds": self.max_rounds,
-            "tool_calls_count": len(self.pending_tool_calls),
             "tool_results_count": len(self.all_tool_results),
             "entity_hints_count": len(self.entity_hints),
             "query_scope": self.query_scope,
@@ -153,6 +140,9 @@ class AgentState:
             "missing_required_dimensions": self.missing_required_dimensions,
             "missing_dimension_groups": self.missing_dimension_groups,
             "dimension_resolution": self.dimension_resolution,
+            "clarification_requirements": self.clarification_requirements,
+            "clarification_answers": self.clarification_answers,
+            "clarification_version": self.clarification_version,
             "transition_log": self.transition_log,
             "error": self.error,
         }
@@ -163,8 +153,6 @@ class AgentState:
             {
                 "from": from_state.value if isinstance(from_state, State) else str(from_state),
                 "to": to_state.value if isinstance(to_state, State) else str(to_state),
-                "round": self.current_round,
-                "pending_tools": len(self.pending_tool_calls),
                 "tool_results": len(self.all_tool_results),
             }
         )

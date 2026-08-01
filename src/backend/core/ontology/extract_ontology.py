@@ -359,6 +359,15 @@ class OntologyExtractor:
 
             result = self._extract_single_table(shard, business_context)
             if "class" in result:
+                schema_name = str(
+                    result["class"].get("schema_name") or result["class"].get("id") or ""
+                ).strip()
+                if not schema_name:
+                    continue
+                # Ontology JSON still exposes its semantic key as `id`; the
+                # database persists the same value in `schema_name`.
+                result["class"]["schema_name"] = schema_name
+                result["class"]["id"] = schema_name
                 # 留存原始血缘用于物理 Mapping
                 result["class"]["_source_origin"] = shard.get("original_file", shard.get("file"))
                 result["class"]["_temp_shard_id"] = result["class"].get("id")  # 留存分片提取时的临时 ID
@@ -471,7 +480,7 @@ class OntologyExtractor:
         compressed = []
         for c in classes:
             compressed.append({
-                "id": c.get("id"),
+                "schema_name": c.get("schema_name") or c.get("id"),
                 "name_cn": c.get("name_cn"),
                 "description": c.get("description"),
                 "_source_origin": c.get("_source_origin"),
@@ -517,7 +526,6 @@ class OntologyExtractor:
                 "category": m.get("category"),
                 "target_class": m.get("target_class"),
                 "dimensions": m.get("dimensions"),
-                "required_dimensions": m.get("required_dimensions"),
                     "dimension_group_ids": m.get("dimension_group_ids", []),
                 "definition": m.get("definition"),
             }
@@ -542,6 +550,11 @@ class OntologyExtractor:
         # 1. 物理血缘归一（将同一张表的多个分片 Class 揉碎合并）
         by_origin = {}
         for c in raw_classes:
+            schema_name = str(c.get("schema_name") or c.get("id") or "").strip()
+            if not schema_name:
+                continue
+            c["schema_name"] = schema_name
+            c["id"] = schema_name
             origin = c.get("_source_origin", "")
             temp_id = c.get("_temp_shard_id", "")
             
@@ -580,6 +593,7 @@ class OntologyExtractor:
                     if exist.get("_source_origin") != origin:
                         unique_id = self._unique_class_id(cid, origin, deduped)
                         c["id"] = unique_id
+                        c["schema_name"] = unique_id
                         class_id_map[c.get("_temp_shard_id")] = unique_id
                         class_id_map[current_primary_id] = unique_id
                         deduped[unique_id] = c
@@ -706,13 +720,6 @@ class OntologyExtractor:
             except json.JSONDecodeError:
                 dimensions = [d.strip() for d in dimensions.split(",") if d.strip()]
                 
-        required_dimensions = m.get("required_dimensions", [])
-        if isinstance(required_dimensions, str):
-            try:
-                required_dimensions = json.loads(required_dimensions)
-            except json.JSONDecodeError:
-                required_dimensions = [d.strip() for d in required_dimensions.split(",") if d.strip()]
-
         dimension_group_ids = m.get("dimension_group_ids", [])
         if isinstance(dimension_group_ids, str):
             try:
@@ -730,7 +737,6 @@ class OntologyExtractor:
             "target_class": definition.get("anchor_class", m.get("target_class", "")),
             "definition": definition,
             "dimensions": json.dumps(dimensions, ensure_ascii=False),
-            "required_dimensions": json.dumps(required_dimensions, ensure_ascii=False),
             "dimension_group_ids": [str(group_id).strip() for group_id in dimension_group_ids if str(group_id).strip()],
             "chart_type": m.get("chart_type", "bar"),
         }

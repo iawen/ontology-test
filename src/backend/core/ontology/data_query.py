@@ -558,7 +558,7 @@ class DataQueryEngine:
             )
         if operator == "DIVIDE":
             expression = "(" + " / ".join(
-                [expressions[0], *[f"NULLIF({item}, 0)" for item in expressions[1:]]]
+                [f"(1.0 * {expressions[0]})", *[f"NULLIF({item}, 0)" for item in expressions[1:]]]
             ) + ")"
         else:
             symbols = {"ADD": " + ", "SUBTRACT": " - ", "MULTIPLY": " * "}
@@ -591,7 +591,7 @@ class DataQueryEngine:
         if operator == "DIVIDE":
             if len(expressions) != 2:
                 raise ValueError("相除的并列输出必须恰好包含两个组成项")
-            expression = f"({expressions[0]} / NULLIF({expressions[1]}, 0))"
+            expression = f"((1.0 * {expressions[0]}) / NULLIF({expressions[1]}, 0))"
         else:
             symbols = {"ADD": " + ", "SUBTRACT": " - ", "MULTIPLY": " * "}
             expression = "(" + symbols[operator].join(expressions) + ")"

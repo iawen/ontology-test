@@ -67,7 +67,8 @@ class OntologyEngine:
             conn = get_db()
             try:
                 class_rows = conn.execute(
-                    "SELECT * FROM schema_classes WHERE scenario_id=?", (scenario_id,)
+                    "SELECT id AS db_id, schema_name AS id, name_cn, description, fields, table_name, primary_key, is_reviewed, review_status "
+                    "FROM schema_classes WHERE scenario_id=?", (scenario_id,)
                 ).fetchall()
                 if not class_rows:
                     return False
@@ -75,7 +76,12 @@ class OntologyEngine:
                     "SELECT * FROM schema_relationships WHERE scenario_id=?", (scenario_id,)
                 ).fetchall()
                 metric_rows = conn.execute(
-                    "SELECT * FROM metrics WHERE scenario_id=?", (scenario_id,)
+                    """SELECT metrics.name AS id, metrics.name, metrics.description, metrics.category,
+                              schema_classes.schema_name AS target_class, metrics.target_class AS target_class_db_id,
+                              metrics.dimensions, metrics.definition, metrics.chart_type,
+                              metrics.sort_order, metrics.review_status
+                       FROM metrics LEFT JOIN schema_classes ON schema_classes.id=metrics.target_class AND schema_classes.scenario_id=metrics.scenario_id
+                       WHERE metrics.scenario_id=?""", (scenario_id,)
                 ).fetchall()
                 concept_rows = conn.execute(
                     "SELECT * FROM concepts WHERE scenario_id=?", (scenario_id,)
@@ -105,10 +111,10 @@ class OntologyEngine:
 
         classes = []
         mapping_classes = {}
+        schema_names_by_db_id = {row["db_id"]: row["id"] for row in class_rows}
         for row in class_rows:
             item = dict(row)
             fields = self._json_list(item.get("fields"))
-            properties = self._json_list(item.get("properties"))
             normalized_fields = []
             field_map = {}
             field_types = {}
@@ -137,15 +143,12 @@ class OntologyEngine:
                 normalized_fields.append(normalized)
                 field_map[logical_name] = physical_name
                 field_types[physical_name] = normalized["type"]
-            if not properties:
-                properties = [field["name_cn"] for field in normalized_fields]
             review_status = self._review_status(item)
             classes.append(
                 {
                     "id": item.get("id", ""),
                     "name_cn": item.get("name_cn", ""),
                     "description": item.get("description", ""),
-                    "properties": properties,
                     "primary_key": item.get("primary_key", ""),
                     "table_name": item.get("table_name", ""),
                     "fields": normalized_fields,
@@ -208,6 +211,21 @@ class OntologyEngine:
         metrics = []
         for row in metric_rows:
             item = dict(row)
+            definition = self._json_dict(item.get("definition"))
+            definition["anchor_class"] = schema_names_by_db_id.get(
+                definition.get("anchor_class"), definition.get("anchor_class")
+            )
+            input_groups = [definition.get("inputs", [])]
+            input_groups.extend(
+                output.get("inputs", []) for output in definition.get("outputs", [])
+                if isinstance(output, dict)
+            )
+            for inputs in input_groups:
+                for input_item in inputs if isinstance(inputs, list) else []:
+                    if isinstance(input_item, dict):
+                        input_item["class_id"] = schema_names_by_db_id.get(
+                            input_item.get("class_id"), input_item.get("class_id")
+                        )
             metrics.append(
                 {
                     "id": item.get("id", ""),
@@ -216,14 +234,12 @@ class OntologyEngine:
                     "description": item.get("description", ""),
                     "category": item.get("category", ""),
                     "target_class": item.get("target_class", ""),
-                    "definition": self._json_dict(item.get("definition")),
+                    "definition": definition,
                     "dimensions": self._json_list(item.get("dimensions")),
-                    "required_dimensions": self._json_list(item.get("required_dimensions")),
                     "dimension_group_ids": metric_group_ids.get(str(item.get("id") or ""), []),
                     "concept_bindings": metric_concept_bindings.get(str(item.get("id") or ""), []),
                     "chart_type": item.get("chart_type") or "bar",
                     "sort_order": item.get("sort_order") or 0,
-                    "is_reviewed": item.get("is_reviewed", 0),
                     "review_status": self._review_status(item),
                 }
             )

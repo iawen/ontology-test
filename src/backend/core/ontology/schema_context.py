@@ -2,6 +2,7 @@ import json
 from typing import Any
 
 from core.db.db import get_db
+from core.ontology.metric_class_refs import replace_definition_class_refs
 
 
 DEFAULT_SCHEMA_CONTEXT_CHAR_LIMIT = 12000
@@ -92,17 +93,25 @@ def load_schema_reference_context(
     conn = get_db()
     try:
         class_rows = [_row_to_dict(row) for row in conn.execute(
-                """SELECT id, name_cn, description, primary_key, table_name, fields, is_reviewed, review_status
+                """SELECT id AS db_id, schema_name AS id, name_cn, description, primary_key, table_name, fields, is_reviewed, review_status
                FROM schema_classes WHERE scenario_id=?
-               ORDER BY is_reviewed DESC, updated_at DESC, id""",
+               ORDER BY is_reviewed DESC, updated_at DESC, schema_name""",
             (scenario_id,),
         ).fetchall()]
         metric_rows = [_row_to_dict(row) for row in conn.execute(
-                """SELECT id, name, description, category, target_class, definition, dimensions, required_dimensions, is_reviewed, review_status
-               FROM metrics WHERE scenario_id=?
-               ORDER BY is_reviewed DESC, updated_at DESC, id""",
+                     """SELECT metrics.name AS id, metrics.name, metrics.description, metrics.category,
+                                  schema_classes.schema_name AS target_class, metrics.target_class AS target_class_db_id,
+                                  metrics.definition, metrics.dimensions, metrics.review_status
+                         FROM metrics LEFT JOIN schema_classes ON schema_classes.id=metrics.target_class AND schema_classes.scenario_id=metrics.scenario_id
+                         WHERE metrics.scenario_id=?
+                         ORDER BY CASE metrics.review_status WHEN 'approved' THEN 2 WHEN 'pending' THEN 1 ELSE 0 END DESC, metrics.updated_at DESC, metrics.name""",
             (scenario_id,),
         ).fetchall()]
+        class_names_by_db_id = {row["db_id"]: row["id"] for row in class_rows}
+        for metric in metric_rows:
+            metric["definition"] = replace_definition_class_refs(
+                _json_dict(metric.get("definition")), class_names_by_db_id
+            )
         relationship_rows = [_row_to_dict(row) for row in conn.execute(
             """SELECT source, target, type, source_key, target_key, join_key, description, is_reviewed
                FROM schema_relationships WHERE scenario_id=?
@@ -204,7 +213,6 @@ def _compact_metric(row: dict) -> dict:
         "target_class": row.get("target_class", ""),
         "definition": _json_dict(row.get("definition")),
         "dimensions": _json_list(row.get("dimensions"))[:12],
-        "required_dimensions": _json_list(row.get("required_dimensions"))[:12],
         "description": _compact_text(row.get("description", "")),
     }
 

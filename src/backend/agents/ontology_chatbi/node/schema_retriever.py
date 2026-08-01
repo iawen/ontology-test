@@ -4,7 +4,7 @@ from agents.ontology_chatbi.constants import (
     PROGRESS_METRIC_KEYWORDS,
     PROGRESS_QUERY_KEYWORDS,
 )
-from agents.ontology_chatbi.helper import metric_component_names, metric_context_summary, metric_target_classes
+from agents.ontology_chatbi.services.helper import metric_component_names, metric_context_summary, metric_target_classes
 
 # ============================================================
 # Schema 检索 Agent
@@ -65,8 +65,10 @@ class SchemaRetrieverAgent:
                     relevant.add(c["id"])
                     break
             # 字段名匹配
-            for prop in c.get("properties", []):
-                prop_lower = prop.lower()
+            for field in c.get("fields", []):
+                if not isinstance(field, dict):
+                    continue
+                prop_lower = str(field.get("name_cn") or field.get("name") or "").lower()
                 for kw in keywords:
                     if kw in prop_lower:
                         relevant.add(c["id"])
@@ -172,7 +174,11 @@ class SchemaRetrieverAgent:
             parts.append("## 相关实体类详情")
             for c in oe.list_classes():
                 if c["id"] in class_ids:
-                    props = c.get("properties", [])[:10]
+                    props = [
+                        field.get("name_cn") or field.get("name", "")
+                        for field in c.get("fields", [])
+                        if isinstance(field, dict)
+                    ][:10]
                     parts.append(
                         f"- **{c['id']}**({c.get('name_cn', '')}): {c.get('description', '')}\n"
                         f"  字段: {', '.join(props)}"

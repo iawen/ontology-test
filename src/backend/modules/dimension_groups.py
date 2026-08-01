@@ -23,7 +23,7 @@ POLICY_ALIASES = {
 def _refresh_chat_ontology(scenario_id: str) -> None:
     """Invalidate the ChatBI cache after governed DimensionGroup metadata changes."""
     try:
-        from agents.ontology_chatbi.prompt import reset_engine
+        from agents.ontology_chatbi.services.helper import reset_engine
 
         reset_engine(scenario_id)
     except Exception:
@@ -97,7 +97,7 @@ def _validate_payload(conn, scenario_id: str, payload: dict) -> None:
         raise HTTPException(400, "关联 Concept 不存在")
 
     field_rows = conn.execute(
-        "SELECT id, fields, properties FROM schema_classes WHERE scenario_id=?", (scenario_id,)
+        "SELECT schema_name AS id, fields FROM schema_classes WHERE scenario_id=?", (scenario_id,)
     ).fetchall()
     class_fields: dict[str, set[str]] = {}
     for row in field_rows:
@@ -105,7 +105,7 @@ def _validate_payload(conn, scenario_id: str, payload: dict) -> None:
             fields = json.loads(row.get("fields") or "[]")
         except (TypeError, json.JSONDecodeError):
             fields = []
-        names = set(row.get("properties") and json.loads(row.get("properties") or "[]") or [])
+        names = set()
         for field in fields:
             if isinstance(field, dict):
                 names.update(filter(None, [field.get("name_cn"), field.get("name")]))
@@ -117,7 +117,7 @@ def _validate_payload(conn, scenario_id: str, payload: dict) -> None:
         if item.get("class_id") not in class_fields or item.get("field_name") not in class_fields[item["class_id"]]:
             raise HTTPException(400, f"字段映射无效：{item.get('class_id')}.{item.get('field_name')}")
     for metric_id in payload.get("metric_ids") or []:
-        if not conn.execute("SELECT 1 FROM metrics WHERE scenario_id=? AND id=?", (scenario_id, metric_id)).fetchone():
+        if not conn.execute("SELECT 1 FROM metrics WHERE scenario_id=? AND name=?", (scenario_id, metric_id)).fetchone():
             raise HTTPException(400, f"关联指标不存在：{metric_id}")
 
 

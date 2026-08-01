@@ -9,8 +9,8 @@ from typing import List
 from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks
 
 from configs.global_config import Cfg
-from prompts.prompt import reset_engine
 from core.db.db import get_db
+from core.ontology.metric_class_refs import replace_definition_class_refs
 from core.ontology.extract_ontology import OntologyExtractor
 from core.ontology.schema_context import load_schema_reference_context
 from modules.extraction_logs import finish_extraction_log, start_extraction_log
@@ -101,7 +101,6 @@ async def start_extraction(scenario_id: str, background_tasks: BackgroundTasks, 
     """启动分批提取（异步后台任务），支持 CSV 和数据库直连"""
     global extract_status
 
-    reset_engine(scenario_id)
     
     if extract_status["running"]:
         return {"error": "提取正在进行中，请等待完成"}
@@ -310,13 +309,13 @@ def _sync_schema_db(scenario_id: str):
     conn = get_db()
     reviewed_classes = {
         row["id"] for row in conn.execute(
-            "SELECT id FROM schema_classes WHERE scenario_id=? AND (is_reviewed IS TRUE OR review_status IN ('approved','rejected'))",
+            "SELECT schema_name AS id FROM schema_classes WHERE scenario_id=? AND (is_reviewed IS TRUE OR review_status IN ('approved','rejected'))",
             (scenario_id,),
         ).fetchall()
     }
     reviewed_metrics = {
         row["id"] for row in conn.execute(
-            "SELECT id FROM metrics WHERE scenario_id=? AND (is_reviewed IS TRUE OR review_status IN ('approved','rejected'))",
+            "SELECT name AS id FROM metrics WHERE scenario_id=? AND review_status IN ('approved','rejected')",
             (scenario_id,),
         ).fetchall()
     }
@@ -347,7 +346,7 @@ def _sync_schema_db(scenario_id: str):
 
     existing_classes = {
         row["id"] for row in conn.execute(
-            "SELECT id FROM schema_classes WHERE scenario_id=?",
+            "SELECT schema_name AS id FROM schema_classes WHERE scenario_id=?",
             (scenario_id,),
         ).fetchall()
     }
@@ -365,13 +364,10 @@ def _sync_schema_db(scenario_id: str):
             skipped_reviewed["classes"] += 1
             continue
         fields = c.get("fields", [])
-        properties = c.get("properties") or [
-            f.get("name_cn") or f.get("name") for f in fields if isinstance(f, dict) and (f.get("name_cn") or f.get("name"))
-        ]
         classes.append((
             c["id"], scenario_id, c.get("name_cn", c["id"]), c.get("description", ""),
-            _json_text(properties), c.get("primary_key", ""), c.get("table_name", ""),
-            _json_text(fields), _reviewed_value(c.get("is_reviewed", False)),
+            c.get("primary_key", ""), c.get("table_name", ""), _json_text(fields),
+            _reviewed_value(c.get("is_reviewed", False)),
         ))
 
     existing_rels = {
@@ -438,14 +434,19 @@ def _sync_schema_db(scenario_id: str):
 
     existing_metrics = {
         row["id"] for row in conn.execute(
-            "SELECT id FROM metrics WHERE scenario_id=?",
+            "SELECT name AS id FROM metrics WHERE scenario_id=?",
             (scenario_id,),
+        ).fetchall()
+    }
+    class_db_ids = {
+        row["schema_name"]: row["id"] for row in conn.execute(
+            "SELECT id, schema_name FROM schema_classes WHERE scenario_id=?", (scenario_id,)
         ).fetchall()
     }
     metrics = []
     seen_metric_ids = set()
     for c in raw_metrics:
-        metric_id = c.get("id")
+        metric_id = str(c.get("name") or c.get("name_cn") or c.get("id") or "").strip()
         definition = c.get("definition") if isinstance(c.get("definition"), dict) else {}
         if not metric_id or definition.get("version") != 1:
             continue
@@ -453,15 +454,18 @@ def _sync_schema_db(scenario_id: str):
             skipped_duplicates["metrics"] += 1
             continue
         seen_metric_ids.add(metric_id)
-        if c["id"] in reviewed_metrics:
+        if metric_id in reviewed_metrics:
             skipped_reviewed["metrics"] += 1
             continue
+        target_class_id = class_db_ids.get(definition.get("anchor_class", ""))
+        if target_class_id is None:
+            continue
+        definition = replace_definition_class_refs(definition, class_db_ids)
         metrics.append((
-            c["id"], scenario_id, c.get("name", c.get("name_cn", c["id"])), c.get("description", ""),
-            c.get("category", ""), definition.get("anchor_class", ""), _json_text(definition),
-            _json_text(c.get("dimensions")), _json_text(c.get("required_dimensions")),
+            metric_id, scenario_id, metric_id, c.get("description", ""),
+            c.get("category", ""), target_class_id, _json_text(definition),
+            _json_text(c.get("dimensions")),
             c.get("chart_type", "bar"), c.get("sort_order", 0),
-            _reviewed_value(c.get("is_reviewed", False)),
         ))
 
     for item in classes:
@@ -469,14 +473,14 @@ def _sync_schema_db(scenario_id: str):
         if class_id in existing_classes:
             conn.execute(
                 """UPDATE schema_classes
-                   SET name_cn=?, description=?, properties=?, primary_key=?, table_name=?, fields=?, is_reviewed=?, review_status='pending', updated_at=CURRENT_TIMESTAMP
-                   WHERE id=? AND scenario_id=? AND is_reviewed IS NOT TRUE AND COALESCE(review_status, 'pending') NOT IN ('approved','rejected')""",
-                (item[2], item[3], item[4], item[5], item[6], item[7], item[8], class_id, scenario_id),
+                         SET name_cn=?, description=?, primary_key=?, table_name=?, fields=?, is_reviewed=?, review_status='pending', updated_at=CURRENT_TIMESTAMP
+                 WHERE schema_name=? AND scenario_id=? AND is_reviewed IS NOT TRUE AND COALESCE(review_status, 'pending') NOT IN ('approved','rejected')""",
+                    (item[2], item[3], item[4], item[5], item[6], item[7], class_id, scenario_id),
             )
         else:
             conn.execute(
-                "INSERT INTO schema_classes (id, scenario_id, name_cn, description, properties, primary_key, table_name, fields, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-                item,
+                "INSERT INTO schema_classes (schema_name, scenario_id, name_cn, description, primary_key, table_name, fields, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                item[1:],
             )
 
     for item in rels:
@@ -569,17 +573,20 @@ def _sync_schema_db(scenario_id: str):
         if metric_id in existing_metrics:
             conn.execute(
                 """UPDATE metrics
-                         SET name=?, description=?, category=?, target_class=?, definition=?, dimensions=?, required_dimensions=?, chart_type=?, sort_order=?, is_reviewed=?, review_status='pending', updated_at=CURRENT_TIMESTAMP
-                   WHERE id=? AND scenario_id=? AND is_reviewed IS NOT TRUE AND COALESCE(review_status, 'pending') NOT IN ('approved','rejected')""",
-                (item[2], item[3], item[4], item[5], item[6], item[7], item[8], item[9], item[10], item[11], metric_id, scenario_id),
+                         SET name=?, description=?, category=?, target_class=?, definition=?, dimensions=?, chart_type=?, sort_order=?, review_status='pending', updated_at=CURRENT_TIMESTAMP
+                     WHERE name=? AND scenario_id=? AND COALESCE(review_status, 'pending') NOT IN ('approved','rejected')""",
+                    (item[2], item[3], item[4], item[5], item[6], item[7], item[8], item[9], metric_id, scenario_id),
             )
         else:
             conn.execute(
-                "INSERT INTO metrics (id, scenario_id, name, description, category, target_class, definition, dimensions, required_dimensions, chart_type, sort_order, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'pending', CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-                item,
+                "INSERT INTO metrics (scenario_id, name, description, category, target_class, definition, dimensions, chart_type, sort_order, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,'pending', CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                item[1:],
             )
         if metric_id not in reviewed_metrics:
-            source_metric = next((metric for metric in raw_metrics if metric.get("id") == metric_id), {})
+            source_metric = next((
+                metric for metric in raw_metrics
+                if str(metric.get("name") or metric.get("name_cn") or metric.get("id") or "").strip() == metric_id
+            ), {})
             group_ids = [
                 str(group_id).strip()
                 for group_id in source_metric.get("dimension_group_ids", [])

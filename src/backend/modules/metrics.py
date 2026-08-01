@@ -66,7 +66,39 @@ def _physical_metric_definition(definition: dict, class_field_map: dict[str, dic
     return normalized
 
 
-def _validate_metric_definition(scenario_id: str, definition: dict) -> tuple[str, list[str], dict]:
+def _hydrate_metric_definition_class_refs(scenario_id: str, definition: dict) -> dict:
+    """Convert persisted numeric Class IDs to schema names for API/runtime use."""
+    normalized = json.loads(json.dumps(_metric_definition(definition)))
+    conn = get_db()
+    try:
+        class_names = {
+            row["id"]: row["schema_name"]
+            for row in conn.execute(
+                "SELECT id, schema_name FROM schema_classes WHERE scenario_id=?", (scenario_id,)
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+    def resolve(value):
+        if isinstance(value, int):
+            return class_names.get(value, value)
+        return value
+
+    normalized["anchor_class"] = resolve(normalized.get("anchor_class"))
+    input_groups = [normalized.get("inputs", [])]
+    input_groups.extend(
+        output.get("inputs", []) for output in normalized.get("outputs", [])
+        if isinstance(output, dict)
+    )
+    for inputs in input_groups:
+        for item in inputs if isinstance(inputs, list) else []:
+            if isinstance(item, dict):
+                item["class_id"] = resolve(item.get("class_id"))
+    return normalized
+
+
+def _validate_metric_definition(scenario_id: str, definition: dict) -> tuple[int, list[str], dict]:
     definition = _metric_definition(definition)
     version = definition.get("version")
     if version not in {1, 2}:
@@ -106,10 +138,11 @@ def _validate_metric_definition(scenario_id: str, definition: dict) -> tuple[str
                 "并列输出计算结果调整值",
             )
     conn = get_db()
-    rows = conn.execute("SELECT id, fields, properties FROM schema_classes WHERE scenario_id=?", (scenario_id,)).fetchall()
+    rows = conn.execute("SELECT id AS db_id, schema_name AS id, fields FROM schema_classes WHERE scenario_id=?", (scenario_id,)).fetchall()
     conn.close()
     class_fields = {}
     class_field_map = {}
+    class_db_ids = {}
     for row in rows:
         try:
             fields = json.loads(row["fields"] or "[]")
@@ -133,6 +166,7 @@ def _validate_metric_definition(scenario_id: str, definition: dict) -> tuple[str
                 field_map[logical_name] = physical_name
         class_field_map[row["id"]] = field_map
         class_fields[row["id"]] = set(field_map.values())
+        class_db_ids[row["id"]] = row["db_id"]
     definition = _physical_metric_definition(definition, class_field_map)
     if anchor_class not in class_fields:
         raise HTTPException(400, "锚点类不存在")
@@ -171,7 +205,27 @@ def _validate_metric_definition(scenario_id: str, definition: dict) -> tuple[str
                 if operator not in {"IS NULL", "IS NOT NULL"} and filter_item.get("value") in (None, "", []):
                     raise HTTPException(400, "指标组成项的固定条件必须包含值")
             source_classes.append(class_id)
-    return anchor_class, list(dict.fromkeys(source_classes)), definition
+    definition["anchor_class"] = class_db_ids[anchor_class]
+    input_groups = [definition.get("inputs", [])]
+    input_groups.extend(
+        output.get("inputs", []) for output in definition.get("outputs", [])
+        if isinstance(output, dict)
+    )
+    for inputs in input_groups:
+        for item in inputs if isinstance(inputs, list) else []:
+            if isinstance(item, dict):
+                item["class_id"] = class_db_ids[str(item.get("class_id") or "")]
+    return class_db_ids[anchor_class], list(dict.fromkeys(source_classes)), definition
+
+
+def _resolve_class_db_id(conn, scenario_id: str, schema_name: str) -> int:
+    row = conn.execute(
+        "SELECT id FROM schema_classes WHERE scenario_id=? AND schema_name=?",
+        (scenario_id, schema_name),
+    ).fetchone()
+    if not row:
+        raise HTTPException(400, "目标类不存在")
+    return row["id"]
 
 
 def _reviewed_value(value) -> bool:
@@ -196,17 +250,6 @@ def _review_status(value, is_reviewed=False) -> str:
 
 def _is_reviewed_status(value) -> int:
     return {"rejected": -1, "approved": 1}.get(value, 0)
-
-
-def _sync_ontology_files(scenario_id: str):
-    from modules.schema import _sync_schema_files
-    from prompts.prompt import reset_engine
-
-    try:
-        _sync_schema_files(scenario_id)
-        reset_engine(scenario_id)
-    except Exception as e:
-        raise HTTPException(500, f"数据已保存，但同步 schema 文件失败: {e}")
 
 
 def _validate_dimension_group_ids(conn, scenario_id: str, group_ids: list[str]) -> list[str]:
@@ -289,7 +332,12 @@ def _replace_metric_concept_bindings(
 async def list_metrics(scenario_id: str):
     conn = get_db()
     rows = conn.execute(
-        "SELECT * FROM metrics WHERE scenario_id=? ORDER BY sort_order, category",
+        """SELECT metrics.id AS db_id, metrics.name AS id, metrics.scenario_id, metrics.name, metrics.description, metrics.category,
+              schema_classes.schema_name AS target_class, metrics.target_class AS target_class_db_id,
+                  metrics.dimensions, metrics.definition, metrics.chart_type, metrics.sort_order,
+              metrics.review_status, metrics.created_at, metrics.updated_at
+           FROM metrics LEFT JOIN schema_classes ON schema_classes.id=metrics.target_class AND schema_classes.scenario_id=metrics.scenario_id
+           WHERE metrics.scenario_id=? ORDER BY metrics.sort_order, metrics.category""",
         (scenario_id,)
     ).fetchall()
     binding_rows = conn.execute(
@@ -314,7 +362,6 @@ async def list_metrics(scenario_id: str):
     for r in rows:
         d = dict(r)
         d["dimensions"] = json.loads(d.get("dimensions", "[]"))
-        d["required_dimensions"] = json.loads(d.get("required_dimensions", "[]"))
         d["dimension_group_ids"] = bindings.get(d["id"], [])
         d["concept_bindings"] = concept_bindings.get(d["id"], [])
         try:
@@ -324,15 +371,16 @@ async def list_metrics(scenario_id: str):
         # Keep the editor compatible with definitions saved before physical names
         # became mandatory. A subsequent save persists the normalized definition.
         try:
-            _, _, d["definition"] = _validate_metric_definition(
+            semantic_definition = _hydrate_metric_definition_class_refs(
                 scenario_id, d["definition"]
             )
+            _validate_metric_definition(scenario_id, semantic_definition)
+            d["definition"] = semantic_definition
         except HTTPException:
-            pass
+            d["definition"] = _hydrate_metric_definition_class_refs(scenario_id, d["definition"])
         # chart_type 可能不存在于旧数据库中
         d.setdefault("chart_type", "bar")
-        d["review_status"] = _review_status(d.get("review_status"), d.get("is_reviewed", 0))
-        d["is_reviewed"] = _is_reviewed_status(d["review_status"])
+        d["review_status"] = _review_status(d.get("review_status"))
         result.append(d)
     return result
 
@@ -353,12 +401,11 @@ async def replace_metric_concept_bindings(
     conn = get_db()
     try:
         if not conn.execute(
-            "SELECT 1 FROM metrics WHERE scenario_id=? AND id=?", (scenario_id, metric_id)
+            "SELECT 1 FROM metrics WHERE scenario_id=? AND name=?", (scenario_id, metric_id)
         ).fetchone():
             raise HTTPException(404, "指标不存在")
         _replace_metric_concept_bindings(conn, scenario_id, metric_id, bindings)
         conn.commit()
-        _sync_ontology_files(scenario_id)
     except HTTPException:
         conn.rollback()
         raise
@@ -380,9 +427,9 @@ async def metric_field_values(
 ):
     """Return bounded DISTINCT values for a configured physical Class field."""
     try:
-        from prompts.prompt import init_prompt, get_query_engine
+        from agents.ontology_chatbi.services.helper import init_prompt, get_query_engine
 
-        init_prompt(scenario_id)
+        await init_prompt(scenario_id)
         query_engine = get_query_engine(scenario_id)
         if not query_engine.field_available_in_class(class_id, field):
             raise HTTPException(400, "字段不属于指定目标类")
@@ -397,7 +444,11 @@ async def metric_field_values(
 @router.post("/api/admin/scenarios/{scenario_id}/metrics", include_in_schema=False)
 async def create_metric(scenario_id: str, req: MetricCreate):
     conn = get_db()
-    review_status = _review_status(req.review_status, req.is_reviewed)
+    metric_name = req.name.strip()
+    if not metric_name:
+        conn.close()
+        raise HTTPException(400, "指标名称必填")
+    review_status = _review_status(req.review_status)
     anchor_class, _, definition = _validate_metric_definition(scenario_id, req.definition)
     try:
         dimension_group_ids = _validate_dimension_group_ids(
@@ -405,22 +456,20 @@ async def create_metric(scenario_id: str, req: MetricCreate):
         )
         conn.execute(
             """INSERT INTO metrics
-                             (id, scenario_id, name, description, category, target_class, definition,
-                dimensions, required_dimensions, chart_type, sort_order, is_reviewed, review_status, created_at, updated_at)
-                                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
-            (req.id, scenario_id, req.name, req.description, req.category,
+                             (scenario_id, name, description, category, target_class, definition,
+                dimensions, chart_type, sort_order, review_status, created_at, updated_at)
+                                        VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+            (scenario_id, req.name, req.description, req.category,
                          anchor_class, json.dumps(definition, ensure_ascii=False),
              json.dumps(req.dimensions, ensure_ascii=False),
-             json.dumps(req.required_dimensions, ensure_ascii=False),
-                 req.chart_type, req.sort_order, _is_reviewed_status(review_status), review_status),
+                 req.chart_type, req.sort_order, review_status),
         )
-        _replace_metric_dimension_bindings(conn, scenario_id, req.id, dimension_group_ids)
+        _replace_metric_dimension_bindings(conn, scenario_id, metric_name, dimension_group_ids)
         conn.commit()
     except Exception as e:
         conn.close()
         raise HTTPException(400, f"创建失败: {e}")
     conn.close()
-    _sync_ontology_files(scenario_id)
     return {"status": "ok"}
 
 
@@ -445,23 +494,18 @@ async def update_metric(scenario_id: str, metric_id: str, req: MetricUpdate):
             conn.close()
             raise HTTPException(400, "目标类必填")
         sets.append("target_class=?")
-        vals.append(req.target_class.strip())
+        vals.append(_resolve_class_db_id(conn, scenario_id, req.target_class.strip()))
     if req.dimensions is not None:
         sets.append("dimensions=?")
         vals.append(json.dumps(req.dimensions, ensure_ascii=False))
-    if req.required_dimensions is not None:
-        sets.append("required_dimensions=?")
-        vals.append(json.dumps(req.required_dimensions, ensure_ascii=False))
     if req.dimension_group_ids is not None:
         dimension_group_ids = _validate_dimension_group_ids(
             conn, scenario_id, req.dimension_group_ids
         )
         _replace_metric_dimension_bindings(conn, scenario_id, metric_id, dimension_group_ids)
         sets.append("updated_at=CURRENT_TIMESTAMP")
-    if req.review_status is not None or req.is_reviewed is not None:
-        review_status = _review_status(req.review_status, req.is_reviewed)
-        sets.append("is_reviewed=?")
-        vals.append(_is_reviewed_status(review_status))
+    if req.review_status is not None:
+        review_status = _review_status(req.review_status)
         sets.append("review_status=?")
         vals.append(review_status)
     if not sets:
@@ -469,11 +513,21 @@ async def update_metric(scenario_id: str, metric_id: str, req: MetricUpdate):
         return {"status": "ok"}
     if "updated_at=CURRENT_TIMESTAMP" not in sets:
         sets.append("updated_at=CURRENT_TIMESTAMP")
+    old_metric_name = metric_id
+    new_metric_name = req.name.strip() if req.name else old_metric_name
     vals.extend([metric_id, scenario_id])
-    conn.execute(f"UPDATE metrics SET {','.join(sets)} WHERE id=? AND scenario_id=?", vals)
+    conn.execute(f"UPDATE metrics SET {','.join(sets)} WHERE name=? AND scenario_id=?", vals)
+    if new_metric_name != old_metric_name:
+        conn.execute(
+            "UPDATE metric_dimension_bindings SET metric_id=? WHERE scenario_id=? AND metric_id=?",
+            (new_metric_name, scenario_id, old_metric_name),
+        )
+        conn.execute(
+            "UPDATE metric_concept_bindings SET metric_id=? WHERE scenario_id=? AND metric_id=?",
+            (new_metric_name, scenario_id, old_metric_name),
+        )
     conn.commit()
     conn.close()
-    _sync_ontology_files(scenario_id)
     return {"status": "ok"}
 
 
@@ -482,10 +536,10 @@ async def update_metric(scenario_id: str, metric_id: str, req: MetricUpdate):
 async def delete_metric(scenario_id: str, metric_id: str):
     conn = get_db()
     conn.execute("DELETE FROM metric_dimension_bindings WHERE scenario_id=? AND metric_id=?", (scenario_id, metric_id))
-    conn.execute("DELETE FROM metrics WHERE id=? AND scenario_id=?", (metric_id, scenario_id))
+    conn.execute("DELETE FROM metric_concept_bindings WHERE scenario_id=? AND metric_id=?", (scenario_id, metric_id))
+    conn.execute("DELETE FROM metrics WHERE name=? AND scenario_id=?", (metric_id, scenario_id))
     conn.commit()
     conn.close()
-    _sync_ontology_files(scenario_id)
     return {"status": "ok"}
 
 
@@ -502,15 +556,18 @@ async def batch_delete_metrics(scenario_id: str, req: MetricBatchDelete):
             "DELETE FROM metric_dimension_bindings WHERE scenario_id=? AND metric_id=?",
             [(scenario_id, metric_id) for metric_id in ids],
         )
+        conn.executemany(
+            "DELETE FROM metric_concept_bindings WHERE scenario_id=? AND metric_id=?",
+            [(scenario_id, metric_id) for metric_id in ids],
+        )
         cursor = conn.executemany(
-            "DELETE FROM metrics WHERE id=? AND scenario_id=?",
+            "DELETE FROM metrics WHERE name=? AND scenario_id=?",
             [(metric_id, scenario_id) for metric_id in ids],
         )
         deleted = cursor.rowcount if cursor.rowcount >= 0 else len(ids)
         conn.commit()
     finally:
         conn.close()
-    _sync_ontology_files(scenario_id)
     return {"status": "ok", "deleted": deleted}
 
 
@@ -522,7 +579,11 @@ def lookup_metric(scenario_id: str, metric_name: str) -> dict | None:
     """按名称模糊匹配指标，返回完整指标定义"""
     conn = get_db()
     rows = conn.execute(
-        "SELECT * FROM metrics WHERE scenario_id=?",
+         """SELECT metrics.name AS id, metrics.name, metrics.description, metrics.category,
+                schema_classes.schema_name AS target_class, metrics.definition, metrics.dimensions,
+                  metrics.chart_type
+            FROM metrics LEFT JOIN schema_classes ON schema_classes.id=metrics.target_class AND schema_classes.scenario_id=metrics.scenario_id
+            WHERE metrics.scenario_id=?""",
         (scenario_id,)
     ).fetchall()
     conn.close()
@@ -535,9 +596,10 @@ def lookup_metric(scenario_id: str, metric_name: str) -> dict | None:
                 "description": r["description"],
                 "category": r["category"],
                 "target_class": r["target_class"],
-                "definition": json.loads(r.get("definition") or "{}"),
+                "definition": _hydrate_metric_definition_class_refs(
+                    scenario_id, json.loads(r.get("definition") or "{}")
+                ),
                 "dimensions": json.loads(r["dimensions"]),
-                "required_dimensions": json.loads(r.get("required_dimensions", "[]")),
                 "chart_type": r.get("chart_type", "bar"),
             }
     return None
@@ -581,7 +643,6 @@ async def create_concept(scenario_id: str, req: ConceptCreate):
         conn.close()
         raise HTTPException(400, f"创建失败: {e}")
     conn.close()
-    _sync_ontology_files(scenario_id)
     return {"status": "ok"}
 
 
@@ -610,7 +671,6 @@ async def update_concept(scenario_id: str, concept_id: str, req: ConceptUpdate):
     conn.execute(f"UPDATE concepts SET {','.join(sets)} WHERE id=? AND scenario_id=?", vals)
     conn.commit()
     conn.close()
-    _sync_ontology_files(scenario_id)
     return {"status": "ok"}
 
 
@@ -620,5 +680,4 @@ async def delete_concept(scenario_id: str, concept_id: str):
     conn.execute("DELETE FROM concepts WHERE id=? AND scenario_id=?", (concept_id, scenario_id))
     conn.commit()
     conn.close()
-    _sync_ontology_files(scenario_id)
     return {"status": "ok"}

@@ -1,7 +1,7 @@
 import unittest
 
 from agents.ontology_chatbi.node.plan_execute_agent import PlanExecuteAgent
-from agents.ontology_chatbi.prompt import get_query_mode_routing_prompt
+from agents.ontology_chatbi.services.prompt import get_query_mode_routing_prompt
 
 
 SCHEMA_CONTEXT = "- **SalesFact**(销售事实): 销售业绩明细\n- **InventoryFact**(库存事实): 库存与可用量明细"

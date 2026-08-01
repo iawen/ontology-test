@@ -41,7 +41,12 @@ class OntologyAssetValidator:
         for cls in classes:
             if not isinstance(cls, dict):
                 continue
-            cid = str(cls.get("id", "")).strip()
+            cid = str(cls.get("schema_name") or cls.get("id") or "").strip()
+            if cid:
+                # schema_name is the external/database contract. `id` remains
+                # a semantic compatibility alias in serialized ontology assets.
+                cls["schema_name"] = cid
+                cls["id"] = cid
             source = self._resolve_class_source(cls)
             summary = summary_index.get(source) or summary_index.get(source.lower())
             if not cid or not summary:
@@ -310,19 +315,12 @@ class OntologyAssetValidator:
                 continue
 
             dimensions = self._parse_json_list(metric.get("dimensions", []))
-            required_dimensions = self._parse_json_list(metric.get("required_dimensions", []))
             valid_dimensions = [field for field in dimensions if field in fields]
             invalid_dimensions = [field for field in dimensions if field not in fields]
             if invalid_dimensions:
                 self._log_asset_drop("metric_dimension", metric_id, f"剔除无效维度字段: {invalid_dimensions}")
 
-            invalid_required = [field for field in required_dimensions if field not in valid_dimensions]
-            if invalid_required:
-                self._log_asset_drop("metric", metric_id, f"required_dimensions 包含无效字段: {invalid_required}")
-                continue
-
             metric["dimensions"] = json.dumps(valid_dimensions, ensure_ascii=False)
-            metric["required_dimensions"] = json.dumps(required_dimensions, ensure_ascii=False)
             metric["dimension_group_ids"] = [
                 group_id for group_id in self._parse_json_list(metric.get("dimension_group_ids", []))
                 if group_id in valid_group_ids

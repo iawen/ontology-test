@@ -1,7 +1,7 @@
 import unittest
 
 from agents.ontology_chatbi.node.ontology_agent import OntologyAgent
-from agents.ontology_chatbi.prompt import get_query_details_planning_prompt
+from agents.ontology_chatbi.services.prompt import get_query_details_planning_prompt
 
 
 class FakeOntologyEngine:
@@ -93,6 +93,7 @@ class OntologyAgentMetricIdTests(unittest.TestCase):
 
         self.assertFalse(result["valid"])
         self.assertIn("Metric 或并列输出 ID", result["error"])
+        self.assertIn("actual_sales", result["error"])
 
     def test_query_detail_prompt_requires_metric_ids(self):
         prompt = get_query_details_planning_prompt("查询销售", "## Metrics\n- id=actual_sales")
@@ -100,6 +101,7 @@ class OntologyAgentMetricIdTests(unittest.TestCase):
         self.assertIn('"metrics":["Metric 或并列输出 ID"]', prompt)
         self.assertIn("必须填写列表中展示的 ID", prompt)
         self.assertIn("只通过该 ID 获取对应 Metric 定义", prompt)
+        self.assertIn("Class` 区域出现的任何字段都不是 Metric ID", prompt)
 
     def test_reused_plan_keeps_parent_filters_and_metrics_when_delta_only_adds_filter(self):
         merged = OntologyAgent._merge_reusable_query_plan(

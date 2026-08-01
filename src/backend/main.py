@@ -17,7 +17,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from configs.global_config import Cfg
 from core.models.models import LoginReq
 from core.db.db import get_db, init_db
-from prompts.prompt import get_engine
 from tools.helpers import create_token
 
 
@@ -71,11 +70,8 @@ async def login(req: LoginReq):
 
 @app.get("/api/health")
 async def health():
-    engine = get_engine()
     return {
         "status": "ok",
-        "model": Cfg.model_name,
-        "classes": len(engine.list_classes()) if engine else 0,
     }
 
 

@@ -18,7 +18,7 @@ PHASE1_TABLE_PROMPT = """你是一个顶级数据仓库建模与本体论专家�
 请输出标准 JSON 格式，严禁夹带任何 Markdown 解释文本，结构必须严格如下：
 {{
 	"class": {{
-		"id": "PascalCase类名，如 Sale 或 PbtProcessMonitoring",
+        "schema_name": "PascalCase Schema 名称，如 Sale 或 PbtProcessMonitoring；这是 Class 的业务唯一键，不是数据库自增长 id",
 		"name_cn": "中文逻辑名称",
 		"description": "该实体在业务上的核心定义与边界描述",
 		"primary_key": "主键物理列名，必须从当前分片的 columns 中选择",
@@ -54,7 +54,7 @@ PHASE2_DIMENSION_GROUP_PROMPT = """你是企业语义层与维度建模专家。
 2. `id` 使用稳定下划线英文，如 `time_granularity`、`region`；`name` 使用业务名称。
 3. `group_type` 仅为 `time`、`categorical` 或 `hierarchy`。
 4. `options` 是面向业务用户的选择。时间组可包含“按月/按季度/按财年”等选项；每项 value 必须稳定、唯一，label 必须可读，只有一个默认项。
-5. `field_mappings` 负责把 option 映射到真实 Class 的**逻辑字段名**；class_id 和 field_name 必须来自上方 Schema。一个 option 可有多个 Class 映射以支持多表。
+5. `field_mappings` 负责把 option 映射到真实 Class 的**逻辑字段名**；class_id 必须引用上方 Class 的 `schema_name`，field_name 必须来自上方 Schema。一个 option 可有多个 Class 映射以支持多表。
 6. 只有未指定会导致指标统计口径明显不完整的组才设置 `is_required=true`。时间粒度通常可设为必选，并可通过 `default_option` 与 `clarification_policy="auto_fill"` 降低追问频率。
 7. 不确定的字段不要映射；宁可少输出，也不得虚构 Class 或字段。
 
@@ -98,16 +98,16 @@ PHASE3_GLOBAL_PROMPT = """你是企业指标语义建模专家。第一、二阶
 
 ## 结构化 Metric definition 规则（必须严格遵守）
 1. 每个 Metric 必须提供 `definition`，且 `version` 固定为 1；不得输出 `formula`、`calculation`、`value_field`、顶层 `aggregation` 或顶层 `metric_filters` 等旧字段。
-2. `definition.anchor_class` 是指标的查询锚点，必须是上方 Class 的 ID；`target_class` 必须与它完全相同。
+2. `definition.anchor_class` 是指标的查询锚点，必须是上方 Class 的 `schema_name`；`target_class` 必须与它完全相同。
 3. 每个 `inputs[]` 是独立聚合来源，必须包含 `id`、`output_name`、`class_id`、`source_shape`、`field`、`aggregation`、`filters`：
-    - `class_id` 必须来自上方 Class ID；`inputs[].field` 与 `inputs[].filters[].field` 必须使用该 Class 的**物理字段名**（`name`）；`dimensions`、`required_dimensions` 使用逻辑字段名（`name_cn`）。不可臆造字段。
+    - `class_id` 必须引用上方 Class 的 `schema_name`；`inputs[].field` 与 `inputs[].filters[].field` 必须使用该 Class 的**物理字段名**（`name`）；`dimensions` 使用逻辑字段名（`name_cn`）。不可臆造字段。
 		- 宽表：`source_shape="wide"`，直接选择业务数值字段；`filters` 通常为空。
 		- 窄表：`source_shape="long"`，选择公共数值字段，且必须至少一个 `filters` 固定 WHERE 条件来识别 KPI、规格、品类或序列。
 		- `filters` 的操作符仅允许 `=`、`!=`、`IN`、`NOT IN`、`IS NULL`、`IS NOT NULL`；`IN` / `NOT IN` 的 value 必须是数组。
 4. 单输入指标使用 `ADD`。同口径并列展示的多个结果使用 `CONCAT`，每个输入必须具有唯一且业务可读的 `output_name`。只有业务上确需组合计算时，才使用 `ADD`、`SUBTRACT`、`MULTIPLY` 或 `DIVIDE`。可选 `offset` 是表达式完成后追加的有限数字；例如同比或环比增长率应使用 `DIVIDE`、两个输入，并设置 `offset: -1`，即 `(分子 / NULLIF(分母, 0)) - 1`。`CONCAT` 不得设置非零 `offset`。
 5. 跨 Class Metric 的每个输入 Class 必须可通过下方 `relationships` 与 anchor_class 连通；无法确认关联时，不要生成跨 Class Metric。
-6. 每个 Metric 必须输出 `dimension_group_ids`，只引用上方已提取的维度组 ID。不要创建不存在的维度组 ID；没有适用组时输出空数组。`required_dimensions` 保留为兼容字段，优先输出空数组，必选治理由维度组的 `is_required` 负责。
-7. `dimensions` 必须属于 anchor_class；`required_dimensions` 是 `dimensions` 的子集。
+6. 每个 Metric 必须输出 `dimension_group_ids`，只引用上方已提取的维度组 ID。不要创建不存在的维度组 ID；没有适用组时输出空数组。必选治理由维度组的 `is_required` 负责。
+7. `dimensions` 必须属于 anchor_class。
 8. Relationships 必须结合数据源目录、字段名、主键/外键线索和 Metric 依赖判断，不能只按字段名称猜测。
 
 ## 输出要求
@@ -115,8 +115,8 @@ PHASE3_GLOBAL_PROMPT = """你是企业指标语义建模专家。第一、二阶
 {{
 	"relationships": [
 		{{
-			"source": "源 Class ID",
-			"target": "目标 Class ID",
+      "source": "源 Class schema_name",
+      "target": "目标 Class schema_name",
 			"type": "belongs_to / has_many / references / correlates_with / affects",
 			"source_key": "源 Class 中的关联物理字段名（多字段逗号分隔）",
 			"target_key": "目标 Class 中的关联物理字段名（多字段逗号分隔）",
@@ -125,20 +125,19 @@ PHASE3_GLOBAL_PROMPT = """你是企业指标语义建模专家。第一、二阶
 	],
     "metrics": [
     {{
-        "id": "下划线英文指标ID，如 total_sales",
-        "name": "指标中文名称",
+        "name": "唯一的指标中文名称，如销售总额；它是指标的业务键，不是数据库自增长 id",
         "description": "指标口径、业务含义和适用场景",
         "category": "销售 / 质量 / 生产 / 财务等分类",
-        "target_class": "与 definition.anchor_class 完全相同的 Class ID",
+        "target_class": "与 definition.anchor_class 完全相同的 Class schema_name",
         "definition": {{
             "version": 1,
-            "anchor_class": "Class ID",
+            "anchor_class": "Class schema_name",
             "expression_operator": "ADD / SUBTRACT / MULTIPLY / DIVIDE / CONCAT",
             "offset": 0,
             "inputs": [{{
                 "id": "input_1",
                 "output_name": "组成项中文名称",
-                "class_id": "Class ID",
+                "class_id": "Class schema_name",
                 "source_shape": "wide / long",
                 "field": "物理数值字段名",
                 "aggregation": "SUM / AVG / MIN / MAX / COUNT / COUNT_DISTINCT",
@@ -146,7 +145,6 @@ PHASE3_GLOBAL_PROMPT = """你是企业指标语义建模专家。第一、二阶
             }}]
         }},
         "dimensions": ["锚点类逻辑维度字段名"],
-        "required_dimensions": ["锚点类必要逻辑维度字段名"],
         "dimension_group_ids": ["time_granularity"],
         "chart_type": "bar / line / pie / table / scatter / heatmap / funnel / radar"
     }}
@@ -173,7 +171,7 @@ PHASE3_CONCEPT_PROMPT = """你是企业本体与领域驱动设计专家。Class
 1. Concepts 必须为多级树，不能全部平铺；每个非顶级节点的 parent_id 必须指向本次输出的 Concepts ID。
 2. 顶级节点：level=1、parent_id=""、concept_type="subject_domain"，表示宏观业务主题域。
 3. 二级节点：level=2，使用 `dimension_group` 或 `fact_group`，归属到一个主题域。
-4. 三级实体节点：level=3，关联一个实际 Class，related_class 必须来自上方实体类 ID。
+4. 三级实体节点：level=3，关联一个实际 Class，related_class 必须引用上方实体类的 `schema_name`。
 5. KPI/指标概念应挂在 `fact_group` 下；若引用业务实体，related_class 填对应 Metric 的 anchor_class，并在 description 中说明覆盖的 Metrics。
 6. 每个 Class 至少应有一个 related_class 指向它的概念节点；概念 ID 使用下划线英文且唯一。
 
@@ -187,7 +185,7 @@ PHASE3_CONCEPT_PROMPT = """你是企业本体与领域驱动设计专家。Class
             "parent_id": "",
             "level": 1,
             "concept_type": "subject_domain / dimension_group / fact_group",
-            "related_class": "可选的 Class ID；非实体节点留空"
+            "related_class": "可选的 Class schema_name；非实体节点留空"
         }}
     ]
 }}
@@ -233,9 +231,9 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
 ## 优化要求
 1. {stage_rules}
 2. **去重与合并**：不得生成与当前批次、前置阶段资产、reviewed 或 existing_unreviewed 中语义相同或高度相似（同义词、缩写、仅措辞不同）的资产；应复用最合适的已有未审核 ID 并增量修正。
-3. **Class 优化**：根据文档修正 name_cn、description，fields 只输出需优化的字段（排除已正确的）。
+3. **Class 优化**：Class 对象只能使用 `schema_name` 作为稳定的文本业务键；它对应数据库中的 `schema_classes.schema_name`。严禁生成或引用数据库自增长的数字 `id`。所有关系、Metric 和维度组中的 Class 引用必须使用该 `schema_name`。根据文档修正 name_cn、description，fields 只输出需优化的字段（排除已正确的）。
 4. **维度组优化与发现**：根据文档修正业务名称、选项、别名、默认值与 Class 逻辑字段映射；当 dimension_discovery 为 true 时，额外识别当前系统缺失、可被多个 Metric 复用的时间/分类/层级维度组并输出。已有维度组必须保留原 ID；新维度组必须提供稳定英文下划线 ID、至少一个选项和至少一条映射。不允许使用物理字段名替代业务字段，也不得把临时过滤条件建成维度组。
-5. **Metric 优化**：根据文档修正 name、description、definition、dimensions、required_dimensions、dimension_group_ids；definition.inputs 中每项均需包含 id、output_name、class_id、source_shape、field、aggregation、filters。long 输入必须有固定 filters。
+5. **Metric 优化**：Metric 只使用唯一的中文 `name` 作为业务键；严禁生成或引用数据库自增长 `id`。根据文档修正 name、description、definition、dimensions、dimension_group_ids；definition.inputs 中每项均需包含 id、output_name、class_id、source_shape、field、aggregation、filters。long 输入必须有固定 filters。
 5. **Relationship 优化**：根据文档补充或修正 source_key/target_key。
 6. **Concept 优化**：根据文档补充概念层级，parent_id 只能引用当前或前置阶段已存在的 Concept。
 7. **已有资产保护**：如果优化建议与 reviewed 冲突，必须以 reviewed 为准；不得输出 reviewed 的 ID。
@@ -244,16 +242,16 @@ existing_unreviewed 中的资产是此前提取或优化得到的已有上下文
 输出标准 JSON，结构如下：
 {{
   "classes": [
-	{{"id": "原ID", "name_cn": "优化后中文名", "description": "优化后描述", "primary_key": "", "table_name": "", "fields": []}}
+	{{"schema_name": "原 schema_name", "name_cn": "优化后中文名", "description": "优化后描述", "primary_key": "", "table_name": "", "fields": []}}
   ],
   "relationships": [
-	{{"source": "类ID", "target": "类ID", "type": "belongs_to", "source_key": "源键", "target_key": "目标键", "join_key": ""}}
+  {{"source": "Class schema_name", "target": "Class schema_name", "type": "belongs_to", "source_key": "源键", "target_key": "目标键", "join_key": ""}}
   ],
   "metrics": [
-		{{"id": "原ID", "name": "优化后名称", "description": "优化后描述", "category": "", "target_class": "类ID", "definition": {{"version": 1, "anchor_class": "类ID", "expression_operator": "ADD", "inputs": []}}, "dimensions": ["col1"], "required_dimensions": [], "dimension_group_ids": ["time_granularity"], "chart_type": "bar"}}
+    {{"name": "唯一的优化后指标中文名称", "description": "优化后描述", "category": "", "target_class": "Class schema_name", "definition": {{"version": 1, "anchor_class": "Class schema_name", "expression_operator": "ADD", "inputs": []}}, "dimensions": ["col1"], "dimension_group_ids": ["time_granularity"], "chart_type": "bar"}}
 	],
 	"dimension_groups": [
-		{{"id": "已有组使用原ID；新组使用英文下划线ID", "name": "时间粒度", "description": "业务说明", "group_type": "time", "is_required": true, "default_option": "month", "clarification_policy": "auto_fill", "options": [{{"value": "month", "label": "按月", "aliases": [], "is_default": true}}], "field_mappings": [{{"option_value": "month", "class_id": "类ID", "field_name": "逻辑字段名", "display_name": "月份", "priority": 0}}]}}
+    {{"id": "已有组使用原ID；新组使用英文下划线ID", "name": "时间粒度", "description": "业务说明", "group_type": "time", "is_required": true, "default_option": "month", "clarification_policy": "auto_fill", "options": [{{"value": "month", "label": "按月", "aliases": [], "is_default": true}}], "field_mappings": [{{"option_value": "month", "class_id": "Class schema_name", "field_name": "逻辑字段名", "display_name": "月份", "priority": 0}}]}}
   ],
   "concepts": [
 	{{"id": "原ID", "name": "", "description": "", "parent_id": "", "level": 0, "concept_type": "entity", "related_class": ""}}
@@ -345,7 +343,7 @@ def build_quality_assessment_prompt(*, diff_summary: str, classes: str, metrics:
   "confidence": 0.85,
   "strengths": ["维度划分清晰", "指标口径一致"],
   "weaknesses": ["部分 Class 描述仍偏技术化"],
-  "high_risk_items": ["指标 'gmv' 缺少 required_dimensions"],
+    "high_risk_items": ["指标 'gmv' 缺少必要的维度组治理"],
   "summary": "整体质量较高，建议重点审核 high_risk_items"
 }}
 """

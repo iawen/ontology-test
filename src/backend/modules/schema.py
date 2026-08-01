@@ -62,17 +62,11 @@ def _normalize_fields(fields: list) -> list[dict]:
     return normalized
 
 
-def _field_names(fields: list[dict]) -> list[str]:
-    return [f.get("name_cn") or f.get("name") for f in fields if f.get("name_cn") or f.get("name")]
-
-
-def _field_map(fields: list[dict], properties: list[str]) -> dict:
-    if fields:
-        return {
-            (f.get("name") if f.get("physical_name") else f.get("name_cn") or f.get("name")): f.get("physical_name") or f.get("name")
-            for f in fields
-        }
-    return {p: p for p in properties}
+def _field_map(fields: list[dict]) -> dict:
+    return {
+        (f.get("name") if f.get("physical_name") else f.get("name_cn") or f.get("name")): f.get("physical_name") or f.get("name")
+        for f in fields
+    }
 
 
 def _field_types(fields: list[dict]) -> dict:
@@ -127,14 +121,15 @@ async def admin_list_classes(scenario_id: str):
     """管理面板：列出场景下所有 Schema 类"""
     conn = get_db()
     rows = conn.execute(
-        "SELECT * FROM schema_classes WHERE scenario_id=? ORDER BY id",
+        "SELECT * FROM schema_classes WHERE scenario_id=? ORDER BY schema_name",
         (scenario_id,)
     ).fetchall()
     conn.close()
     result = []
     for r in rows:
         d = dict(r)
-        d["properties"] = _json_list(d.get("properties", "[]"))
+        d["db_id"] = d["id"]
+        d["id"] = d["schema_name"]
         d["fields"] = _normalize_fields(_json_list(d.get("fields", "[]")))
         d["review_status"] = _review_status(d.get("review_status"), d.get("is_reviewed", 0))
         d["is_reviewed"] = _is_reviewed_status(d["review_status"])
@@ -148,15 +143,16 @@ async def admin_create_class(scenario_id: str, req: SchemaClassEdit):
     """管理面板：新增 Schema 类"""
     conn = get_db()
     fields = _normalize_fields(req.fields)
-    properties = req.properties or _field_names(fields)
+    schema_name = (req.schema_name or req.id).strip()
+    if not schema_name:
+        raise HTTPException(400, "Schema 名称不能为空")
     review_status = _review_status(req.review_status, req.is_reviewed)
     try:
         conn.execute(
             """INSERT INTO schema_classes
-                    (id, scenario_id, name_cn, description, properties, fields, table_name, primary_key, is_reviewed, review_status, created_at, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
-            (req.id, scenario_id, req.name_cn, req.description,
-             json.dumps(properties, ensure_ascii=False),
+                    (schema_name, scenario_id, name_cn, description, fields, table_name, primary_key, is_reviewed, review_status, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+            (schema_name, scenario_id, req.name_cn, req.description,
              json.dumps(fields, ensure_ascii=False),
                  req.table_name, req.primary_key, _is_reviewed_status(review_status), review_status),
         )
@@ -177,22 +173,21 @@ async def admin_update_class(scenario_id: str, class_id: str, req: SchemaClassEd
     """管理面板：更新 Schema 类；ID 变更时原子同步其引用。"""
     conn = get_db()
     fields = _normalize_fields(req.fields)
-    properties = req.properties or _field_names(fields)
     review_status = _review_status(req.review_status, req.is_reviewed)
-    new_class_id = req.id.strip()
+    new_class_id = (req.schema_name or req.id).strip()
     if not new_class_id:
         conn.close()
         raise HTTPException(400, "类 ID 不能为空")
     try:
         current = conn.execute(
-            "SELECT id FROM schema_classes WHERE id=? AND scenario_id=?",
+            "SELECT id FROM schema_classes WHERE schema_name=? AND scenario_id=?",
             (class_id, scenario_id),
         ).fetchone()
         if current is None:
             raise HTTPException(404, "待更新的类不存在")
         if new_class_id != class_id:
             duplicate = conn.execute(
-                "SELECT id FROM schema_classes WHERE id=? AND scenario_id=?",
+                "SELECT id FROM schema_classes WHERE schema_name=? AND scenario_id=?",
                 (new_class_id, scenario_id),
             ).fetchone()
             if duplicate is not None:
@@ -200,10 +195,9 @@ async def admin_update_class(scenario_id: str, class_id: str, req: SchemaClassEd
 
         conn.execute(
             """UPDATE schema_classes
-                      SET id=?, name_cn=?, description=?, properties=?, fields=?, table_name=?, primary_key=?, is_reviewed=?, review_status=?, updated_at=CURRENT_TIMESTAMP
-               WHERE id=? AND scenario_id=?""",
+                     SET schema_name=?, name_cn=?, description=?, fields=?, table_name=?, primary_key=?, is_reviewed=?, review_status=?, updated_at=CURRENT_TIMESTAMP
+                 WHERE schema_name=? AND scenario_id=?""",
             (new_class_id, req.name_cn, req.description,
-             json.dumps(properties, ensure_ascii=False),
              json.dumps(fields, ensure_ascii=False),
              req.table_name, req.primary_key, _is_reviewed_status(review_status), review_status,
              class_id, scenario_id),
@@ -217,6 +211,10 @@ async def admin_update_class(scenario_id: str, class_id: str, req: SchemaClassEd
                 "UPDATE schema_relationships SET target=?, updated_at=CURRENT_TIMESTAMP WHERE scenario_id=? AND target=?",
                 (new_class_id, scenario_id, class_id),
             )
+            conn.execute(
+                "UPDATE dimension_field_mappings SET class_id=? WHERE scenario_id=? AND class_id=?",
+                (new_class_id, scenario_id, class_id),
+            )
             _rename_metric_class_references(conn, scenario_id, class_id, new_class_id)
             conn.execute(
                 "UPDATE concepts SET related_class=?, updated_at=CURRENT_TIMESTAMP WHERE scenario_id=? AND related_class=?",
@@ -227,7 +225,7 @@ async def admin_update_class(scenario_id: str, class_id: str, req: SchemaClassEd
                 (new_class_id, scenario_id, class_id),
             )
             logger.info(
-                "Schema class renamed: scenario_id=%s old_id=%s new_id=%s; synchronized relationships, metrics, concepts, and alert rules",
+                "Schema class renamed: scenario_id=%s old_id=%s new_id=%s; synchronized relationships, dimension mappings, metrics, concepts, and alert rules",
                 scenario_id,
                 class_id,
                 new_class_id,
@@ -248,28 +246,8 @@ async def admin_update_class(scenario_id: str, class_id: str, req: SchemaClassEd
 
 
 def _rename_metric_class_references(conn, scenario_id: str, old_class_id: str, new_class_id: str) -> None:
-    """Replace exact class IDs in Metric anchors and structured input definitions."""
-    metric_rows = conn.execute(
-        "SELECT id, target_class, definition FROM metrics WHERE scenario_id=?",
-        (scenario_id,),
-    ).fetchall()
-    for row in metric_rows:
-        metric = dict(row)
-        target_class = new_class_id if metric.get("target_class") == old_class_id else metric.get("target_class", "")
-        definition = _json_dict(metric.get("definition"))
-        if definition.get("anchor_class") == old_class_id:
-            definition["anchor_class"] = new_class_id
-        for input_item in definition.get("inputs", []):
-            if isinstance(input_item, dict) and input_item.get("class_id") == old_class_id:
-                input_item["class_id"] = new_class_id
-        if definition.get("anchor_class"):
-            target_class = definition["anchor_class"]
-        if target_class != metric.get("target_class", "") or definition != _json_dict(metric.get("definition")):
-            conn.execute(
-                """UPDATE metrics SET target_class=?, definition=?, updated_at=CURRENT_TIMESTAMP
-                   WHERE id=? AND scenario_id=?""",
-                (target_class, json.dumps(definition, ensure_ascii=False), metric["id"], scenario_id),
-            )
+    """Metric Class references are numeric and remain valid across a rename."""
+    return None
 
 
 @router.delete("/api/scenarios/{scenario_id}/schema/classes/{class_id}")
@@ -279,7 +257,7 @@ async def admin_delete_class(scenario_id: str, class_id: str):
     conn = get_db()
     try:
         class_row = conn.execute(
-            "SELECT id FROM schema_classes WHERE id=? AND scenario_id=?",
+            "SELECT id FROM schema_classes WHERE schema_name=? AND scenario_id=?",
             (class_id, scenario_id),
         ).fetchone()
         if class_row is None:
@@ -287,7 +265,7 @@ async def admin_delete_class(scenario_id: str, class_id: str):
 
         # Metric 不仅可锚定该 Class，也可以在 definition.inputs 中将其作为来源。
         metric_rows = conn.execute(
-            "SELECT id, target_class, definition FROM metrics WHERE scenario_id=?",
+            "SELECT name AS id, target_class, definition FROM metrics WHERE scenario_id=?",
             (scenario_id,),
         ).fetchall()
         dependent_metric_ids = []
@@ -295,14 +273,14 @@ async def admin_delete_class(scenario_id: str, class_id: str):
             metric = dict(metric_row)
             definition = _json_dict(metric.get("definition"))
             input_class_ids = {
-                str(input_item.get("class_id") or "").strip()
+                input_item.get("class_id")
                 for input_item in definition.get("inputs", [])
                 if isinstance(input_item, dict)
             }
             if (
-                metric.get("target_class") == class_id
-                or definition.get("anchor_class") == class_id
-                or class_id in input_class_ids
+                metric.get("target_class") == class_row["id"]
+                or definition.get("anchor_class") == class_row["id"]
+                or class_row["id"] in input_class_ids
             ):
                 dependent_metric_ids.append(metric["id"])
 
@@ -317,12 +295,20 @@ async def admin_delete_class(scenario_id: str, class_id: str):
         deleted_metrics = 0
         if dependent_metric_ids:
             placeholders = ",".join("?" for _ in dependent_metric_ids)
+            conn.execute(
+                f"DELETE FROM metric_dimension_bindings WHERE scenario_id=? AND metric_id IN ({placeholders})",
+                (scenario_id, *dependent_metric_ids),
+            )
+            conn.execute(
+                f"DELETE FROM metric_concept_bindings WHERE scenario_id=? AND metric_id IN ({placeholders})",
+                (scenario_id, *dependent_metric_ids),
+            )
             deleted_metrics = conn.execute(
-                f"DELETE FROM metrics WHERE scenario_id=? AND id IN ({placeholders})",
+                f"DELETE FROM metrics WHERE scenario_id=? AND name IN ({placeholders})",
                 (scenario_id, *dependent_metric_ids),
             ).rowcount
         conn.execute(
-            "DELETE FROM schema_classes WHERE id=? AND scenario_id=?",
+            "DELETE FROM schema_classes WHERE schema_name=? AND scenario_id=?",
             (class_id, scenario_id),
         )
         conn.commit()
@@ -446,6 +432,7 @@ async def admin_delete_relationship(scenario_id: str, rel_id: int):
 
 def _sync_schema_files(scenario_id: str):
     """将数据库中的 schema 数据同步到 JSON 文件"""
+    from core.ontology.metric_class_refs import replace_definition_class_refs
     ontology_dir = os.path.join(Cfg.scenarios_root, scenario_id, "ontology")
     conn = get_db()
     classes = conn.execute(
@@ -455,7 +442,12 @@ def _sync_schema_files(scenario_id: str):
         "SELECT * FROM schema_relationships WHERE scenario_id=?", (scenario_id,)
     ).fetchall()
     metrics = conn.execute(
-        "SELECT * FROM metrics WHERE scenario_id=?", (scenario_id,)
+        """SELECT metrics.id AS db_id, metrics.name AS id, metrics.scenario_id, metrics.name, metrics.description, metrics.category,
+                  schema_classes.schema_name AS target_class, metrics.target_class AS target_class_db_id,
+                  metrics.dimensions, metrics.definition, metrics.chart_type, metrics.sort_order,
+                  metrics.review_status, metrics.created_at, metrics.updated_at
+           FROM metrics LEFT JOIN schema_classes ON schema_classes.id=metrics.target_class AND schema_classes.scenario_id=metrics.scenario_id
+           WHERE metrics.scenario_id=?""", (scenario_id,)
     ).fetchall()
     concepts = conn.execute(
         "SELECT * FROM concepts WHERE scenario_id=?", (scenario_id,)
@@ -476,17 +468,16 @@ def _sync_schema_files(scenario_id: str):
 
     parsed_classes = []
     mapping_classes = {}
+    class_names_by_db_id = {}
     for row in classes:
         c = dict(row)
-        properties = _json_list(c["properties"])
+        schema_name = c["schema_name"]
+        class_names_by_db_id[c["id"]] = schema_name
         fields = _normalize_fields(_json_list(c["fields"]))
-        if not properties:
-            properties = _field_names(fields)
         parsed_classes.append({
-            "id": c["id"],
+            "id": schema_name,
             "name_cn": c["name_cn"],
             "description": c["description"],
-            "properties": properties,
             "primary_key": c["primary_key"],
             "table_name": c["table_name"],
             "fields": fields,
@@ -495,12 +486,12 @@ def _sync_schema_files(scenario_id: str):
             ),
             "review_status": _review_status(c.get("review_status"), c.get("is_reviewed", 0)),
         })
-        mapping_classes[c["id"]] = {
+        mapping_classes[schema_name] = {
             "table_name": c["table_name"],
-            "table_name": c["table_name"].replace(".csv", "") if c["table_name"] else c["id"],
+            "table_name": c["table_name"].replace(".csv", "") if c["table_name"] else schema_name,
             "primary_key": c["primary_key"],
             "name_cn": c["name_cn"],
-            "field_map": _field_map(fields, properties),
+            "field_map": _field_map(fields),
             "field_types": _field_types(fields),
             "data_source": "csv" if c["table_name"].endswith(".csv") else "database",
             "is_reviewed": _is_reviewed_status(
@@ -544,16 +535,14 @@ def _sync_schema_files(scenario_id: str):
             "description": m["description"],
             "category": m["category"],
             "target_class": m["target_class"],
-            "definition": _json_dict(m.get("definition", "{}")),
+            "definition": replace_definition_class_refs(
+                _json_dict(m.get("definition", "{}")), class_names_by_db_id
+            ),
             "dimensions": _json_list(m["dimensions"]),
-            "required_dimensions": _json_list(m["required_dimensions"]),
             "dimension_group_ids": metric_group_ids.get(m["id"], []),
             "chart_type": m["chart_type"],
             "sort_order": m["sort_order"],
-            "is_reviewed": _is_reviewed_status(
-                _review_status(m.get("review_status"), m.get("is_reviewed", 0))
-            ),
-            "review_status": _review_status(m.get("review_status"), m.get("is_reviewed", 0)),
+            "review_status": _review_status(m.get("review_status")),
         })
 
     parsed_concepts = []

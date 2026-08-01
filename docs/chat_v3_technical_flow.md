@@ -72,7 +72,7 @@ flowchart TD
 | 元数据表 | 关键字段 | 用途 |
 | --- | --- | --- |
 | `data_connections` | `scenario_id`, `connection_url`, `is_active` | 找到当前场景激活的数据源连接串 |
-| `schema_classes` | `id`, `name_cn`, `properties`, `fields`, `csv_file`, `primary_key` | 定义实体 class、物理表、逻辑字段到物理列的映射 |
+| `schema_classes` | `id`, `name_cn`, `fields`, `table_name`, `primary_key` | 定义实体 class、物理表、逻辑字段到物理列的映射 |
 | `schema_relationships` | `source`, `target`, `source_key`, `target_key`, `join_key` | 定义实体之间 JOIN 路径和 JOIN 字段 |
 | `metrics` | `id`, `name`, `class_id`, `target_class`, `formula`, `dimensions`, `required_dimensions` | 定义指标所属实体、计算公式和可用维度 |
 

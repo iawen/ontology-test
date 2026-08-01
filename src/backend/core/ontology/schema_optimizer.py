@@ -22,6 +22,7 @@ from core.llm.chat_model import get_async_client, get_model_name
 from core.db.db import get_db
 from pydantic import ValidationError
 from core.ontology.ontology_asset_validator import validate_schema_assets
+from core.ontology.metric_class_refs import replace_definition_class_refs
 from core.ontology.schema_context import load_schema_reference_context
 from core.ontology.prompt import (
     build_global_correction_prompt,
@@ -297,22 +298,32 @@ class SchemaOptimizer:
         conn = get_db()
         sid = self.scenario_id
 
-        class_sql = "SELECT * FROM schema_classes WHERE scenario_id=?"
+        class_sql = "SELECT id AS db_id, schema_name, schema_name AS id, name_cn, description, fields, table_name, primary_key, is_reviewed, review_status, created_at, updated_at FROM schema_classes WHERE scenario_id=?"
         if incremental or exclude_reviewed:
             class_sql += " AND is_reviewed IS NOT TRUE AND COALESCE(review_status, 'pending')='pending'"
         if target_class_ids:
             placeholders = ",".join("?" * len(target_class_ids))
-            class_sql += f" AND id IN ({placeholders})"
+            class_sql += f" AND schema_name IN ({placeholders})"
             class_rows = conn.execute(class_sql, (sid, *target_class_ids)).fetchall()
         else:
             class_rows = conn.execute(class_sql, (sid,)).fetchall()
         classes = [_row_to_dict(r) for r in class_rows]
 
-        metric_sql = "SELECT * FROM metrics WHERE scenario_id=?"
+        metric_sql = """SELECT metrics.id AS db_id, metrics.name AS id, metrics.scenario_id, metrics.name, metrics.description, metrics.category,
+                      schema_classes.schema_name AS target_class, metrics.target_class AS target_class_db_id,
+                      metrics.dimensions, metrics.definition, metrics.chart_type, metrics.sort_order,
+                      metrics.review_status, metrics.created_at, metrics.updated_at
+                   FROM metrics LEFT JOIN schema_classes ON schema_classes.id=metrics.target_class AND schema_classes.scenario_id=metrics.scenario_id
+                   WHERE metrics.scenario_id=?"""
         if incremental or exclude_reviewed:
-            metric_sql += " AND is_reviewed IS NOT TRUE AND COALESCE(review_status, 'pending')='pending'"
+            metric_sql += " AND COALESCE(review_status, 'pending')='pending'"
         metric_rows = conn.execute(metric_sql, (sid,)).fetchall()
         metrics = [_row_to_dict(r) for r in metric_rows]
+        class_names_by_db_id = {item["db_id"]: item["id"] for item in classes}
+        for metric in metrics:
+            metric["definition"] = replace_definition_class_refs(
+                _json_dict(metric.get("definition")), class_names_by_db_id
+            )
         metric_group_rows = conn.execute(
             "SELECT metric_id, group_id FROM metric_dimension_bindings WHERE scenario_id=?",
             (sid,),
@@ -572,6 +583,11 @@ class SchemaOptimizer:
                 )
                 raw = response.choices[0].message.content or ""
                 data = _extract_json(raw)
+                for item in data.get("classes", []) if isinstance(data, dict) else []:
+                    if isinstance(item, dict) and item.get("schema_name") and not item.get("id"):
+                        # Keep the optimization pipeline's semantic-ID maps
+                        # backward compatible while persisting schema_name.
+                        item["id"] = item["schema_name"]
 
                 # Pydantic 验证
                 result = OptimizationBatchResult(**data)
@@ -747,11 +763,15 @@ class SchemaOptimizer:
         for r in batch_results:
             for c in r.classes:
                 cid = rename_map.get(c.id, c.id)
-                c.id = cid
-                all_classes[cid] = c.model_dump()
+                c.schema_name = cid
+                class_item = c.model_dump()
+                class_item["id"] = cid
+                all_classes[cid] = class_item
             for m in r.metrics:
                 m.target_class = rename_map.get(m.target_class, m.target_class)
-                all_metrics[m.id] = m.model_dump()
+                metric_item = m.model_dump()
+                metric_item["id"] = m.name
+                all_metrics[m.name] = metric_item
             for group in r.dimension_groups:
                 all_dimension_groups[group.id] = group.model_dump()
             for rel in r.relationships:
@@ -872,7 +892,7 @@ class SchemaOptimizer:
         }
         protected_metric_ids = {
             item.get("id") for item in all_metrics
-            if bool(item.get("is_reviewed")) or item.get("review_status") in {"approved", "rejected"}
+            if item.get("review_status") in {"approved", "rejected"}
         }
         protected_concept_ids = {
             item.get("id") for item in all_concepts
@@ -910,8 +930,6 @@ class SchemaOptimizer:
             merged_item = {**base, **item}
             if not item.get("fields") and base.get("fields"):
                 merged_item["fields"] = base.get("fields")
-            if not item.get("properties") and base.get("properties"):
-                merged_item["properties"] = base.get("properties")
             if not item.get("table_name") and base.get("table_name"):
                 merged_item["table_name"] = base.get("table_name")
             if not item.get("table_name") and base.get("table_name"):
@@ -946,7 +964,6 @@ class SchemaOptimizer:
         cleaned_metrics = cleaned.get("metrics", [])
         for metric in cleaned_metrics:
             metric["dimensions"] = _json_list(metric.get("dimensions"))
-            metric["required_dimensions"] = _json_list(metric.get("required_dimensions"))
         return {
             "classes": [item for item in cleaned.get("classes", []) if item.get("id") in merged_class_ids],
             "relationships": cleaned.get("relationships", []),
@@ -957,16 +974,15 @@ class SchemaOptimizer:
 
     def _normalize_class_for_validation(self, item: dict) -> dict:
         fields = _json_list(item.get("fields"))
-        properties = _json_list(item.get("properties"))
-        if not fields and properties:
-            fields = [{"name_cn": field, "name": field, "type": "text"} for field in properties]
         table_name = item.get("table_name", "")
+        schema_name = str(item.get("schema_name") or item.get("id") or "").strip()
         return {
             **item,
+            "schema_name": schema_name,
+            "id": schema_name,
             "table_name": table_name,
-            "table_name": item.get("table_name", "") or (table_name.replace(".csv", "") if table_name else item.get("id", "")),
+            "table_name": item.get("table_name", "") or (table_name.replace(".csv", "") if table_name else schema_name),
             "fields": fields,
-            "properties": properties or [field.get("name_cn") or field.get("name") for field in fields if isinstance(field, dict)],
             "primary_key": item.get("primary_key", ""),
         }
 
@@ -1077,11 +1093,11 @@ class SchemaOptimizer:
         return counts
 
     def _upsert_class(self, conn, item: dict) -> bool:
-        cid = item.get("id", "").strip()
+        cid = str(item.get("schema_name") or item.get("id") or "").strip()
         if not cid:
             return False
         sid = self.scenario_id
-        exists = conn.execute("SELECT id, is_reviewed, review_status FROM schema_classes WHERE id=? AND scenario_id=?", (cid, sid)).fetchone()
+        exists = conn.execute("SELECT id, is_reviewed, review_status FROM schema_classes WHERE schema_name=? AND scenario_id=?", (cid, sid)).fetchone()
         if exists and (bool(exists["is_reviewed"]) or exists["review_status"] in {"approved", "rejected"}):
             return False
         values = (
@@ -1090,12 +1106,12 @@ class SchemaOptimizer:
         )
         if exists:
             conn.execute(
-                "UPDATE schema_classes SET name_cn=?, description=?, primary_key=?, table_name=?, is_reviewed=FALSE, review_status='pending', updated_at=CURRENT_TIMESTAMP WHERE id=? AND scenario_id=?",
+                "UPDATE schema_classes SET name_cn=?, description=?, primary_key=?, table_name=?, is_reviewed=FALSE, review_status='pending', updated_at=CURRENT_TIMESTAMP WHERE schema_name=? AND scenario_id=?",
                 (*values, cid, sid),
             )
         else:
             conn.execute(
-                "INSERT INTO schema_classes (id, scenario_id, name_cn, description, primary_key, table_name, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,FALSE,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO schema_classes (schema_name, scenario_id, name_cn, description, primary_key, table_name, is_reviewed, review_status, created_at, updated_at) VALUES (?,?,?,?,?,?,FALSE,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 (cid, sid, *values),
             )
         return True
@@ -1134,27 +1150,38 @@ class SchemaOptimizer:
         if not mid or not isinstance(definition, dict) or definition.get("version") != 1 or not definition.get("inputs"):
             return False
         sid = self.scenario_id
-        exists = conn.execute("SELECT id, is_reviewed, review_status FROM metrics WHERE id=? AND scenario_id=?", (mid, sid)).fetchone()
-        if exists and (bool(exists["is_reviewed"]) or exists["review_status"] in {"approved", "rejected"}):
+        exists = conn.execute("SELECT id AS db_id, review_status FROM metrics WHERE name=? AND scenario_id=?", (mid, sid)).fetchone()
+        if exists and exists["review_status"] in {"approved", "rejected"}:
             return False
         dims = json.dumps(item.get("dimensions", []), ensure_ascii=False)
-        req_dims = json.dumps(item.get("required_dimensions", []), ensure_ascii=False)
+        target_class = conn.execute(
+            "SELECT id FROM schema_classes WHERE scenario_id=? AND schema_name=?",
+            (sid, definition.get("anchor_class", "")),
+        ).fetchone()
+        if not target_class:
+            return False
+        class_db_ids = {
+            row["schema_name"]: row["id"] for row in conn.execute(
+                "SELECT id, schema_name FROM schema_classes WHERE scenario_id=?", (sid,)
+            ).fetchall()
+        }
+        definition = replace_definition_class_refs(definition, class_db_ids)
         values = (
             item.get("name", ""), item.get("description", ""), item.get("category", ""),
-            definition.get("anchor_class", ""), json.dumps(definition, ensure_ascii=False),
-            dims, req_dims, item.get("chart_type", "bar"),
+            target_class["id"], json.dumps(definition, ensure_ascii=False),
+            dims, item.get("chart_type", "bar"),
         )
         if exists:
             conn.execute(
-                     """UPDATE metrics SET name=?, description=?, category=?, target_class=?, definition=?, dimensions=?, required_dimensions=?, chart_type=?, is_reviewed=FALSE, review_status='pending', updated_at=CURRENT_TIMESTAMP
-                   WHERE id=? AND scenario_id=?""",
+                     """UPDATE metrics SET name=?, description=?, category=?, target_class=?, definition=?, dimensions=?, chart_type=?, review_status='pending', updated_at=CURRENT_TIMESTAMP
+                   WHERE name=? AND scenario_id=?""",
                 (*values, mid, sid),
             )
         else:
             conn.execute(
-                     """INSERT INTO metrics (id, scenario_id, name, description, category, target_class, definition, dimensions, required_dimensions, chart_type, is_reviewed, review_status, created_at, updated_at)
-                         VALUES (?,?,?,?,?,?,?,?,?,?,FALSE,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
-                (mid, sid, *values),
+                     """INSERT INTO metrics (scenario_id, name, description, category, target_class, definition, dimensions, chart_type, review_status, created_at, updated_at)
+                         VALUES (?,?,?,?,?,?,?, ?,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+                (sid, mid, *values[1:]),
             )
         conn.execute("DELETE FROM metric_dimension_bindings WHERE scenario_id=? AND metric_id=?", (sid, mid))
         valid_group_ids = {

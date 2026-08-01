@@ -114,6 +114,11 @@ async def get_messages(conv_id: str, request: Request):
                 item["action_confirm"] = json.loads(r["action_confirm"])
             except Exception:
                 pass
+        if "clarification" in r.keys() and r["clarification"]:
+            try:
+                item["clarification"] = json.loads(r["clarification"])
+            except Exception:
+                pass
         result.append(item)
     return result
 

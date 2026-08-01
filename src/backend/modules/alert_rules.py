@@ -117,7 +117,7 @@ def check_alert_rule(rule: dict) -> dict:
     condition = rule["condition_expression"]
 
     try:
-        from prompts.prompt import init_prompt, get_query_engine
+        from agents.ontology_chatbi.services.helper import init_prompt, get_query_engine
         init_prompt(scenario_id)
         query_engine = get_query_engine(scenario_id)
 

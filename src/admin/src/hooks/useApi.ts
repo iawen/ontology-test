@@ -1,6 +1,6 @@
 import { useCallback } from "react";
 
-export function useApi(token: string) {
+export function useApi(token = "") {
   const api = useCallback(
     async (url: string, opts?: RequestInit) => {
       const headers: Record<string, string> = {

@@ -1,7 +1,7 @@
 import json
 
 from tools.logger import logger
-from agents.ontology_chatbi.helper import route_skills
+from agents.ontology_chatbi.services.helper import route_skills
 
 # ============================================================
 # 技能路由 Agent

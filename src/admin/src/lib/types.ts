@@ -14,15 +14,19 @@ export interface Scenario {
 }
 
 export interface SchemaClass {
+  /** Auto-increment database primary key. */
+  db_id?: number;
+  /** Stable semantic key used by relationships, metrics and ontology data. */
+  schema_name?: string;
+  /** @deprecated Compatibility alias for schema_name. */
   id: string;
   scenario_id: string;
   name_cn: string;
   description: string;
-  properties: string[];
   fields: SchemaField[];
   table_name: string;
   primary_key: string;
-  is_reviewed: boolean;
+  is_reviewed: number | boolean;
   review_status?: ReviewStatus;
 }
 
@@ -33,6 +37,8 @@ export interface SchemaField {
   description: string;
   is_primary_key: boolean;
   is_foreign_key: boolean;
+  /** Client-only key for stable editing before a field is persisted. */
+  _uid?: string;
 }
 
 export interface SchemaRelationship {
@@ -49,6 +55,8 @@ export interface SchemaRelationship {
 }
 
 export interface Metric {
+  db_id?: number;
+  /** @deprecated Compatibility alias for name. */
   id: string;
   scenario_id: string;
   name: string;
@@ -57,11 +65,10 @@ export interface Metric {
   target_class: string;
   definition?: AnyMetricDefinition;
   dimensions: string[];
-  required_dimensions: string[];
   dimension_group_ids?: string[];
   chart_type: string;
   sort_order: number;
-  is_reviewed?: number | ReviewStatus | boolean;
+  review_status?: ReviewStatus;
   created_at?: string;
   updated_at?: string;
 }

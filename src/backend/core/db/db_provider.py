@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -33,8 +34,8 @@ _INSERT_OR_REPLACE_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _CONFLICT_COLUMNS = {
-    "schema_classes": ("id", "scenario_id"),
-    "metrics": ("id", "scenario_id"),
+    "schema_classes": ("schema_name", "scenario_id"),
+    "metrics": ("name", "scenario_id"),
     "concepts": ("id", "scenario_id"),
     "skills": ("id", "scenario_id"),
     "system_settings": ("key",),
@@ -279,6 +280,516 @@ def _parse_mysql_dsn(dsn):
     }
 
 
+def _json_list(value):
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value or "[]")
+        return parsed if isinstance(parsed, list) else []
+    except (TypeError, json.JSONDecodeError):
+        return []
+
+
+def _migrate_schema_classes_without_properties(conn, dialect):
+    """Backfill legacy field names, then remove the duplicate properties column."""
+    try:
+        rows = conn.execute(
+            "SELECT id, scenario_id, fields, properties FROM schema_classes"
+        ).fetchall()
+    except Exception:
+        return
+
+    for row in rows:
+        fields = _json_list(row.get("fields"))
+        has_usable_fields = any(
+            isinstance(field, dict) and str(field.get("name") or field.get("name_cn") or "").strip()
+            for field in fields
+        )
+        if has_usable_fields:
+            continue
+        legacy_names = [str(name).strip() for name in _json_list(row.get("properties")) if str(name).strip()]
+        if not legacy_names:
+            continue
+        backfilled_fields = [
+            {
+                "name_cn": name,
+                "name": name,
+                "type": "text",
+                "description": "",
+                "is_primary_key": False,
+                "is_foreign_key": False,
+            }
+            for name in legacy_names
+        ]
+        conn.execute(
+            "UPDATE schema_classes SET fields=? WHERE id=? AND scenario_id=?",
+            (json.dumps(backfilled_fields, ensure_ascii=False), row["id"], row["scenario_id"]),
+        )
+
+    if dialect == "sqlite3":
+        try:
+            conn.execute("ALTER TABLE schema_classes DROP COLUMN properties")
+            return
+        except sqlite3.OperationalError:
+            pass
+        conn.executescript("""
+            ALTER TABLE schema_classes RENAME TO schema_classes_legacy_properties;
+            CREATE TABLE schema_classes (
+                id TEXT NOT NULL,
+                scenario_id TEXT NOT NULL,
+                name_cn TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                fields TEXT DEFAULT '[]',
+                table_name TEXT DEFAULT '',
+                primary_key TEXT DEFAULT '',
+                is_reviewed INTEGER DEFAULT 0,
+                review_status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id, scenario_id)
+            );
+            INSERT INTO schema_classes
+                (id, scenario_id, name_cn, description, fields, table_name, primary_key, is_reviewed, review_status, created_at, updated_at)
+            SELECT id, scenario_id, name_cn, description, fields, table_name, primary_key, is_reviewed, review_status, created_at, updated_at
+            FROM schema_classes_legacy_properties;
+            DROP TABLE schema_classes_legacy_properties;
+        """)
+        return
+
+    try:
+        conn.execute("ALTER TABLE schema_classes DROP COLUMN properties")
+    except Exception:
+        pass
+
+
+def _migrate_schema_classes_to_surrogate_id(conn, dialect):
+    """Replace the legacy text primary key with a numeric surrogate key.
+
+    ``schema_name`` remains the stable business identifier used by ontology
+    metadata and cross-table references; no downstream semantic references are
+    converted to the implementation-only numeric primary key.
+    """
+    if dialect == "sqlite3":
+        columns = conn.execute("PRAGMA table_info(schema_classes)").fetchall()
+        names = {str(column["name"]) for column in columns}
+        if "schema_name" in names:
+            return
+        conn.executescript("""
+            ALTER TABLE schema_classes RENAME TO schema_classes_legacy_text_id;
+            CREATE TABLE schema_classes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                schema_name TEXT NOT NULL,
+                scenario_id TEXT NOT NULL,
+                name_cn TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                fields TEXT DEFAULT '[]',
+                table_name TEXT DEFAULT '',
+                primary_key TEXT DEFAULT '',
+                is_reviewed INTEGER DEFAULT 0,
+                review_status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (scenario_id, schema_name)
+            );
+            INSERT INTO schema_classes
+                (schema_name, scenario_id, name_cn, description, fields, table_name, primary_key, is_reviewed, review_status, created_at, updated_at)
+            SELECT id, scenario_id, name_cn, description, fields, table_name, primary_key, is_reviewed, review_status, created_at, updated_at
+            FROM schema_classes_legacy_text_id;
+            DROP TABLE schema_classes_legacy_text_id;
+        """)
+        return
+
+    if dialect == "postgresql":
+        columns = conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name='schema_classes'"
+        ).fetchall()
+        if any(str(column["column_name"]) == "schema_name" for column in columns):
+            return
+        conn.execute("ALTER TABLE schema_classes RENAME COLUMN id TO schema_name")
+        conn.execute("ALTER TABLE schema_classes DROP CONSTRAINT IF EXISTS schema_classes_pkey")
+        conn.execute("ALTER TABLE schema_classes ADD COLUMN id BIGSERIAL PRIMARY KEY")
+        conn.execute("ALTER TABLE schema_classes ADD CONSTRAINT schema_classes_scenario_name_key UNIQUE (scenario_id, schema_name)")
+        return
+
+    columns = conn.execute("SHOW COLUMNS FROM schema_classes").fetchall()
+    if any(str(column["Field"]) == "schema_name" for column in columns):
+        return
+    conn.execute("ALTER TABLE schema_classes DROP PRIMARY KEY")
+    conn.execute("ALTER TABLE schema_classes CHANGE COLUMN id schema_name TEXT NOT NULL")
+    conn.execute("ALTER TABLE schema_classes ADD COLUMN id INT AUTO_INCREMENT PRIMARY KEY FIRST")
+    conn.execute("ALTER TABLE schema_classes ADD UNIQUE KEY schema_classes_scenario_name_key (scenario_id, schema_name)")
+
+
+def _migrate_metrics_to_surrogate_id(conn, dialect):
+    """Use numeric Metric IDs internally and Chinese ``name`` externally.
+
+    Legacy text IDs and the short-lived ``metric_name`` field are migrated to
+    the Metric's business name. Metric bindings remain text references so they
+    continue to work in JSON, prompts, and query planning.
+    """
+    if dialect == "sqlite3":
+        columns = conn.execute("PRAGMA table_info(metrics)").fetchall()
+        names = {str(column["name"]) for column in columns}
+        if "metric_name" not in names and str(next(column for column in columns if column["name"] == "id")["type"]).upper() == "INTEGER":
+            return
+        if "metric_name" not in names:
+            conn.executescript("""
+            ALTER TABLE metrics RENAME TO metrics_legacy_text_id;
+            CREATE TABLE metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                metric_name TEXT NOT NULL,
+                scenario_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                category TEXT DEFAULT '',
+                target_class TEXT DEFAULT '',
+                dimensions TEXT DEFAULT '[]',
+                required_dimensions TEXT DEFAULT '[]',
+                definition TEXT DEFAULT '{}',
+                chart_type TEXT DEFAULT 'bar',
+                sort_order INTEGER DEFAULT 0,
+                review_status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (scenario_id, metric_name)
+            );
+            INSERT INTO metrics
+                (metric_name, scenario_id, name, description, category, target_class, dimensions, required_dimensions, definition, chart_type, sort_order, review_status, created_at, updated_at)
+            SELECT id, scenario_id, name, description, category, target_class, dimensions, required_dimensions, definition, chart_type, sort_order,
+                   CASE WHEN is_reviewed=-1 THEN 'rejected' WHEN is_reviewed=1 THEN 'approved' ELSE COALESCE(NULLIF(review_status, ''), 'pending') END,
+                   created_at, updated_at
+            FROM metrics_legacy_text_id;
+            DROP TABLE metrics_legacy_text_id;
+            """)
+        metric_rows = conn.execute(
+            "SELECT id, scenario_id, metric_name, name, description, category, target_class, dimensions, required_dimensions, definition, chart_type, sort_order, review_status, created_at, updated_at FROM metrics ORDER BY id"
+        ).fetchall()
+        reference_map = _unique_metric_name_map(metric_rows)
+        binding_rows = _metric_binding_rows(conn, "metric_dimension_bindings", "group_id")
+        concept_binding_rows = _metric_binding_rows(conn, "metric_concept_bindings", "concept_id, role, priority, is_primary, status")
+        conn.executescript("""
+            ALTER TABLE metrics RENAME TO metrics_legacy_metric_name;
+            CREATE TABLE metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scenario_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                category TEXT DEFAULT '',
+                target_class TEXT DEFAULT '',
+                dimensions TEXT DEFAULT '[]',
+                required_dimensions TEXT DEFAULT '[]',
+                definition TEXT DEFAULT '{}',
+                chart_type TEXT DEFAULT 'bar',
+                sort_order INTEGER DEFAULT 0,
+                review_status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (scenario_id, name)
+            );
+        """)
+        conn.executemany(
+                """INSERT INTO metrics (id, scenario_id, name, description, category, target_class, dimensions, required_dimensions, definition, chart_type, sort_order, review_status, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            [
+                (row["id"], row["scenario_id"], reference_map[(row["scenario_id"], row["metric_name"])], row["description"], row["category"], row["target_class"], row["dimensions"], row["required_dimensions"], row["definition"], row["chart_type"], row["sort_order"], row["review_status"], row["created_at"], row["updated_at"])
+                for row in metric_rows
+            ],
+        )
+        conn.execute("DROP TABLE metrics_legacy_metric_name")
+        _restore_metric_bindings(conn, binding_rows, concept_binding_rows, reference_map)
+        return
+
+    if dialect == "postgresql":
+        columns = conn.execute(
+            "SELECT column_name, data_type FROM information_schema.columns WHERE table_name='metrics'"
+        ).fetchall()
+        if not any(str(column["column_name"]) == "metric_name" for column in columns):
+            id_column = next((column for column in columns if str(column["column_name"]) == "id"), None)
+            if not id_column or str(id_column["data_type"]).lower() in {"integer", "bigint", "smallint"}:
+                return
+            conn.execute("ALTER TABLE metrics RENAME COLUMN id TO metric_name")
+            conn.execute("ALTER TABLE metrics DROP CONSTRAINT IF EXISTS metrics_pkey")
+            conn.execute("ALTER TABLE metrics ADD COLUMN id BIGSERIAL PRIMARY KEY")
+            conn.execute("ALTER TABLE metrics ADD CONSTRAINT metrics_scenario_name_key UNIQUE (scenario_id, metric_name)")
+        _migrate_metric_name_references(conn, dialect)
+        conn.execute("ALTER TABLE metrics DROP CONSTRAINT IF EXISTS metrics_scenario_name_key")
+        conn.execute("ALTER TABLE metrics DROP COLUMN metric_name")
+        conn.execute("ALTER TABLE metrics ADD CONSTRAINT metrics_scenario_name_key UNIQUE (scenario_id, name)")
+        return
+
+    columns = conn.execute("SHOW COLUMNS FROM metrics").fetchall()
+    if not any(str(column["Field"]) == "metric_name" for column in columns):
+        id_column = next((column for column in columns if str(column["Field"]) == "id"), None)
+        if not id_column or "int" in str(id_column["Type"]).lower():
+            return
+        conn.execute("ALTER TABLE metrics DROP PRIMARY KEY")
+        conn.execute("ALTER TABLE metrics CHANGE COLUMN id metric_name TEXT NOT NULL")
+        conn.execute("ALTER TABLE metrics ADD COLUMN id INT AUTO_INCREMENT PRIMARY KEY FIRST")
+        conn.execute("ALTER TABLE metrics ADD UNIQUE KEY metrics_scenario_name_key (scenario_id, metric_name)")
+    _migrate_metric_name_references(conn, dialect)
+    conn.execute("ALTER TABLE metrics DROP INDEX metrics_scenario_name_key")
+    conn.execute("ALTER TABLE metrics DROP COLUMN metric_name")
+    conn.execute("ALTER TABLE metrics ADD UNIQUE KEY metrics_scenario_name_key (scenario_id, name)")
+
+
+def _unique_metric_name_map(rows):
+    """Map legacy semantic metric keys to unique human-readable names."""
+    result = {}
+    used_names: dict[str, set[str]] = {}
+    for row in rows:
+        scenario_id = str(row["scenario_id"])
+        base = str(row["name"] or row["metric_name"] or "").strip() or "未命名指标"
+        used = used_names.setdefault(scenario_id, set())
+        candidate = base
+        index = 2
+        while candidate in used:
+            candidate = f"{base}（{index}）"
+            index += 1
+        used.add(candidate)
+        result[(scenario_id, str(row["metric_name"]))] = candidate
+    return result
+
+
+def _metric_binding_rows(conn, table, selected_columns):
+    try:
+        return conn.execute(f"SELECT metric_id, scenario_id, {selected_columns} FROM {table}").fetchall()
+    except Exception:
+        return []
+
+
+def _restore_metric_bindings(conn, dimension_rows, concept_rows, reference_map):
+    try:
+        conn.execute("DELETE FROM metric_dimension_bindings")
+    except Exception:
+        dimension_rows = []
+    for row in dimension_rows:
+        metric_id = reference_map.get((str(row["scenario_id"]), str(row["metric_id"])))
+        if metric_id:
+            try:
+                conn.execute("INSERT INTO metric_dimension_bindings (metric_id, scenario_id, group_id) VALUES (?,?,?)", (metric_id, row["scenario_id"], row["group_id"]))
+            except IntegrityError:
+                pass
+    try:
+        conn.execute("DELETE FROM metric_concept_bindings")
+    except Exception:
+        concept_rows = []
+    for row in concept_rows:
+        metric_id = reference_map.get((str(row["scenario_id"]), str(row["metric_id"])))
+        if metric_id:
+            try:
+                conn.execute("""INSERT INTO metric_concept_bindings (metric_id, scenario_id, concept_id, role, priority, is_primary, status)
+                                VALUES (?,?,?,?,?,?,?)""", (metric_id, row["scenario_id"], row["concept_id"], row["role"], row["priority"], row["is_primary"], row["status"]))
+            except IntegrityError:
+                pass
+
+
+def _migrate_metric_name_references(conn, dialect):
+    rows = conn.execute("SELECT id, scenario_id, metric_name, name FROM metrics ORDER BY id").fetchall()
+    reference_map = _unique_metric_name_map(rows)
+    dimension_rows = _metric_binding_rows(conn, "metric_dimension_bindings", "group_id")
+    concept_rows = _metric_binding_rows(conn, "metric_concept_bindings", "concept_id, role, priority, is_primary, status")
+    for row in rows:
+        new_name = reference_map[(str(row["scenario_id"]), str(row["metric_name"]))]
+        if new_name != row["name"]:
+            conn.execute("UPDATE metrics SET name=? WHERE id=?", (new_name, row["id"]))
+    _restore_metric_bindings(conn, dimension_rows, concept_rows, reference_map)
+
+
+def _remove_stale_dimension_group_bindings(conn):
+    """Keep semantic Metric binding tables free of deleted Metric references."""
+    conn.execute(
+        """DELETE FROM metric_dimension_bindings
+           WHERE NOT EXISTS (
+               SELECT 1 FROM metrics
+               WHERE metrics.scenario_id = metric_dimension_bindings.scenario_id
+                 AND metrics.name = metric_dimension_bindings.metric_id
+           )"""
+    )
+    conn.execute(
+        """DELETE FROM metric_concept_bindings
+           WHERE NOT EXISTS (
+               SELECT 1 FROM metrics
+               WHERE metrics.scenario_id = metric_concept_bindings.scenario_id
+                 AND metrics.name = metric_concept_bindings.metric_id
+           )"""
+    )
+
+
+def _migrate_metrics_target_class_to_class_id(conn, dialect):
+    """Store each Metric's target Class as the numeric schema_classes.id.
+
+    Metric definitions retain their semantic ``schema_name`` references for
+    JSON, LLM, and query-runtime compatibility; the persisted top-level Metric
+    association is the canonical numeric Class foreign key.
+    """
+    if dialect == "sqlite3":
+        columns = conn.execute("PRAGMA table_info(metrics)").fetchall()
+        target_column = next((column for column in columns if column["name"] == "target_class"), None)
+        if target_column and str(target_column["type"]).upper() == "INTEGER":
+            return
+        rows = conn.execute("SELECT * FROM metrics").fetchall()
+        class_rows = conn.execute("SELECT id, scenario_id, schema_name FROM schema_classes").fetchall()
+        class_ids = {(row["scenario_id"], row["schema_name"]): row["id"] for row in class_rows}
+        conn.executescript("""
+            ALTER TABLE metrics RENAME TO metrics_legacy_target_class;
+            CREATE TABLE metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scenario_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                category TEXT DEFAULT '',
+                target_class INTEGER,
+                dimensions TEXT DEFAULT '[]',
+                required_dimensions TEXT DEFAULT '[]',
+                definition TEXT DEFAULT '{}',
+                chart_type TEXT DEFAULT 'bar',
+                sort_order INTEGER DEFAULT 0,
+                review_status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (scenario_id, name)
+            );
+        """)
+        conn.executemany(
+                """INSERT INTO metrics (id, scenario_id, name, description, category, target_class, dimensions, required_dimensions, definition, chart_type, sort_order, review_status, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            [
+                (
+                    row["id"], row["scenario_id"], row["name"], row["description"], row["category"],
+                    class_ids.get((row["scenario_id"], str(row["target_class"] or ""))),
+                    row["dimensions"], row["required_dimensions"], row["definition"], row["chart_type"],
+                    row["sort_order"],
+                    "rejected" if row.get("is_reviewed") == -1 else "approved" if row.get("is_reviewed") else row["review_status"],
+                    row["created_at"], row["updated_at"],
+                )
+                for row in rows
+            ],
+        )
+        conn.execute("DROP TABLE metrics_legacy_target_class")
+        return
+
+    if dialect == "postgresql":
+        column = conn.execute(
+            "SELECT data_type FROM information_schema.columns WHERE table_name='metrics' AND column_name='target_class'"
+        ).fetchone()
+        if column and str(column["data_type"]).lower() in {"integer", "bigint", "smallint"}:
+            return
+        conn.execute("ALTER TABLE metrics ADD COLUMN target_class_id BIGINT")
+        conn.execute("""UPDATE metrics SET target_class_id = schema_classes.id
+                        FROM schema_classes
+                        WHERE schema_classes.scenario_id=metrics.scenario_id
+                          AND schema_classes.schema_name=metrics.target_class""")
+        conn.execute("ALTER TABLE metrics DROP COLUMN target_class")
+        conn.execute("ALTER TABLE metrics RENAME COLUMN target_class_id TO target_class")
+        return
+
+    columns = conn.execute("SHOW COLUMNS FROM metrics").fetchall()
+    target_column = next((column for column in columns if column["Field"] == "target_class"), None)
+    if target_column and "int" in str(target_column["Type"]).lower():
+        return
+    conn.execute("ALTER TABLE metrics ADD COLUMN target_class_id INT")
+    conn.execute("""UPDATE metrics
+                    JOIN schema_classes ON schema_classes.scenario_id=metrics.scenario_id
+                     AND schema_classes.schema_name=metrics.target_class
+                    SET metrics.target_class_id=schema_classes.id""")
+    conn.execute("ALTER TABLE metrics DROP COLUMN target_class")
+    conn.execute("ALTER TABLE metrics CHANGE COLUMN target_class_id target_class INT")
+
+
+def _migrate_metric_definition_class_refs_to_ids(conn):
+    """Replace Metric definition anchor/input schema names with Class IDs."""
+    class_rows = conn.execute("SELECT id, scenario_id, schema_name FROM schema_classes").fetchall()
+    class_ids = {(str(row["scenario_id"]), str(row["schema_name"])): row["id"] for row in class_rows}
+    metric_rows = conn.execute("SELECT id, scenario_id, definition FROM metrics").fetchall()
+    for row in metric_rows:
+        try:
+            definition = json.loads(row["definition"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(definition, dict):
+            continue
+        changed = False
+        scenario_id = str(row["scenario_id"])
+
+        def resolve(value):
+            nonlocal changed
+            if isinstance(value, int):
+                return value
+            resolved = class_ids.get((scenario_id, str(value or "")))
+            if resolved is not None:
+                changed = True
+                return resolved
+            return value
+
+        definition["anchor_class"] = resolve(definition.get("anchor_class"))
+        input_groups = [definition.get("inputs", [])]
+        input_groups.extend(
+            output.get("inputs", []) for output in definition.get("outputs", [])
+            if isinstance(output, dict)
+        )
+        for inputs in input_groups:
+            for input_item in inputs if isinstance(inputs, list) else []:
+                if isinstance(input_item, dict):
+                    input_item["class_id"] = resolve(input_item.get("class_id"))
+        if changed:
+            conn.execute(
+                "UPDATE metrics SET definition=? WHERE id=?",
+                (json.dumps(definition, ensure_ascii=False), row["id"]),
+            )
+
+
+def _remove_metrics_required_dimensions(conn, dialect):
+    """Drop the deprecated Metric required_dimensions storage column."""
+    try:
+        if dialect == "sqlite3":
+            conn.execute("ALTER TABLE metrics DROP COLUMN required_dimensions")
+        else:
+            conn.execute("ALTER TABLE metrics DROP COLUMN IF EXISTS required_dimensions")
+    except Exception:
+        # Existing databases may already be on the fields-only Metric shape.
+        pass
+
+
+def _remove_metrics_is_reviewed(conn, dialect):
+    """Migrate legacy Metric approval flags into review_status, then drop them."""
+    try:
+        if dialect == "sqlite3":
+            columns = {
+                str(column["name"])
+                for column in conn.execute("PRAGMA table_info(metrics)").fetchall()
+            }
+        elif dialect == "postgresql":
+            columns = {
+                str(column["column_name"])
+                for column in conn.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name='metrics'"
+                ).fetchall()
+            }
+        else:
+            columns = {
+                str(column["Field"])
+                for column in conn.execute("SHOW COLUMNS FROM metrics").fetchall()
+            }
+        if "is_reviewed" not in columns:
+            return
+        if "review_status" in columns:
+            conn.execute(
+                """UPDATE metrics SET review_status=CASE
+                       WHEN is_reviewed=-1 THEN 'rejected'
+                       WHEN is_reviewed=1 THEN 'approved'
+                       ELSE COALESCE(NULLIF(review_status, ''), 'pending')
+                   END
+                   WHERE review_status IS NULL OR review_status='' OR review_status='pending'"""
+            )
+        if dialect == "sqlite3":
+            conn.execute("ALTER TABLE metrics DROP COLUMN is_reviewed")
+        else:
+            conn.execute("ALTER TABLE metrics DROP COLUMN IF EXISTS is_reviewed")
+    except Exception:
+        # A pre-existing database may already have the final Metric shape.
+        pass
+
+
 def _migrate_db(conn, dialect):
     conn.execute(
         """CREATE TABLE IF NOT EXISTS metric_concept_bindings (
@@ -294,7 +805,6 @@ def _migrate_db(conn, dialect):
     )
     if dialect == "sqlite3":
         migrations = [
-            ("SELECT required_dimensions FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN required_dimensions TEXT DEFAULT '[]'"),
             ("SELECT chart_type FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN chart_type TEXT DEFAULT 'bar'"),
             ("SELECT definition FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN definition TEXT DEFAULT '{}'"),
             ("SELECT source_key FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN source_key TEXT DEFAULT ''"),
@@ -311,7 +821,6 @@ def _migrate_db(conn, dialect):
             ("SELECT updated_at FROM schema_classes LIMIT 1", "ALTER TABLE schema_classes ADD COLUMN updated_at TEXT DEFAULT ''"),
             ("SELECT created_at FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN created_at TEXT DEFAULT ''"),
             ("SELECT updated_at FROM schema_relationships LIMIT 1", "ALTER TABLE schema_relationships ADD COLUMN updated_at TEXT DEFAULT ''"),
-            ("SELECT is_reviewed FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN is_reviewed INTEGER DEFAULT 0"),
             ("SELECT review_status FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN review_status TEXT DEFAULT 'pending'"),
             ("SELECT created_at FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN created_at TEXT DEFAULT ''"),
             ("SELECT updated_at FROM metrics LIMIT 1", "ALTER TABLE metrics ADD COLUMN updated_at TEXT DEFAULT ''"),
@@ -320,6 +829,8 @@ def _migrate_db(conn, dialect):
             ("SELECT created_at FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN created_at TEXT DEFAULT ''"),
             ("SELECT updated_at FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN updated_at TEXT DEFAULT ''"),
             ("SELECT answer_datasets FROM messages LIMIT 1", "ALTER TABLE messages ADD COLUMN answer_datasets TEXT DEFAULT ''"),
+            ("SELECT clarification FROM messages LIMIT 1", "ALTER TABLE messages ADD COLUMN clarification TEXT DEFAULT ''"),
+            ("SELECT query_id FROM messages LIMIT 1", "ALTER TABLE messages ADD COLUMN query_id TEXT DEFAULT ''"),
             ("SELECT started_at FROM schema_optimization_runs LIMIT 1", "ALTER TABLE schema_optimization_runs ADD COLUMN started_at TEXT DEFAULT ''"),
         ]
         for check_sql, alter_sql in migrations:
@@ -337,13 +848,20 @@ def _migrate_db(conn, dialect):
             except sqlite3.OperationalError:
                 pass
         conn.execute("UPDATE schema_optimization_runs SET started_at=created_at WHERE started_at IS NULL OR started_at='' ")
-        for table in ("schema_classes", "schema_relationships", "metrics", "concepts"):
+        for table in ("schema_classes", "schema_relationships", "concepts"):
             conn.execute(f"UPDATE {table} SET review_status='approved' WHERE is_reviewed=1 AND (review_status IS NULL OR review_status='' OR review_status='pending')")
+        _migrate_schema_classes_without_properties(conn, dialect)
+        _migrate_schema_classes_to_surrogate_id(conn, dialect)
+        _migrate_metrics_to_surrogate_id(conn, dialect)
+        _migrate_metrics_target_class_to_class_id(conn, dialect)
+        _migrate_metric_definition_class_refs_to_ids(conn)
+        _remove_metrics_required_dimensions(conn, dialect)
+        _remove_metrics_is_reviewed(conn, dialect)
+        _remove_stale_dimension_group_bindings(conn)
         return
 
     if dialect == "postgresql":
         migrations = [
-            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS required_dimensions TEXT DEFAULT '[]'",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS chart_type TEXT DEFAULT 'bar'",
             "ALTER TABLE metrics DROP COLUMN IF EXISTS target_classes",
             "ALTER TABLE metrics DROP COLUMN IF EXISTS calculation",
@@ -370,7 +888,6 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
@@ -379,11 +896,12 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS answer_datasets TEXT DEFAULT ''",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS clarification TEXT DEFAULT ''",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS query_id TEXT DEFAULT ''",
             "ALTER TABLE schema_optimization_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         ]
     else:
         migrations = [
-            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS required_dimensions TEXT DEFAULT '[]'",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS chart_type TEXT DEFAULT 'bar'",
             "ALTER TABLE metrics DROP COLUMN IF EXISTS target_classes",
             "ALTER TABLE metrics DROP COLUMN IF EXISTS calculation",
@@ -410,7 +928,6 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE schema_classes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE schema_relationships ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS is_reviewed INTEGER DEFAULT 0",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
@@ -419,12 +936,22 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS answer_datasets TEXT DEFAULT ''",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS clarification TEXT DEFAULT ''",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS query_id TEXT DEFAULT ''",
             "ALTER TABLE schema_optimization_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         ]
     for statement in migrations:
         conn.execute(statement)
-    for table in ("schema_classes", "schema_relationships", "metrics", "concepts"):
+    for table in ("schema_classes", "schema_relationships", "concepts"):
         conn.execute(f"UPDATE {table} SET review_status='approved' WHERE is_reviewed=1 AND (review_status IS NULL OR review_status='' OR review_status='pending')")
+    _migrate_schema_classes_without_properties(conn, dialect)
+    _migrate_schema_classes_to_surrogate_id(conn, dialect)
+    _migrate_metrics_to_surrogate_id(conn, dialect)
+    _migrate_metrics_target_class_to_class_id(conn, dialect)
+    _migrate_metric_definition_class_refs_to_ids(conn)
+    _remove_metrics_required_dimensions(conn, dialect)
+    _remove_metrics_is_reviewed(conn, dialect)
+    _remove_stale_dimension_group_bindings(conn)
 
 
 def _schema_sql(dialect):
@@ -454,11 +981,11 @@ def _schema_sql(dialect):
             created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS schema_classes (
-            id TEXT NOT NULL,
+            id {serial_pk},
+            schema_name TEXT NOT NULL,
             scenario_id TEXT NOT NULL,
             name_cn TEXT DEFAULT '',
             description TEXT DEFAULT '',
-            properties TEXT DEFAULT '[]',
             fields TEXT DEFAULT '[]',
             table_name TEXT DEFAULT '',
             primary_key TEXT DEFAULT '',
@@ -466,7 +993,7 @@ def _schema_sql(dialect):
             review_status TEXT DEFAULT 'pending',
             created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
             updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (id, scenario_id)
+            UNIQUE (scenario_id, schema_name)
         );
         CREATE TABLE IF NOT EXISTS schema_relationships (
             id {serial_pk},
@@ -524,6 +1051,8 @@ def _schema_sql(dialect):
             answer_datasets TEXT DEFAULT '',
             steps TEXT DEFAULT '',
             action_confirm TEXT DEFAULT '',
+            clarification TEXT DEFAULT '',
+            query_id TEXT DEFAULT '',
             created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS chat_clarification_checkpoints (
@@ -536,22 +1065,20 @@ def _schema_sql(dialect):
             consumed_at TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS metrics (
-            id TEXT NOT NULL,
+            id {serial_pk},
             scenario_id TEXT NOT NULL,
             name TEXT NOT NULL,
             description TEXT DEFAULT '',
             category TEXT DEFAULT '',
-            target_class TEXT DEFAULT '',
+            target_class INTEGER,
             dimensions TEXT DEFAULT '[]',
-            required_dimensions TEXT DEFAULT '[]',
             definition TEXT DEFAULT '{{}}',
             chart_type TEXT DEFAULT 'bar',
             sort_order INTEGER DEFAULT 0,
-            is_reviewed INTEGER DEFAULT 0,
             review_status TEXT DEFAULT 'pending',
             created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
             updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (id, scenario_id)
+            UNIQUE (scenario_id, name)
         );
         CREATE TABLE IF NOT EXISTS concepts (
             id TEXT NOT NULL,

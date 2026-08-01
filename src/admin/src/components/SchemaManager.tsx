@@ -194,10 +194,7 @@ export default function SchemaManager() {
   const updateEditField = (index: number, patch: Partial<SchemaField>) => {
     const fields = [...(editClass?.fields || [])];
     fields[index] = { ...fields[index], ...patch } as SchemaField;
-    const properties = fields
-      .map((field) => field.name_cn || field.name)
-      .filter(Boolean);
-    setEditClass({ ...editClass!, fields, properties });
+    setEditClass({ ...editClass!, fields });
   };
 
   const addEditField = () => {
@@ -209,10 +206,7 @@ export default function SchemaManager() {
 
   const removeEditField = (index: number) => {
     const fields = (editClass?.fields || []).filter((_, i) => i !== index);
-    const properties = fields
-      .map((field) => field.name_cn || field.name)
-      .filter(Boolean);
-    setEditClass({ ...editClass!, fields, properties });
+    setEditClass({ ...editClass!, fields });
   };
 
   const openClassEditor = (schemaClass: SchemaClass) => {
@@ -376,11 +370,6 @@ export default function SchemaManager() {
     const payload = {
       ...editClass,
       fields,
-      properties: editClass.properties?.length
-        ? editClass.properties
-        : fields
-            .map((field) => field.name_cn || field.name)
-            .filter(Boolean),
     };
     try {
       await api(
@@ -633,8 +622,7 @@ export default function SchemaManager() {
           `;
         }
         const schemaClass = params.data.raw as SchemaClass;
-        const fieldCount =
-          schemaClass.fields?.length || schemaClass.properties?.length || 0;
+        const fieldCount = schemaClass.fields?.length || 0;
         const connectionCount = relationshipCountByClass[schemaClass.id] || 0;
         return `
           <div style="padding:10px 12px;min-width:240px">
@@ -723,7 +711,7 @@ export default function SchemaManager() {
               Math.min(
                 46,
                 30 +
-                  Math.min(c.fields?.length || c.properties?.length || 0, 8) *
+                  Math.min(c.fields?.length || 0, 8) *
                     1.4,
               ),
             ],
@@ -825,7 +813,6 @@ export default function SchemaManager() {
               setOriginalClassId(null);
               setEditClass({
                 scenario_id: activeScenario,
-                properties: [],
                 fields: [],
                 table_name: "",
                 primary_key: "",
@@ -1263,10 +1250,6 @@ export default function SchemaManager() {
               <option value={-1}>不通过</option>
             </select>
           </div>
-          {/* <div>
-            <label className="text-xs text-slate-500 font-medium block mb-1.5">属性 (逗号分隔)</label>
-            <input value={(editClass?.properties || []).join(", ")} onChange={(e) => setEditClass({ ...editClass!, properties: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })} className="w-full" />
-          </div> */}
           <div className="overflow-hidden rounded-lg border border-slate-200">
             <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-3">
               <div>

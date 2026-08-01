@@ -19,7 +19,7 @@ import PlanProgressCard from "@/components/PlanProgressCard";
 import LoginOverlay from "@/components/LoginOverlay";
 import SidebarPanel from "@/components/SidebarPanel";
 import ToolStepsPanel from "@/components/ToolStepsPanel";
-import type { AnswerDataset, ClarificationAnswer, Message, Conversation, ToolStep } from "@/lib/types";
+import type { AnswerDataset, ClarificationAnswer, ClarificationData, Message, Conversation, ToolStep } from "@/lib/types";
 
 function normalizeQueryResult(value: any): QueryResultData | undefined {
   if (!value || value.error) return undefined;
@@ -255,6 +255,7 @@ function AppContent() {
           answerDatasets: normalizeAnswerDatasets(m.answer_datasets),
           steps: m.steps || [],
           actionConfirm: m.action_confirm || undefined,
+          clarification: m.clarification || undefined,
           isLoading: false,
         }))
       );
@@ -298,6 +299,7 @@ function AppContent() {
     text: string,
     clarificationAnswers?: ClarificationAnswer[],
     clarificationCheckpointId?: string,
+    clarificationVersion?: number,
   ) => {
     if (!text.trim() || isTyping) return;
 
@@ -319,6 +321,21 @@ function AppContent() {
 
     const isClarificationContinuation = Boolean(clarificationCheckpointId && clarificationAnswers?.length);
     const continuationText = "已确认维度条件，继续查询。";
+    if (isClarificationContinuation) {
+      setMessages((current) => current.map((message) => {
+        const clarification = message.clarification;
+        if (!clarification || clarification.checkpoint_id !== clarificationCheckpointId) return message;
+        const updatedClarification: ClarificationData = {
+          ...clarification,
+          submitted_answers: clarificationAnswers ?? [],
+          status: "submitted",
+        };
+        return {
+          ...message,
+          clarification: updatedClarification,
+        };
+      }));
+    }
     const userMsg: Message = {
       id: `u-${Date.now()}`,
       role: "user",
@@ -357,6 +374,7 @@ function AppContent() {
             conversation_id: convId,
             clarification_answers: clarificationAnswers,
             clarification_checkpoint_id: clarificationCheckpointId,
+            clarification_version: clarificationVersion,
             clarification_continuation: isClarificationContinuation,
             clarification_display: isClarificationContinuation ? continuationText : undefined,
           },
@@ -737,6 +755,7 @@ function AppContent() {
                 originalQuestion || "请按已确认的维度口径继续原查询。",
                 answers,
                 msg.clarification?.checkpoint_id,
+                msg.clarification?.clarification_version || msg.clarification?.version,
               )}
             />
           )}

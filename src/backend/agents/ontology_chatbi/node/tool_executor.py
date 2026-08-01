@@ -18,7 +18,6 @@ Chat v3 - 无状态子智能体
 import json
 
 from tools.logger import logger
-from agents.tools.python_analyize import python_analyze
 
 from .entity_disambiguator import EntityDisambiguatorAgent
 
@@ -43,9 +42,11 @@ class ToolExecutor:
         self,
         scenario_id: str,
         entity_agent: EntityDisambiguatorAgent,
+        employee_plugin=None,
     ):
         self.scenario_id = scenario_id
         self.entity_agent = entity_agent
+        self.employee_plugin = employee_plugin
 
     async def execute(
         self,
@@ -68,6 +69,7 @@ class ToolExecutor:
                     query_engine,
                     engine,
                     scenario_id=self.scenario_id,
+                    employee_plugin=self.employee_plugin,
                 )
                 # The caller's subquestion ledger must retain the actual resolved
                 # filter fields used for SQL, not the pre-alignment LLM proposal.
@@ -85,6 +87,7 @@ class ToolExecutor:
                     query_engine,
                     engine,
                     scenario_id=self.scenario_id,
+                    employee_plugin=self.employee_plugin,
                 )
                 if corrected_args.get("error"):
                     return corrected_args
@@ -139,17 +142,4 @@ class ToolExecutor:
                 user_question=str(args.get("user_question") or ""),
             )
 
-        elif name == "python_analyze":
-            query_history = args.get("query_history", [])
-            all_query_data = json.dumps(query_history, ensure_ascii=False, default=str)
-            last_result = query_history[-1].get("result", []) if query_history else []
-            data_json = json.dumps(last_result, ensure_ascii=False, default=str)
-            logger.info("Python analyze started: scenario_id=%s query_history=%d", self.scenario_id, len(query_history))
-            return python_analyze(
-                code=args.get("code", ""),
-                data_json=data_json,
-                all_query_data=all_query_data,
-            )
-
-        else:
-            return {"error": f"未知工具: {name}"}
+        return {"error": f"不支持的受控查询操作: {name}"}

@@ -5,7 +5,7 @@ Schema Optimizer v3.1 - Pydantic 模型定义
 """
 
 from typing import Optional, List
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 
 class FieldOptimization(BaseModel):
@@ -26,18 +26,27 @@ class FieldOptimization(BaseModel):
 
 class ClassOptimization(BaseModel):
     """Class 优化建议"""
-    id: str = Field(..., description="实体类ID（PascalCase）")
+    schema_name: str = Field(
+        ...,
+        validation_alias=AliasChoices("schema_name", "id"),
+        description="实体 Schema 名称（PascalCase，数据库的业务唯一键）",
+    )
     name_cn: str = Field("", description="中文逻辑名称")
     description: str = Field("", description="实体业务定义与边界描述")
     primary_key: str = Field("", description="主键物理列名")
     table_name: str = Field("", description="数据源文件名或表名")
     fields: List[FieldOptimization] = Field(default_factory=list, description="字段列表（可只包含需优化的字段）")
 
-    @field_validator("id")
+    @property
+    def id(self) -> str:
+        """Compatibility accessor for ontology code that uses semantic class IDs."""
+        return self.schema_name
+
+    @field_validator("schema_name")
     @classmethod
-    def validate_id(cls, v):
+    def validate_schema_name(cls, v):
         if not v or not v.strip():
-            raise ValueError("class id 不能为空")
+            raise ValueError("schema_name 不能为空")
         return v.strip()
 
 
@@ -60,22 +69,29 @@ class RelationshipOptimization(BaseModel):
 
 class MetricOptimization(BaseModel):
     """指标优化建议"""
-    id: str = Field(..., description="指标ID（下划线英文）")
-    name: str = Field("", description="指标逻辑中文名称")
+    name: str = Field(
+        ...,
+        validation_alias=AliasChoices("name", "id"),
+        description="指标中文名称（业务唯一键）",
+    )
     description: str = Field("", description="指标业务定义及应用场景")
     category: str = Field("", description="指标业务分类")
     target_class: str = Field("", description="绑定的实体类ID")
     definition: dict = Field(default_factory=dict, description="结构化指标定义")
     dimensions: List[str] = Field(default_factory=list, description="可用分析维度物理列名列表")
-    required_dimensions: List[str] = Field(default_factory=list, description="最低必要粒度维度字段")
     dimension_group_ids: List[str] = Field(default_factory=list, description="关联的分析维度组ID")
     chart_type: str = Field("bar", description="推荐图表类型")
 
-    @field_validator("id")
+    @property
+    def id(self) -> str:
+        """Compatibility accessor for code that still calls the semantic key id."""
+        return self.name
+
+    @field_validator("name")
     @classmethod
-    def validate_id(cls, v):
+    def validate_name(cls, v):
         if not v or not v.strip():
-            raise ValueError("metric id 不能为空")
+            raise ValueError("metric name 不能为空")
         return v.strip()
 
     @field_validator("chart_type")

@@ -45,10 +45,11 @@ class ScenarioUpdate(BaseModel):
 # ============================================================
 
 class SchemaClassEdit(BaseModel):
-    id: str
+    # schema_name is the stable business identifier; id is retained for older clients.
+    schema_name: str = ""
+    id: str = ""
     name_cn: str
     description: str = ""
-    properties: list[str] = []
     fields: list[dict] = []
     table_name: str = ""
     primary_key: str = ""
@@ -82,18 +83,17 @@ class SchemaOptimizationRequest(BaseModel):
 # ============================================================
 
 class MetricCreate(BaseModel):
-    id: str
+    # Deprecated client-supplied semantic ID; the Metric name is the key.
+    id: str = ""
     name: str
     description: str = ""
     category: str = ""
     target_class: str = ""
     definition: dict = {}
     dimensions: list[str] = []
-    required_dimensions: list[str] = []
     dimension_group_ids: list[str] = []
     chart_type: str = "bar"
     sort_order: int = 0
-    is_reviewed: int | bool = 0
     review_status: ReviewStatus = "pending"
 
 
@@ -104,11 +104,9 @@ class MetricUpdate(BaseModel):
     target_class: str = ""
     definition: dict | None = None
     dimensions: list[str] | None = None
-    required_dimensions: list[str] | None = None
     dimension_group_ids: list[str] | None = None
     chart_type: str = ""
     sort_order: int | None = None
-    is_reviewed: int | bool | None = None
     review_status: ReviewStatus | None = None
 
 

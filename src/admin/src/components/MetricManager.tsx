@@ -42,7 +42,7 @@ type SortKey =
   | "category"
   | "target_class"
   | "chart_type"
-  | "is_reviewed"
+  | "review_status"
   | "updated_at";
 type SortDirection = "asc" | "desc";
 
@@ -51,7 +51,7 @@ const SORTABLE_COLUMNS: Array<{ key: SortKey; label: string }> = [
   { key: "category", label: "分类" },
   { key: "target_class", label: "目标类" },
   { key: "chart_type", label: "图表" },
-  { key: "is_reviewed", label: "审核" },
+  { key: "review_status", label: "审核" },
   { key: "updated_at", label: "最后更新时间" },
 ];
 
@@ -121,9 +121,6 @@ function normalizeMetric(metric: Metric): Metric {
     ...metric,
     target_class: metric.target_class || metric.definition?.anchor_class || "",
     dimensions: Array.isArray(metric.dimensions) ? metric.dimensions : [],
-    required_dimensions: Array.isArray(metric.required_dimensions)
-      ? metric.required_dimensions
-      : [],
     dimension_group_ids: Array.isArray(metric.dimension_group_ids)
       ? metric.dimension_group_ids
       : [],
@@ -131,8 +128,20 @@ function normalizeMetric(metric: Metric): Metric {
   };
 }
 
+function metricReviewStatusValue(status?: Metric["review_status"]): ReviewStatus {
+  if (status === "approved") return 1;
+  if (status === "rejected") return -1;
+  return 0;
+}
+
+function reviewStatusFromValue(value: string): NonNullable<Metric["review_status"]> {
+  if (value === "1") return "approved";
+  if (value === "-1") return "rejected";
+  return "pending";
+}
+
 function metricSortValue(metric: Metric, key: SortKey) {
-  if (key === "is_reviewed") return normalizeReviewStatus(metric.is_reviewed);
+  if (key === "review_status") return metricReviewStatusValue(metric.review_status);
   if (key === "chart_type")
     return CHART_LABELS[metric.chart_type] || metric.chart_type || "";
   if (key === "target_class") return metric.target_class || "";
@@ -273,7 +282,6 @@ export default function MetricManager() {
       target_class: activeMetricDefinition.anchor_class,
       definition: activeMetricDefinition,
       dimensions: editMetric.dimensions || [],
-      required_dimensions: editMetric.required_dimensions || [],
     };
     try {
       const idSuffix = isEdit ? `/${editMetric.id}` : "";
@@ -405,7 +413,7 @@ export default function MetricManager() {
   const reviewStats = useMemo(() => {
     const counts: Record<ReviewStatus, number> = { "-1": 0, "0": 0, "1": 0 };
     for (const metric of metrics) {
-      counts[normalizeReviewStatus(metric.is_reviewed)] += 1;
+      counts[metricReviewStatusValue(metric.review_status)] += 1;
     }
     return counts;
   }, [metrics]);
@@ -422,7 +430,7 @@ export default function MetricManager() {
         metricTargetClasses(m).includes(filterTargetClass);
       const mr =
         !filterReviewStatus ||
-        normalizeReviewStatus(m.is_reviewed) === Number(filterReviewStatus);
+        metricReviewStatusValue(m.review_status) === Number(filterReviewStatus);
       return ms && mc && mt && mr;
     });
   }, [filterCategory, filterReviewStatus, filterTargetClass, metrics, search]);
@@ -582,12 +590,11 @@ export default function MetricManager() {
               category: "",
               target_class: "",
               dimensions: [],
-              required_dimensions: [],
               dimension_group_ids: [],
               definition: emptyMetricDefinition(),
               chart_type: "bar",
               sort_order: 0,
-              is_reviewed: 0,
+              review_status: "pending",
             });
             setTargetClassSearch("");
             setMetricFilterValueOptions({});
@@ -805,9 +812,9 @@ export default function MetricManager() {
                     </td>
                     <td>
                       <span
-                        className={`inline-block rounded px-1.5 py-0.5 text-xs ${reviewStatusClassName(m.is_reviewed)}`}
+                        className={`inline-block rounded px-1.5 py-0.5 text-xs ${reviewStatusClassName(metricReviewStatusValue(m.review_status))}`}
                       >
-                        {reviewStatusLabel(m.is_reviewed)}
+                        {reviewStatusLabel(metricReviewStatusValue(m.review_status))}
                       </span>
                     </td>
                     <td className="whitespace-nowrap text-xs text-slate-500">
@@ -1233,11 +1240,10 @@ export default function MetricManager() {
                           <X className="h-4 w-4" />
                         </button>
                       </div>
-                      {(input.source_shape || "wide") === "long" && (
                         <div className="mt-3 rounded border border-amber-200 bg-amber-50/60 p-2.5">
                           <div className="mb-2 flex items-center justify-between">
                             <span className="text-xs font-medium text-amber-800">
-                              窄表固定条件（WHERE）
+                              组成项固定条件
                             </span>
                             <button
                               type="button"
@@ -1255,7 +1261,9 @@ export default function MetricManager() {
                           </div>
                           {(input.filters || []).length === 0 ? (
                             <p className="text-xs text-amber-700">
-                              请选择用于识别该 KPI、规格或类别的固定条件。
+                              {(input.source_shape || "wide") === "long"
+                                ? "窄表组成项必须配置用于识别 KPI、规格或类别的固定条件。"
+                                : "可选。用于限定该组成项的计算范围，例如状态、规格或类别。"}
                             </p>
                           ) : (
                             <div className="space-y-2">
@@ -1398,7 +1406,6 @@ export default function MetricManager() {
                             </div>
                           )}
                         </div>
-                      )}
                       {inputClass && (
                         <p className="mt-2 text-xs text-slate-400">
                           组成项 {index + 1}：{input.aggregation}(
@@ -1544,11 +1551,11 @@ export default function MetricManager() {
               人工审核
             </label>
             <select
-              value={normalizeReviewStatus(editMetric?.is_reviewed)}
+              value={metricReviewStatusValue(editMetric?.review_status)}
               onChange={(e) =>
                 setEditMetric({
                   ...editMetric!,
-                  is_reviewed: Number(e.target.value) as ReviewStatus,
+                  review_status: reviewStatusFromValue(e.target.value),
                 })
               }
               className="w-full text-sm"

@@ -177,6 +177,26 @@ export default function DimensionGroupManager() {
       ),
     [classes],
   );
+  const metricGroups = useMemo(() => {
+    const classById = new Map(
+      classes.map((schemaClass) => [schemaClass.id, schemaClass]),
+    );
+    const groups = new Map<string, Metric[]>();
+    for (const metric of metrics) {
+      const classId = metric.target_class || "__unassigned__";
+      groups.set(classId, [...(groups.get(classId) || []), metric]);
+    }
+    return [...groups.entries()]
+      .sort(([left], [right]) => left.localeCompare(right, "zh-Hans-CN"))
+      .map(([classId, groupMetrics]) => ({
+        classId,
+        classLabel:
+          classId === "__unassigned__"
+            ? "未指定来源类"
+            : classById.get(classId)?.name_cn || classId,
+        metrics: groupMetrics,
+      }));
+  }, [classes, metrics]);
   const filtered = groups.filter((group) =>
     [group.id, group.name, group.description]
       .join(" ")
@@ -674,33 +694,134 @@ export default function DimensionGroupManager() {
             </section>
 
             <section>
-              <h3 className="mb-2 text-sm font-semibold text-slate-700">
-                受影响指标
-              </h3>
-              <div className="grid grid-cols-2 gap-2">
-                {metrics.map((metric) => (
-                  <label
-                    key={metric.id}
-                    className="flex items-center gap-2 rounded border border-slate-100 px-2 py-1.5 text-xs"
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <h3 className="text-sm font-semibold text-slate-700">
+                  受影响指标
+                  <span className="ml-1.5 text-xs font-normal text-slate-400">
+                    已选 {(editing.metric_ids || []).length} / {metrics.length}
+                  </span>
+                </h3>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    className="btn-outline text-xs"
+                    disabled={!metrics.length || (editing.metric_ids || []).length === metrics.length}
+                    onClick={() =>
+                      setEditing({
+                        ...editing,
+                        metric_ids: metrics.map((metric) => metric.id),
+                      })
+                    }
                   >
-                    <input
-                      type="checkbox"
-                      checked={(editing.metric_ids || []).includes(metric.id)}
-                      onChange={(event) =>
-                        setEditing({
-                          ...editing,
-                          metric_ids: event.target.checked
-                            ? [...(editing.metric_ids || []), metric.id]
-                            : (editing.metric_ids || []).filter(
-                                (id) => id !== metric.id,
-                              ),
-                        })
-                      }
-                    />
-                    {metric.name}{" "}
-                    <span className="text-slate-400">({metric.id})</span>
-                  </label>
-                ))}
+                    全选
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-outline text-xs"
+                    disabled={!(editing.metric_ids || []).length}
+                    onClick={() =>
+                      setEditing({ ...editing, metric_ids: [] })
+                    }
+                  >
+                    取消全选
+                  </button>
+                </div>
+              </div>
+              <div className="space-y-3">
+                {metricGroups.map((metricGroup) => {
+                  const groupMetricIds = metricGroup.metrics.map(
+                    (metric) => metric.id,
+                  );
+                  const selectedMetricIds = editing.metric_ids || [];
+                  const selectedCount = groupMetricIds.filter((id) =>
+                    selectedMetricIds.includes(id),
+                  ).length;
+                  return (
+                    <div
+                      key={metricGroup.classId}
+                      className="rounded border border-slate-200 bg-slate-50/60 p-3"
+                    >
+                      <div className="mb-2 flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="truncate text-xs font-medium text-slate-700">
+                            {metricGroup.classLabel}
+                            {metricGroup.classId !== "__unassigned__" && (
+                              <span className="ml-1 text-slate-400">
+                                ({metricGroup.classId})
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-xs text-slate-400">
+                            已选 {selectedCount} / {groupMetricIds.length}
+                          </div>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <button
+                            type="button"
+                            className="btn-outline text-xs"
+                            disabled={selectedCount === groupMetricIds.length}
+                            onClick={() =>
+                              setEditing({
+                                ...editing,
+                                metric_ids: Array.from(
+                                  new Set([
+                                    ...selectedMetricIds,
+                                    ...groupMetricIds,
+                                  ]),
+                                ),
+                              })
+                            }
+                          >
+                            全选本组
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-outline text-xs"
+                            disabled={selectedCount === 0}
+                            onClick={() =>
+                              setEditing({
+                                ...editing,
+                                metric_ids: selectedMetricIds.filter(
+                                  (id) => !groupMetricIds.includes(id),
+                                ),
+                              })
+                            }
+                          >
+                            取消本组
+                          </button>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        {metricGroup.metrics.map((metric) => (
+                          <label
+                            key={metric.id}
+                            className="flex items-center gap-2 rounded border border-slate-100 bg-white px-2 py-1.5 text-xs"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selectedMetricIds.includes(metric.id)}
+                              onChange={(event) =>
+                                setEditing({
+                                  ...editing,
+                                  metric_ids: event.target.checked
+                                    ? [
+                                        ...selectedMetricIds,
+                                        metric.id,
+                                      ]
+                                    : selectedMetricIds.filter(
+                                        (id) => id !== metric.id,
+                                      ),
+                                })
+                              }
+                            />
+                            {metric.name}{" "}
+                            <span className="text-slate-400">({metric.id})</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </section>
           </div>

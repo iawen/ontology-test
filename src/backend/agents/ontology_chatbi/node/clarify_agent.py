@@ -3,7 +3,7 @@
 from collections import OrderedDict
 import re
 
-from agents.ontology_chatbi.helper import resolve_metric_reference
+from agents.ontology_chatbi.services.helper import resolve_metric_reference
 
 
 class ClarifyAgent:
@@ -68,6 +68,95 @@ class ClarifyAgent:
             "audit": audit,
         }
 
+    def precheck_metric_candidates(
+        self,
+        metric_refs: list[str],
+        query_scope: dict,
+        user_message: str,
+        ontology_engine,
+        session_selections: dict[str, dict] | None = None,
+    ) -> dict:
+        """Conservatively identify an early clarification safe before detail planning.
+
+        Blocking is allowed only when every resolved Metric candidate has the
+        same non-empty required Group set and that Group maps into the verified
+        schema scope. The query-plan check remains the authoritative gate.
+        """
+        metrics = ontology_engine.list_metrics()
+        groups_by_id = {
+            str(group.get("id")): group
+            for group in ontology_engine.schema.get("dimension_groups", [])
+            if group.get("status") == "approved"
+        }
+        resolved_metrics = []
+        for metric_ref in dict.fromkeys(str(item).strip() for item in metric_refs if str(item).strip()):
+            metric, _ = resolve_metric_reference(metric_ref, metrics)
+            if metric:
+                resolved_metrics.append(metric)
+        if not resolved_metrics:
+            return {"eligible": False, "reason": "no_resolved_metric_candidates"}
+
+        group_sets = []
+        for metric in resolved_metrics:
+            group_sets.append(tuple(sorted(
+                str(group_id)
+                for group_id in metric.get("dimension_group_ids") or []
+                if str(group_id) in groups_by_id and groups_by_id[str(group_id)].get("is_required")
+            )))
+        if not group_sets[0] or any(group_ids != group_sets[0] for group_ids in group_sets[1:]):
+            return {"eligible": False, "reason": "candidate_groups_not_stable"}
+
+        scope_classes = {
+            str(query_scope.get("target_class") or ""),
+            *(str(class_id) for class_id in query_scope.get("join_classes", []) or []),
+        }
+        required_groups = []
+        for group_id in group_sets[0]:
+            group = groups_by_id[group_id]
+            approved_options = {
+                str(option.get("value") or "")
+                for option in group.get("options", [])
+                if option.get("status", "approved") == "approved" and str(option.get("value") or "")
+            }
+            mapped_options = {
+                str(mapping.get("option_value") or "")
+                for mapping in group.get("field_mappings", [])
+                if str(mapping.get("class_id") or "") in scope_classes
+                and str(mapping.get("field_name") or "")
+            }
+            if not approved_options or not approved_options.issubset(mapped_options):
+                return {"eligible": False, "reason": "group_mapping_outside_scope", "group_id": group_id}
+            required_groups.append({
+                **group,
+                "metric_ids": [str(metric.get("id") or "") for metric in resolved_metrics],
+                "metric_names": [str(metric.get("name") or metric.get("id") or "") for metric in resolved_metrics],
+                "output_names": [],
+            })
+
+        preliminary_plan = {"metrics": [str(metric.get("id") or "") for metric in resolved_metrics], "filters": [], "dimensions": []}
+        unresolved = []
+        resolved = []
+        audit = []
+        for group in required_groups:
+            selection, source, selection_value = self._resolve_group(
+                group, preliminary_plan, user_message, session_selections or {}
+            )
+            if selection:
+                resolved.append({"group_id": group["id"], "option_value": selection, "selection_value": selection_value, "source": source})
+                audit.append({"group_id": group["id"], "option_value": selection, "selection_value": selection_value, "source": source})
+            else:
+                unresolved.append(group)
+                audit.append({"group_id": group["id"], "source": "needs_clarification"})
+        return {
+            "eligible": True,
+            "reason": "stable_candidate_groups",
+            "candidate_metric_ids": preliminary_plan["metrics"],
+            "groups": required_groups,
+            "resolved_selections": resolved,
+            "unresolved_groups": unresolved,
+            "audit": audit,
+        }
+
     @staticmethod
     def _planned_fields(query_plan: dict) -> set[str]:
         fields = {str(item).strip() for item in query_plan.get("dimensions", []) if isinstance(item, str)}
@@ -93,6 +182,10 @@ class ClarifyAgent:
         ):
             return stored_value, "user_answer", member_value
 
+        explicit_time = self._explicit_time_selection(group, user_message)
+        if explicit_time:
+            return explicit_time[0], "message_explicit_time", explicit_time[1]
+
         text = str(user_message or "").casefold()
         matches = []
         for option in group.get("options", []):
@@ -110,6 +203,33 @@ class ClarifyAgent:
         if group.get("group_type") != "time" and policy == "auto_fill" and self._approved_option(group, default):
             return default, "group_default", ""
         return "", "", ""
+
+    def _explicit_time_selection(self, group: dict, user_message: str) -> tuple[str, str] | None:
+        """Return one concrete period explicitly written by the user, if unambiguous."""
+        if group.get("group_type") != "time":
+            return None
+
+        patterns = {
+            "month": r"(?<!\d)(\d{4}AP(?:0[1-9]|1[0-2]))(?!\d)",
+            "quarter": r"(?<!\d)(\d{4}Q[1-4])(?!\d)",
+            # Do not treat the year prefix of an AP month or quarter as a year selection.
+            "year": r"(?<!\d)(\d{4})(?!\d|\s*(?:AP|Q))",
+        }
+        text = str(user_message or "")
+        matches = {
+            option_value: {
+                match.upper()
+                for match in re.findall(patterns[option_value], text, flags=re.IGNORECASE)
+            }
+            for option_value in patterns
+            if self._approved_option(group, option_value)
+        }
+        candidates = [
+            (option_value, value)
+            for option_value, values in matches.items()
+            for value in values
+        ]
+        return candidates[0] if len(candidates) == 1 else None
 
     @staticmethod
     def _valid_time_value(option_value: str, value: str) -> bool:
@@ -156,7 +276,7 @@ class ClarifyAgent:
         return plan
 
     @staticmethod
-    def build_dimension_group_question(unresolved_groups: list[dict]) -> dict:
+    def build_dimension_group_question(unresolved_groups: list[dict], stage: str = "final") -> dict:
         questions = []
         for group in unresolved_groups:
             options = [
@@ -167,26 +287,12 @@ class ClarifyAgent:
             questions.append({"group_id": group.get("id"), "group_name": group.get("name"), "group_type": group.get("group_type"), "metric_ids": group.get("metric_ids", []), "required": True, "requires_value": requires_value, "value_label": "统计期间" if requires_value else "", "options": options})
         first = questions[0] if questions else {}
         question = f"请先选择“{first.get('group_name', '必要维度')}”的统计周期，再填写具体期间。" if first.get("requires_value") else f"为保证统计口径一致，请选择“{first.get('group_name', '必要维度')}”。"
-        return {"version": 2, "reason": "missing_dimension_groups", "question": question, "questions": questions, "field": first.get("group_id", ""), "multi_select": len(questions) > 1, "options": first.get("options", [])}
+        return {"version": 2, "reason": "missing_dimension_groups", "stage": stage, "question": question, "questions": questions, "field": first.get("group_id", ""), "multi_select": len(questions) > 1, "options": first.get("options", [])}
 
     @staticmethod
     def find_missing_required_dimensions(query_plan: dict, ontology_engine) -> list[dict]:
-        planned_dimensions = ClarifyAgent._planned_fields(query_plan)
-        missing: OrderedDict[str, dict] = OrderedDict()
-        for metric_ref in query_plan.get("metrics", []):
-            metric, output = resolve_metric_reference(str(metric_ref).strip(), ontology_engine.list_metrics())
-            if not metric:
-                continue
-            for field in metric.get("required_dimensions") or []:
-                field = str(field).strip()
-                if not field or field in planned_dimensions:
-                    continue
-                item = missing.setdefault(field, {"field": field, "metric_ids": [], "metric_names": [], "output_names": []})
-                metric_id, metric_name = str(metric.get("id") or metric_ref), str(metric.get("name") or metric_ref)
-                if metric_id not in item["metric_ids"]: item["metric_ids"].append(metric_id)
-                if metric_name not in item["metric_names"]: item["metric_names"].append(metric_name)
-                if output and output.get("output_name") not in item["output_names"]: item["output_names"].append(output["output_name"])
-        return list(missing.values())
+        # Required input is governed by DimensionGroup.is_required.
+        return []
 
     @staticmethod
     def build_required_dimension_question(missing_dimensions: list[dict]) -> dict:

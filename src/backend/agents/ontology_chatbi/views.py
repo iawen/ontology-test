@@ -1,5 +1,5 @@
 """
-Data Query Chat v3 - 本地调试 API 路由
+Data Query Chat v3 - Chat SSE API 路由
 ==================
 使用 session_id/agent_id/message 请求体，内部映射到状态机引擎并流式返回 SSE。
 """
@@ -13,13 +13,13 @@ from tools.logger import logger
 from .engine import ChatEngineV3
 from core.models.models import ChatRequest
 
-router = APIRouter()  # 本路由仅供本地调试导入使用，不在 app.api.router 中注册。
+router = APIRouter()  # 由 main.py 注册为应用的 Chat SSE 路由。
 
 
 @router.post("/api/chat")
 async def chat_v3(req: ChatRequest):
     """
-    Data Query 本地调试接口（状态机驱动 + 无状态子智能体）。
+    Data Query 流式接口（状态机驱动 + 无状态子智能体）。
 
     改进：
       1. 动态上下文注入（解决 Schema 信息爆炸）

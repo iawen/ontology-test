@@ -1,4 +1,4 @@
-from agents.ontology_chatbi.helper import match_glossary_terms
+from agents.ontology_chatbi.services.helper import match_glossary_terms
 
 
 # ============================================================

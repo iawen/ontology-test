@@ -9,10 +9,19 @@ from agents.ontology_chatbi.constants import (
     CHINESE_QUARTER_VALUE_PATTERN,
     QUARTER_VALUE_PATTERN,
 )
-from agents.ontology_chatbi.helper import metric_target_classes, resolve_metric_reference
+from agents.ontology_chatbi.plugins import NullEmployeePlugin
+from agents.ontology_chatbi.services.helper import metric_target_classes, resolve_metric_reference
+from agents.ontology_chatbi.services.prompt import (
+    ENTITY_CANDIDATE_MATCH_SYSTEM_PROMPT,
+    FILTER_ALIGNMENT_SYSTEM_PROMPT,
+    FILTER_COLUMN_SELECTION_SYSTEM_PROMPT,
+    get_entity_candidate_match_request_prompt,
+    get_filter_alignment_request_prompt,
+    get_filter_column_selection_request_prompt,
+)
 from tools.logger import logger
 from core.llm.chat_model import get_async_client, get_model_name
-from agents.ontology_chatbi.helper import ap_month_to_quarter, current_quarter_ap_months, valid_ap_month
+from agents.ontology_chatbi.services.helper import ap_month_to_quarter, current_quarter_ap_months, valid_ap_month
 
 # ============================================================
 # 实体消歧 Agent
@@ -153,25 +162,22 @@ class EntityDisambiguatorAgent:
                 messages=[
                     {
                         "role": "system",
-                        "content": (
-                            "你是数据库实体值对齐器。结合已有查询选择，判断待确认过滤值是否等价于候选值中的某一项，"
-                            "可考虑中英文翻译、缩写、别名、大小写、后缀省略等表达差异。"
-                            "只能从候选值中原样选择；不确定时 match 输出空字符串。"
-                            '只输出 JSON：{"match": string, "confidence": number}。'
-                        ),
+                        "content": ENTITY_CANDIDATE_MATCH_SYSTEM_PROMPT,
                     },
                     {
                         "role": "user",
-                        "content": json.dumps(
-                            {
-                                "filter_value": value,
-                                "field_name": field_name,
-                                "class_id": class_id,
-                                "query_selection": selection_context or {},
-                                "user_message": user_message,
-                                "candidates": normalized_candidates,
-                            },
-                            ensure_ascii=False,
+                        "content": get_entity_candidate_match_request_prompt(
+                            json.dumps(
+                                {
+                                    "filter_value": value,
+                                    "field_name": field_name,
+                                    "class_id": class_id,
+                                    "query_selection": selection_context or {},
+                                    "user_message": user_message,
+                                    "candidates": normalized_candidates,
+                                },
+                                ensure_ascii=False,
+                            )
                         ),
                     },
                 ],
@@ -243,9 +249,12 @@ class EntityDisambiguatorAgent:
         query_engine,
         engine,
         scenario_id: str = "",
+        employee_plugin=None,
     ) -> dict:
         """统一的 query_ontology_data 参数对齐入口。"""
-        corrected = await self._deterministic_pre_process(arguments, query_engine, engine, scenario_id)
+        corrected = await self._deterministic_pre_process(
+            arguments, query_engine, engine, scenario_id, employee_plugin
+        )
         return corrected
 
     async def auto_correct_query_ontology_data_args(
@@ -254,12 +263,18 @@ class EntityDisambiguatorAgent:
         query_engine,
         engine,
         scenario_id: str = "",
+        employee_plugin=None,
     ) -> dict:
         """Reapply the controlled type-specific alignment rules after one failed query."""
-        return await self._deterministic_pre_process(arguments, query_engine, engine, scenario_id)
+        return await self._deterministic_pre_process(
+            arguments, query_engine, engine, scenario_id, employee_plugin
+        )
 
-    async def _deterministic_pre_process(self, arguments: dict, query_engine, engine, scenario_id: str = "") -> dict:
+    async def _deterministic_pre_process(
+        self, arguments: dict, query_engine, engine, scenario_id: str = "", employee_plugin=None
+    ) -> dict:
         corrected = dict(arguments or {})
+        employee_plugin = employee_plugin or NullEmployeePlugin()
         target_class = corrected.get("target_class", "") or self._infer_target_class(corrected, engine)
         if target_class:
             corrected["target_class"] = target_class
@@ -267,6 +282,7 @@ class EntityDisambiguatorAgent:
         query_selection = self._query_selection_context(corrected)
         locked_filters = self._complete_filter_dicts(corrected.get("_locked_shared_filters"))
         filters = self._merge_locked_filters(corrected.get("filters") or [], locked_filters)
+        filters = employee_plugin.merge_locked_filters(filters, locked_filters)
         filters_to_align = [
             item for item in filters
             if not isinstance(item, dict) or not self._is_locked_filter(item, locked_filters)
@@ -282,6 +298,7 @@ class EntityDisambiguatorAgent:
             str(corrected.get("user_question") or ""),
             query_selection,
             scenario_id,
+            employee_plugin,
         )
 
         alignment_index = 0
@@ -332,6 +349,7 @@ class EntityDisambiguatorAgent:
                 class_id,
                 allowed_classes,
                 scenario_id,
+                employee_plugin,
             )
             fixed_field = str(fixed.get("field") or "")
             if field and fixed_field and fixed_field != field:
@@ -356,10 +374,9 @@ class EntityDisambiguatorAgent:
     def _merge_locked_filters(cls, filters: list, locked_filters: list[dict]) -> list:
         """Keep parent filters unchanged while allowing a child to add a subset.
 
-        A child LLM may express the same person/time value through another column
-        (for example ``rm_employee_name`` instead of ``bd_employee_name``). Such
-        a competing filter is removed before alignment and the parent's canonical
-        field/value pair is retained.
+        A child query may repeat a locked filter. Generic filters are only
+        deduplicated by their exact field/value pair; employee hierarchy policy
+        is delegated to the agent-specific employee plugin.
         """
         if not locked_filters:
             return list(filters)
@@ -380,6 +397,8 @@ class EntityDisambiguatorAgent:
         operator = str(candidate.get("operator") or "").upper()
         value = cls._filter_value_key(candidate.get("value"))
         for locked in locked_filters:
+            if str(candidate.get("field") or "") != str(locked.get("field") or ""):
+                continue
             if str(locked.get("operator") or "").upper() != operator:
                 continue
             if cls._filter_value_key(locked.get("value")) != value:
@@ -405,6 +424,7 @@ class EntityDisambiguatorAgent:
         user_message: str,
         query_selection: dict,
         scenario_id: str,
+        employee_plugin,
     ) -> dict[int, dict]:
         """Classify every filter value and select up to three sample-backed columns."""
         eligible = [
@@ -417,7 +437,7 @@ class EntityDisambiguatorAgent:
         samples = self._build_alignment_samples(query_engine, engine, allowed_classes, scenario_id)
         if not samples:
             return {
-                item["index"]: {"value_type": self._fallback_filter_value_type(item), "columns": []}
+                item["index"]: {"value_type": self._fallback_filter_value_type(item, employee_plugin), "columns": []}
                 for item in eligible
             }
         try:
@@ -426,20 +446,14 @@ class EntityDisambiguatorAgent:
                 messages=[
                     {
                         "role": "system",
-                        "content": (
-                            "你是受控查询参数对齐规划器。先将每个过滤值分类为 person、date、numeric、other；"
-                            "随后仅从下方实体字段清单中，为每个过滤选择多个可能承载该值的列。"
-                            "person 指人名，date 指日期/月份/季度编码，numeric 指数值。不得修改查询意图或虚构列。"
-                            '只输出 JSON：{"filters":[{"index":number,"value_type":"person|date|numeric|other",'
-                            '"columns":[{"class_id":string,"field":string}]}]}。'
-                        ),
+                        "content": FILTER_ALIGNMENT_SYSTEM_PROMPT,
                     },
                     {
                         "role": "user",
-                        "content": (
-                            f"用户问题：{user_message}\n\n"
-                            f"待对齐过滤条件：{json.dumps(eligible, ensure_ascii=False, default=str)}\n\n"
-                            f"{self._format_alignment_examples(samples)}"
+                        "content": get_filter_alignment_request_prompt(
+                            user_message,
+                            json.dumps(eligible, ensure_ascii=False, default=str),
+                            self._format_alignment_examples(samples),
                         ),
                     },
                 ],
@@ -450,7 +464,7 @@ class EntityDisambiguatorAgent:
         except Exception as exc:
             logger.warning("Filter alignment planning failed: scenario_id=%s error=%s", scenario_id, str(exc))
             return {
-                item["index"]: {"value_type": self._fallback_filter_value_type(item), "columns": []}
+                item["index"]: {"value_type": self._fallback_filter_value_type(item, employee_plugin), "columns": []}
                 for item in eligible
             }
 
@@ -486,15 +500,18 @@ class EntityDisambiguatorAgent:
         for item in eligible:
             plans.setdefault(
                 item["index"],
-                {"value_type": self._fallback_filter_value_type(item), "columns": []},
+                {"value_type": self._fallback_filter_value_type(item, employee_plugin), "columns": []},
             )
         return plans
 
     @staticmethod
-    def _fallback_filter_value_type(item: dict) -> str:
+    def _fallback_filter_value_type(item: dict, employee_plugin=None) -> str:
         field = str(item.get("field") or "")
         value = item.get("value")
-        if re.search(r"人|姓名|负责人|员工|医生|代表|经理", field):
+        employee_plugin = employee_plugin or NullEmployeePlugin()
+        if employee_plugin.is_employee_filter(item):
+            return "person"
+        if re.search(r"人|姓名|负责人|医生", field):
             return "person"
         if isinstance(value, (int, float)) or (isinstance(value, str) and re.fullmatch(r"[-+]?\d+(?:\.\d+)?", value.strip())):
             return "numeric"
@@ -597,8 +614,10 @@ class EntityDisambiguatorAgent:
         default_class: str,
         allowed_classes: list[str],
         scenario_id: str,
+        employee_plugin=None,
     ) -> dict:
         """Apply the non-negotiable value rules after the LLM has narrowed columns."""
+        employee_plugin = employee_plugin or NullEmployeePlugin()
         value = item.get("value")
         candidates = selected_columns or [{"class_id": default_class or target_class, "field": str(item.get("field") or "")}]
         if value_type == "date":
@@ -608,6 +627,8 @@ class EntityDisambiguatorAgent:
                     return {**item, "field": column["field"], "value": formatted, "_class_id": column["class_id"]}
             return item
         if value_type == "person":
+            if employee_plugin.is_employee_filter(item):
+                return await employee_plugin.align_filter(item, candidates, query_engine)
             for column in candidates:
                 values = self._get_field_values(column["class_id"], column["field"], query_engine, str(value), {})
                 if str(value) in {str(candidate) for candidate in values}:
@@ -1045,26 +1066,21 @@ class EntityDisambiguatorAgent:
                 messages=[
                     {
                         "role": "system",
-                        "content": (
-                            "你是数据库过滤条件列复核器。基于当前模型已选择的查询参数、原始过滤字段和值，"
-                            "以及各 class 样本数据，"
-                            "重新判断并选择最应该承载该过滤值的列。不要根据用户原始问题重新推断查询意图。"
-                            "只能从 samples 中给出的 class_id 和 columns 原样选择；"
-                            "不确定时输出空字符串。只输出 JSON："
-                            '{"class_id": string, "field": string, "confidence": number}。'
-                        ),
+                        "content": FILTER_COLUMN_SELECTION_SYSTEM_PROMPT,
                     },
                     {
                         "role": "user",
-                        "content": json.dumps(
-                            {
-                                "query_selection": query_selection or {},
-                                "original_field": field,
-                                "filter_value": value,
-                                "samples": samples,
-                            },
-                            ensure_ascii=False,
-                            default=str,
+                        "content": get_filter_column_selection_request_prompt(
+                            json.dumps(
+                                {
+                                    "query_selection": query_selection or {},
+                                    "original_field": field,
+                                    "filter_value": value,
+                                    "samples": samples,
+                                },
+                                ensure_ascii=False,
+                                default=str,
+                            )
                         ),
                     },
                 ],
