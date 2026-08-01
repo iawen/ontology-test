@@ -193,14 +193,6 @@ class ConceptUpdate(BaseModel):
     review_status: ReviewStatus | None = None
 
 
-class MetricConceptBinding(BaseModel):
-    concept_id: str
-    role: str = "outcome"
-    priority: int = 0
-    is_primary: bool = False
-    status: str = "pending"
-
-
 # ============================================================
 # 图表规则
 # ============================================================

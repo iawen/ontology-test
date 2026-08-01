@@ -38,7 +38,6 @@ def _term_id(term_id: str) -> int:
 # ============================================================
 
 @router.get("/api/scenarios/{scenario_id}/glossary")
-@router.get("/api/admin/scenarios/{scenario_id}/glossary", include_in_schema=False)
 async def list_glossary(scenario_id: str):
     conn = get_db()
     rows = conn.execute(
@@ -50,7 +49,6 @@ async def list_glossary(scenario_id: str):
 
 
 @router.post("/api/scenarios/{scenario_id}/glossary")
-@router.post("/api/admin/scenarios/{scenario_id}/glossary", include_in_schema=False)
 async def create_glossary_term(scenario_id: str, req: GlossaryTermCreate):
     conn = get_db()
     try:
@@ -71,7 +69,6 @@ async def create_glossary_term(scenario_id: str, req: GlossaryTermCreate):
 
 
 @router.put("/api/scenarios/{scenario_id}/glossary/{term_id}")
-@router.put("/api/admin/scenarios/{scenario_id}/glossary/{term_id}", include_in_schema=False)
 async def update_glossary_term(scenario_id: str, term_id: str, req: GlossaryTermUpdate):
     if not req.term.strip():
         raise HTTPException(400, "术语必填")
@@ -93,7 +90,6 @@ async def update_glossary_term(scenario_id: str, term_id: str, req: GlossaryTerm
 
 
 @router.delete("/api/scenarios/{scenario_id}/glossary/{term_id}")
-@router.delete("/api/admin/scenarios/{scenario_id}/glossary/{term_id}", include_in_schema=False)
 async def delete_glossary_term(scenario_id: str, term_id: str):
     conn = get_db()
     cursor = conn.execute("DELETE FROM glossary_terms WHERE id=? AND scenario_id=?", (_term_id(term_id), scenario_id))

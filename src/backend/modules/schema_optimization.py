@@ -85,13 +85,11 @@ def _to_http_error(exc: Exception):
 
 
 @router.get("/api/scenarios/{scenario_id}/schema-optimization/files")
-@router.get("/api/admin/scenarios/{scenario_id}/schema-optimization/files", include_in_schema=False)
 async def api_list_optimization_files(scenario_id: str):
     return list_optimization_files(scenario_id)
 
 
 @router.post("/api/scenarios/{scenario_id}/schema-optimization/files")
-@router.post("/api/admin/scenarios/{scenario_id}/schema-optimization/files", include_in_schema=False)
 async def api_upload_optimization_files(scenario_id: str, files: list[UploadFile] = File(...)):
     try:
         return await save_optimization_files(scenario_id, files)
@@ -100,7 +98,6 @@ async def api_upload_optimization_files(scenario_id: str, files: list[UploadFile
 
 
 @router.delete("/api/scenarios/{scenario_id}/schema-optimization/files/{file_id}")
-@router.delete("/api/admin/scenarios/{scenario_id}/schema-optimization/files/{file_id}", include_in_schema=False)
 async def api_delete_optimization_file(scenario_id: str, file_id: str):
     try:
         return delete_optimization_file(scenario_id, file_id)
@@ -109,13 +106,11 @@ async def api_delete_optimization_file(scenario_id: str, file_id: str):
 
 
 @router.get("/api/scenarios/{scenario_id}/schema-optimization/runs")
-@router.get("/api/admin/scenarios/{scenario_id}/schema-optimization/runs", include_in_schema=False)
 async def api_list_optimization_runs(scenario_id: str):
     return list_optimization_runs(scenario_id)
 
 
 @router.post("/api/scenarios/{scenario_id}/schema-optimization/optimize")
-@router.post("/api/admin/scenarios/{scenario_id}/schema-optimization/optimize", include_in_schema=False)
 async def api_run_schema_optimization(
     scenario_id: str,
     background_tasks: BackgroundTasks,
@@ -361,7 +356,6 @@ def _get_document_paths(scenario_id: str, file_ids: list[str]) -> list[str]:
 
 
 @router.get("/api/scenarios/{scenario_id}/schema-optimization/stream/{run_id}")
-@router.get("/api/admin/scenarios/{scenario_id}/schema-optimization/stream/{run_id}", include_in_schema=False)
 async def api_stream_schema_optimization(scenario_id: str, run_id: str):
     async def generate():
         last_status = None

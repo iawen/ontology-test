@@ -116,7 +116,6 @@ def _relationship_exists(conn, scenario_id: str, source: str, target: str, rel_t
 # ============================================================
 
 @router.get("/api/scenarios/{scenario_id}/schema/classes")
-@router.get("/api/admin/scenarios/{scenario_id}/schema/classes", include_in_schema=False)
 async def admin_list_classes(scenario_id: str):
     """管理面板：列出场景下所有 Schema 类"""
     conn = get_db()
@@ -138,7 +137,6 @@ async def admin_list_classes(scenario_id: str):
 
 
 @router.post("/api/scenarios/{scenario_id}/schema/classes")
-@router.post("/api/admin/scenarios/{scenario_id}/schema/classes", include_in_schema=False)
 async def admin_create_class(scenario_id: str, req: SchemaClassEdit):
     """管理面板：新增 Schema 类"""
     conn = get_db()
@@ -168,7 +166,6 @@ async def admin_create_class(scenario_id: str, req: SchemaClassEdit):
 
 
 @router.put("/api/scenarios/{scenario_id}/schema/classes/{class_id}")
-@router.put("/api/admin/scenarios/{scenario_id}/schema/classes/{class_id}", include_in_schema=False)
 async def admin_update_class(scenario_id: str, class_id: str, req: SchemaClassEdit):
     """管理面板：更新 Schema 类；ID 变更时原子同步其引用。"""
     conn = get_db()
@@ -251,7 +248,6 @@ def _rename_metric_class_references(conn, scenario_id: str, old_class_id: str, n
 
 
 @router.delete("/api/scenarios/{scenario_id}/schema/classes/{class_id}")
-@router.delete("/api/admin/scenarios/{scenario_id}/schema/classes/{class_id}", include_in_schema=False)
 async def admin_delete_class(scenario_id: str, class_id: str):
     """删除 Class 及其所有直接依赖的 Relationship、Metric 和 Concept。"""
     conn = get_db()
@@ -334,7 +330,6 @@ async def admin_delete_class(scenario_id: str, class_id: str):
 
 
 @router.get("/api/scenarios/{scenario_id}/schema/relationships")
-@router.get("/api/admin/scenarios/{scenario_id}/schema/relationships", include_in_schema=False)
 async def admin_list_relationships(scenario_id: str):
     """管理面板：列出场景下所有 Schema 关系"""
     conn = get_db()
@@ -355,7 +350,6 @@ async def admin_list_relationships(scenario_id: str):
 
 
 @router.post("/api/scenarios/{scenario_id}/schema/relationships")
-@router.post("/api/admin/scenarios/{scenario_id}/schema/relationships", include_in_schema=False)
 async def admin_create_relationship(scenario_id: str, req: SchemaRelationEdit):
     """管理面板：新增 Schema 关系"""
     conn = get_db()
@@ -385,7 +379,6 @@ async def admin_create_relationship(scenario_id: str, req: SchemaRelationEdit):
 
 
 @router.put("/api/scenarios/{scenario_id}/schema/relationships/{rel_id}")
-@router.put("/api/admin/scenarios/{scenario_id}/schema/relationships/{rel_id}", include_in_schema=False)
 async def admin_update_relationship(scenario_id: str, rel_id: int, req: SchemaRelationEdit):
     """管理面板：更新 Schema 关系"""
     conn = get_db()
@@ -411,7 +404,6 @@ async def admin_update_relationship(scenario_id: str, rel_id: int, req: SchemaRe
 
 
 @router.delete("/api/scenarios/{scenario_id}/schema/relationships/{rel_id}")
-@router.delete("/api/admin/scenarios/{scenario_id}/schema/relationships/{rel_id}", include_in_schema=False)
 async def admin_delete_relationship(scenario_id: str, rel_id: int):
     """管理面板：删除 Schema 关系"""
     conn = get_db()

@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from core.db.db import get_db
 from configs.global_config import Cfg
-from core.models.models import MetricBatchDelete, MetricCreate, MetricUpdate, ConceptCreate, ConceptUpdate, MetricConceptBinding
+from core.models.models import MetricBatchDelete, MetricCreate, MetricUpdate, ConceptCreate, ConceptUpdate
 
 router = APIRouter()
 
@@ -19,8 +19,6 @@ router = APIRouter()
 REVIEW_STATUSES = {"pending", "approved", "rejected"}
 SOURCE_SHAPES = {"wide", "long"}
 METRIC_FILTER_OPERATORS = {"=", "!=", "IN", "NOT IN", "IS NULL", "IS NOT NULL"}
-CONCEPT_BINDING_ROLES = {"outcome", "target", "driver", "risk", "efficiency", "diagnostic"}
-CONCEPT_BINDING_STATUSES = {"pending", "approved", "rejected"}
 
 
 def _normalize_metric_offset(value, label: str) -> float:
@@ -279,56 +277,11 @@ def _replace_metric_dimension_bindings(conn, scenario_id: str, metric_id: str, g
         )
 
 
-def _metric_concept_bindings(conn, scenario_id: str, metric_id: str) -> list[dict]:
-    rows = conn.execute(
-        """SELECT concept_id, role, priority, is_primary, status
-           FROM metric_concept_bindings WHERE scenario_id=? AND metric_id=?
-           ORDER BY priority, concept_id""",
-        (scenario_id, metric_id),
-    ).fetchall()
-    return [{**dict(row), "is_primary": bool(row["is_primary"])} for row in rows]
-
-
-def _replace_metric_concept_bindings(
-    conn, scenario_id: str, metric_id: str, bindings: list[MetricConceptBinding]
-) -> None:
-    seen_concepts = set()
-    normalized = []
-    for binding in bindings:
-        concept_id = binding.concept_id.strip()
-        role = binding.role.strip().lower()
-        status = binding.status.strip().lower()
-        if not concept_id or concept_id in seen_concepts:
-            raise HTTPException(400, "Concept 绑定必须唯一且 concept_id 非空")
-        if role not in CONCEPT_BINDING_ROLES:
-            raise HTTPException(400, "Concept 绑定角色无效")
-        if status not in CONCEPT_BINDING_STATUSES:
-            raise HTTPException(400, "Concept 绑定状态无效")
-        if not conn.execute(
-            "SELECT 1 FROM concepts WHERE scenario_id=? AND id=?", (scenario_id, concept_id)
-        ).fetchone():
-            raise HTTPException(400, f"关联 Concept 不存在：{concept_id}")
-        seen_concepts.add(concept_id)
-        normalized.append((concept_id, role, binding.priority, int(binding.is_primary), status))
-    conn.execute(
-        "DELETE FROM metric_concept_bindings WHERE scenario_id=? AND metric_id=?",
-        (scenario_id, metric_id),
-    )
-    for concept_id, role, priority, is_primary, status in normalized:
-        conn.execute(
-            """INSERT INTO metric_concept_bindings
-               (metric_id, scenario_id, concept_id, role, priority, is_primary, status)
-               VALUES (?,?,?,?,?,?,?)""",
-            (metric_id, scenario_id, concept_id, role, priority, is_primary, status),
-        )
-
-
 # ============================================================
 # 指标 CRUD
 # ============================================================
 
 @router.get("/api/scenarios/{scenario_id}/metrics")
-@router.get("/api/admin/scenarios/{scenario_id}/metrics", include_in_schema=False)
 async def list_metrics(scenario_id: str):
     conn = get_db()
     rows = conn.execute(
@@ -385,38 +338,6 @@ async def list_metrics(scenario_id: str):
     return result
 
 
-@router.get("/api/admin/scenarios/{scenario_id}/metrics/{metric_id}/concept-bindings")
-async def list_metric_concept_bindings(scenario_id: str, metric_id: str):
-    conn = get_db()
-    try:
-        return _metric_concept_bindings(conn, scenario_id, metric_id)
-    finally:
-        conn.close()
-
-
-@router.put("/api/admin/scenarios/{scenario_id}/metrics/{metric_id}/concept-bindings")
-async def replace_metric_concept_bindings(
-    scenario_id: str, metric_id: str, bindings: list[MetricConceptBinding]
-):
-    conn = get_db()
-    try:
-        if not conn.execute(
-            "SELECT 1 FROM metrics WHERE scenario_id=? AND name=?", (scenario_id, metric_id)
-        ).fetchone():
-            raise HTTPException(404, "指标不存在")
-        _replace_metric_concept_bindings(conn, scenario_id, metric_id, bindings)
-        conn.commit()
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception as exc:
-        conn.rollback()
-        raise HTTPException(400, f"保存 Metric Concept 绑定失败：{exc}")
-    finally:
-        conn.close()
-    return {"status": "ok"}
-
-
 @router.get("/api/scenarios/{scenario_id}/metrics/field-values")
 async def metric_field_values(
     scenario_id: str,
@@ -441,7 +362,6 @@ async def metric_field_values(
 
 
 @router.post("/api/scenarios/{scenario_id}/metrics")
-@router.post("/api/admin/scenarios/{scenario_id}/metrics", include_in_schema=False)
 async def create_metric(scenario_id: str, req: MetricCreate):
     conn = get_db()
     metric_name = req.name.strip()
@@ -474,7 +394,6 @@ async def create_metric(scenario_id: str, req: MetricCreate):
 
 
 @router.put("/api/scenarios/{scenario_id}/metrics/{metric_id}")
-@router.put("/api/admin/scenarios/{scenario_id}/metrics/{metric_id}", include_in_schema=False)
 async def update_metric(scenario_id: str, metric_id: str, req: MetricUpdate):
     conn = get_db()
     sets, vals = [], []
@@ -532,7 +451,6 @@ async def update_metric(scenario_id: str, metric_id: str, req: MetricUpdate):
 
 
 @router.delete("/api/scenarios/{scenario_id}/metrics/{metric_id}")
-@router.delete("/api/admin/scenarios/{scenario_id}/metrics/{metric_id}", include_in_schema=False)
 async def delete_metric(scenario_id: str, metric_id: str):
     conn = get_db()
     conn.execute("DELETE FROM metric_dimension_bindings WHERE scenario_id=? AND metric_id=?", (scenario_id, metric_id))
@@ -544,7 +462,6 @@ async def delete_metric(scenario_id: str, metric_id: str):
 
 
 @router.post("/api/scenarios/{scenario_id}/metrics/batch-delete")
-@router.post("/api/admin/scenarios/{scenario_id}/metrics/batch-delete", include_in_schema=False)
 async def batch_delete_metrics(scenario_id: str, req: MetricBatchDelete):
     ids = [metric_id for metric_id in req.ids if metric_id]
     if not ids:

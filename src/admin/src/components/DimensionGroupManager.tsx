@@ -68,6 +68,8 @@ export default function DimensionGroupManager() {
   const [metrics, setMetrics] = useState<Metric[]>([]);
   const [loading, setLoading] = useState(false);
   const [editing, setEditing] = useState<Partial<DimensionGroup> | null>(null);
+  const [viewingAffectedMetrics, setViewingAffectedMetrics] =
+    useState<DimensionGroup | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [search, setSearch] = useState("");
 
@@ -197,6 +199,34 @@ export default function DimensionGroupManager() {
         metrics: groupMetrics,
       }));
   }, [classes, metrics]);
+  const affectedMetricGroups = useMemo(() => {
+    const knownMetricIds = new Set(metrics.map((metric) => metric.id));
+    return new Map(
+      groups.map((dimensionGroup) => {
+        const selectedIds = new Set(dimensionGroup.metric_ids || []);
+        const grouped = metricGroups
+          .map((metricGroup) => ({
+            classId: metricGroup.classId,
+            classLabel: metricGroup.classLabel,
+            metricNames: metricGroup.metrics
+              .filter((metric) => selectedIds.has(metric.id))
+              .map((metric) => metric.name),
+          }))
+          .filter((metricGroup) => metricGroup.metricNames.length > 0);
+        const missingMetricIds = [...selectedIds].filter(
+          (metricId) => !knownMetricIds.has(metricId),
+        );
+        if (missingMetricIds.length) {
+          grouped.push({
+            classId: "__missing__",
+            classLabel: "未找到的 Metric",
+            metricNames: missingMetricIds,
+          });
+        }
+        return [dimensionGroup.id, grouped] as const;
+      }),
+    );
+  }, [groups, metricGroups, metrics]);
   const filtered = groups.filter((group) =>
     [group.id, group.name, group.description]
       .join(" ")
@@ -248,15 +278,14 @@ export default function DimensionGroupManager() {
       ) : (
         <div className="card overflow-hidden">
           <div className="overflow-x-auto">
-            <table className="data-table min-w-[960px]">
+            <table className="data-table min-w-[820px]">
               <colgroup>
+                <col className="w-40" />
                 <col className="w-48" />
-                <col className="w-32" />
-                <col className="w-72" />
-                <col className="w-24" />
                 <col className="w-48" />
                 <col className="w-24" />
-                <col className="w-28" />
+                <col className="w-24" />
+                <col className="w-24" />
               </colgroup>
               <thead>
                 <tr>
@@ -264,7 +293,6 @@ export default function DimensionGroupManager() {
                   <th>类型 / 策略</th>
                   <th>选项</th>
                   <th className="whitespace-nowrap">映射</th>
-                  <th>影响指标</th>
                   <th className="whitespace-nowrap">状态</th>
                   <th className="text-right">操作</th>
                 </tr>
@@ -297,11 +325,6 @@ export default function DimensionGroupManager() {
                   <td className="text-xs text-slate-500">
                     {group.field_mappings.length} 条
                   </td>
-                  <td className="text-xs text-slate-500">
-                    {group.metric_ids.length
-                      ? group.metric_ids.join("、")
-                      : "未绑定"}
-                  </td>
                   <td>
                     <span
                       className={`rounded px-1.5 py-0.5 text-xs ${group.status === "approved" ? "bg-emerald-50 text-emerald-700" : group.status === "deprecated" ? "bg-slate-100 text-slate-500" : "bg-amber-50 text-amber-700"}`}
@@ -314,6 +337,14 @@ export default function DimensionGroupManager() {
                     </span>
                   </td>
                   <td className="whitespace-nowrap text-right">
+                    {(affectedMetricGroups.get(group.id) || []).length > 0 && (
+                      <button
+                        className="btn-ghost text-xs"
+                        onClick={() => setViewingAffectedMetrics(group)}
+                      >
+                        查看受影响指标
+                      </button>
+                    )}
                     <button
                       className="btn-ghost text-xs"
                       onClick={() => setEditing(group)}
@@ -334,6 +365,47 @@ export default function DimensionGroupManager() {
           </div>
         </div>
       )}
+
+      <Modal
+        isOpen={!!viewingAffectedMetrics}
+        onClose={() => setViewingAffectedMetrics(null)}
+        width="max-w-[calc(100vw-2rem)] md:max-w-[42rem]"
+        title={`受影响指标 · ${viewingAffectedMetrics?.name || ""}`}
+        footer={
+          <button
+            className="btn-outline"
+            onClick={() => setViewingAffectedMetrics(null)}
+          >
+            关闭
+          </button>
+        }
+      >
+        <div className="space-y-3">
+          {(affectedMetricGroups.get(viewingAffectedMetrics?.id || "") || []).map(
+            (metricGroup) => (
+              <section
+                key={metricGroup.classId}
+                className="rounded-lg border border-slate-200 p-3"
+              >
+                <h3 className="text-sm font-medium text-slate-700">
+                  {metricGroup.classLabel}
+                  {metricGroup.classId !== "__unassigned__" &&
+                    metricGroup.classId !== "__missing__" && (
+                      <span className="ml-1.5 text-xs font-normal text-slate-400">
+                        {metricGroup.classId}
+                      </span>
+                    )}
+                </h3>
+                <ul className="mt-2 list-inside list-disc space-y-1 text-sm text-slate-600">
+                  {metricGroup.metricNames.map((metricName) => (
+                    <li key={metricName}>{metricName}</li>
+                  ))}
+                </ul>
+              </section>
+            ),
+          )}
+        </div>
+      </Modal>
 
       <Modal
         isOpen={!!editing}

@@ -30,7 +30,8 @@ export default function DataManager() {
   const [activeTab, setActiveTab] = useState<"csv" | "database">("csv");
   const [connections, setConnections] = useState<DataConnection[]>([]);
   const [showConnForm, setShowConnForm] = useState(false);
-  const [connForm, setConnForm] = useState({ name: "", db_type: "postgresql" as "postgresql" | "mysql", connection_url: "" });
+  const [editingConnId, setEditingConnId] = useState<string | null>(null);
+  const [connForm, setConnForm] = useState({ name: "", db_type: "postgresql" as "postgresql" | "mysql", connection_url: "", is_active: true });
   const [testingConn, setTestingConn] = useState(false);
   const [dbTables, setDbTables] = useState<DBTable[]>([]);
   const [dbPreview, setDbPreview] = useState<DBTablePreview | null>(null);
@@ -218,20 +219,47 @@ export default function DataManager() {
     finally { setTestingConn(false); }
   };
 
+  const testSavedConnection = async (connId: string) => {
+    if (!activeScenario) return;
+    setTestingConn(true);
+    try {
+      const d = await api(`/api/admin/scenarios/${activeScenario}/data_connections/${connId}/test`, { method: "POST" });
+      if (d.ok) addToast("success", `连接成功！发现 ${d.table_count || 0} 张表`);
+      else addToast("error", d.error || "连接失败");
+    } catch (e: any) { addToast("error", e.message || "连接测试失败"); }
+    finally { setTestingConn(false); }
+  };
+
+  const resetConnectionForm = () => {
+    setEditingConnId(null);
+    setConnForm({ name: "", db_type: "postgresql", connection_url: "", is_active: true });
+  };
+
+  const editConnection = (connection: DataConnection) => {
+    setEditingConnId(connection.id);
+    setConnForm({
+      name: connection.name,
+      db_type: connection.db_type,
+      connection_url: "",
+      is_active: Boolean(connection.is_active),
+    });
+    setShowConnForm(true);
+  };
+
   // ── 保存数据库连接 ──
   const saveConnection = async () => {
-    if (!connForm.name || !connForm.connection_url) {
+    if (!connForm.name || (!editingConnId && !connForm.connection_url)) {
       addToast("warning", "请填写连接名称和连接URL");
       return;
     }
     try {
-      await api(`/api/admin/scenarios/${activeScenario}/data_connections`, {
-        method: "POST",
+      await api(`/api/admin/scenarios/${activeScenario}/data_connections${editingConnId ? `/${editingConnId}` : ""}`, {
+        method: editingConnId ? "PUT" : "POST",
         body: JSON.stringify(connForm),
       });
-      addToast("success", "数据库连接已保存");
+      addToast("success", editingConnId ? "数据库连接已更新" : "数据库连接已保存");
       setShowConnForm(false);
-      setConnForm({ name: "", db_type: "postgresql", connection_url: "" });
+      resetConnectionForm();
       invalidateCache(connCacheKey);
       loadConnections(true);
     } catch (e: any) { addToast("error", e.message || "保存失败"); }
@@ -309,6 +337,7 @@ export default function DataManager() {
     setDbPreviewTable(null);
     setLoadingDbPreview(false);
     setShowConnForm(false);
+    resetConnectionForm();
     setSelectedCsvFiles([]);
     setSelectedDbTables([]);
     setSearch("");
@@ -419,7 +448,7 @@ export default function DataManager() {
           <div className="bg-white rounded-xl border border-slate-200 p-6">
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-sm font-semibold text-slate-700">数据库连接</h3>
-              <button onClick={() => setShowConnForm(!showConnForm)} className="px-4 py-2 bg-blue-500 text-white text-sm rounded-lg hover:bg-blue-600">
+              <button onClick={() => { if (showConnForm) resetConnectionForm(); setShowConnForm(!showConnForm); }} className="px-4 py-2 bg-blue-500 text-white text-sm rounded-lg hover:bg-blue-600">
                 {showConnForm ? "取消" : "+ 添加连接"}
               </button>
             </div>
@@ -444,16 +473,21 @@ export default function DataManager() {
                   <label className="block text-xs font-medium text-slate-600 mb-1">连接 URL</label>
                   <input value={connForm.connection_url} onChange={e => setConnForm({ ...connForm, connection_url: e.target.value })} placeholder="postgresql://user:password@host:5432/dbname" className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500" />
                   <p className="mt-1 text-xs text-slate-400">
+                      {editingConnId ? "留空则保留现有连接 URL；填写后会先验证新 URL。" : ""}
                     PostgreSQL: postgresql://user:pass@host:port/dbname &nbsp;|&nbsp;
                     MySQL: mysql://user:pass@host:port/dbname
                   </p>
                 </div>
+                  <label className="flex items-center gap-2 text-sm text-slate-600">
+                    <input type="checkbox" checked={connForm.is_active} onChange={e => setConnForm({ ...connForm, is_active: e.target.checked })} className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
+                    设为活跃连接
+                  </label>
                 <div className="flex gap-2">
                   <button onClick={testConnection} disabled={testingConn || !connForm.connection_url} className="px-4 py-2 bg-slate-600 text-white text-sm rounded-lg hover:bg-slate-700 disabled:opacity-50">
                     {testingConn ? "测试中..." : "测试连接"}
                   </button>
-                  <button onClick={saveConnection} disabled={!connForm.name || !connForm.connection_url} className="px-4 py-2 bg-blue-500 text-white text-sm rounded-lg hover:bg-blue-600 disabled:opacity-50">
-                    保存连接
+                  <button onClick={saveConnection} disabled={!connForm.name || (!editingConnId && !connForm.connection_url)} className="px-4 py-2 bg-blue-500 text-white text-sm rounded-lg hover:bg-blue-600 disabled:opacity-50">
+                    {editingConnId ? "保存修改" : "保存连接"}
                   </button>
                 </div>
               </div>
@@ -478,6 +512,12 @@ export default function DataManager() {
                         </div>
                       </div>
                       <div className="flex items-center gap-2">
+                        <button onClick={() => testSavedConnection(conn.id)} disabled={testingConn} className="px-3 py-1.5 text-xs bg-slate-100 text-slate-600 rounded-lg hover:bg-slate-200 disabled:opacity-50">
+                          测试连接
+                        </button>
+                        <button onClick={() => editConnection(conn)} className="px-3 py-1.5 text-xs bg-amber-50 text-amber-700 rounded-lg hover:bg-amber-100">
+                          编辑
+                        </button>
                         <button onClick={() => browseTables(conn.id)} disabled={loadingTables} className="px-3 py-1.5 text-xs bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 disabled:opacity-50 disabled:cursor-not-allowed">
                           {loadingTablesConnId === conn.id ? "浏览中..." : "浏览表"}
                         </button>
