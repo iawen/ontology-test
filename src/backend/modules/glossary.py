@@ -54,8 +54,8 @@ async def create_glossary_term(scenario_id: str, req: GlossaryTermCreate):
     try:
         conn.execute(
             """INSERT INTO glossary_terms
-               (scenario_id, term, standard_name, aliases, description, category, sort_order)
-               VALUES (?,?,?,?,?,?,?)""",
+               (scenario_id, term, standard_name, aliases, description, category, sort_order, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
             (scenario_id, req.term, req.standard_name,
              json.dumps(req.aliases, ensure_ascii=False),
              req.description, req.category, req.sort_order)
@@ -75,7 +75,7 @@ async def update_glossary_term(scenario_id: str, term_id: str, req: GlossaryTerm
     conn = get_db()
     cursor = conn.execute(
         """UPDATE glossary_terms
-           SET term=?, standard_name=?, aliases=?, description=?, category=?, sort_order=?
+           SET term=?, standard_name=?, aliases=?, description=?, category=?, sort_order=?, updated_at=CURRENT_TIMESTAMP
            WHERE id=? AND scenario_id=?""",
         (
             req.term.strip(), req.standard_name, json.dumps(_aliases(req.aliases), ensure_ascii=False),

@@ -11,6 +11,7 @@ export interface Scenario {
   is_active: number;
   is_default: number;
   created_at: string;
+  updated_at: string;
 }
 
 export interface SchemaClass {
@@ -190,6 +191,8 @@ export interface GlossaryTerm {
   term: string;
   aliases: string[];
   description: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface Skill {

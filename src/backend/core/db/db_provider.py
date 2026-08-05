@@ -828,6 +828,8 @@ def _migrate_db(conn, dialect):
             ("SELECT review_status FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN review_status TEXT DEFAULT 'pending'"),
             ("SELECT created_at FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN created_at TEXT DEFAULT ''"),
             ("SELECT updated_at FROM concepts LIMIT 1", "ALTER TABLE concepts ADD COLUMN updated_at TEXT DEFAULT ''"),
+            ("SELECT updated_at FROM scenarios LIMIT 1", "ALTER TABLE scenarios ADD COLUMN updated_at TEXT DEFAULT ''"),
+            ("SELECT updated_at FROM glossary_terms LIMIT 1", "ALTER TABLE glossary_terms ADD COLUMN updated_at TEXT DEFAULT ''"),
             ("SELECT answer_datasets FROM messages LIMIT 1", "ALTER TABLE messages ADD COLUMN answer_datasets TEXT DEFAULT ''"),
             ("SELECT clarification FROM messages LIMIT 1", "ALTER TABLE messages ADD COLUMN clarification TEXT DEFAULT ''"),
             ("SELECT query_id FROM messages LIMIT 1", "ALTER TABLE messages ADD COLUMN query_id TEXT DEFAULT ''"),
@@ -841,6 +843,8 @@ def _migrate_db(conn, dialect):
         for table in ("schema_classes", "schema_relationships", "metrics", "concepts"):
             conn.execute(f"UPDATE {table} SET created_at=CURRENT_TIMESTAMP WHERE created_at IS NULL OR created_at='' ")
             conn.execute(f"UPDATE {table} SET updated_at=CURRENT_TIMESTAMP WHERE updated_at IS NULL OR updated_at='' ")
+        conn.execute("UPDATE scenarios SET updated_at=created_at WHERE updated_at IS NULL OR updated_at='' ")
+        conn.execute("UPDATE glossary_terms SET updated_at=created_at WHERE updated_at IS NULL OR updated_at='' ")
         conn.execute("DELETE FROM metrics WHERE definition IS NULL OR definition='' OR definition='{}'")
         for column in ("target_classes", "calculation", "formula", "filters_hint", "source_shape", "value_field", "aggregation", "metric_filters", "value_type", "display_format"):
             try:
@@ -895,6 +899,8 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE glossary_terms ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS answer_datasets TEXT DEFAULT ''",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS clarification TEXT DEFAULT ''",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS query_id TEXT DEFAULT ''",
@@ -935,6 +941,8 @@ def _migrate_db(conn, dialect):
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS review_status TEXT DEFAULT 'pending'",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE concepts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "ALTER TABLE glossary_terms ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS answer_datasets TEXT DEFAULT ''",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS clarification TEXT DEFAULT ''",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS query_id TEXT DEFAULT ''",
@@ -942,6 +950,8 @@ def _migrate_db(conn, dialect):
         ]
     for statement in migrations:
         conn.execute(statement)
+    conn.execute("UPDATE scenarios SET updated_at=created_at WHERE updated_at IS NULL")
+    conn.execute("UPDATE glossary_terms SET updated_at=created_at WHERE updated_at IS NULL")
     for table in ("schema_classes", "schema_relationships", "concepts"):
         conn.execute(f"UPDATE {table} SET review_status='approved' WHERE is_reviewed=1 AND (review_status IS NULL OR review_status='' OR review_status='pending')")
     _migrate_schema_classes_without_properties(conn, dialect)
@@ -978,7 +988,8 @@ def _schema_sql(dialect):
             ontology_dir TEXT NOT NULL,
             is_active INTEGER DEFAULT 0,
             is_default INTEGER DEFAULT 0,
-            created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP
+            created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
+            updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS schema_classes (
             id {serial_pk},
@@ -1165,7 +1176,8 @@ def _schema_sql(dialect):
             description TEXT DEFAULT '',
             category TEXT DEFAULT '',
             sort_order INTEGER DEFAULT 0,
-            created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP
+            created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
+            updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS skills (
             id TEXT NOT NULL,

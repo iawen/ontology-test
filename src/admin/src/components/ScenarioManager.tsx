@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
+import { ArrowDown, ArrowUp, ArrowUpDown } from "lucide-react";
 import { useApp } from "@/contexts/AppContext";
 import { useApi } from "@/hooks/useApi";
 import { getCacheData, setCacheData, invalidateCacheByPrefix } from "@/lib/cache";
@@ -10,6 +11,10 @@ import EmptyState from "@/components/ui/EmptyState";
 import SearchInput from "@/components/ui/SearchInput";
 import LoadingSpinner from "@/components/ui/LoadingSpinner";
 import type { Scenario } from "@/lib/types";
+import { formatDateTime } from "@/lib/dateTime";
+
+type SortKey = "name" | "updated_at";
+type SortDirection = "asc" | "desc";
 
 /**
  * 场景管理页面
@@ -29,6 +34,10 @@ export default function ScenarioManager() {
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [editScenario, setEditScenario] = useState<Scenario | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [sort, setSort] = useState<{ key: SortKey; direction: SortDirection }>({
+    key: "updated_at",
+    direction: "desc",
+  });
 
   const load = async (force = false) => {
     const cacheKey = "scenarios:all";
@@ -92,9 +101,43 @@ export default function ScenarioManager() {
     addToast("success", "✅ 已设为默认场景");
   };
 
-  const filtered = scenarios.filter((s) =>
-    s.name.toLowerCase().includes(search.toLowerCase()) || s.id.toLowerCase().includes(search.toLowerCase())
-  );
+  const filtered = useMemo(() => {
+    const keyword = search.toLowerCase();
+    return scenarios
+      .filter((s) => s.name.toLowerCase().includes(keyword) || s.id.toLowerCase().includes(keyword))
+      .sort((left, right) => {
+        const direction = sort.direction === "asc" ? 1 : -1;
+        return (
+          String(left[sort.key] || "").localeCompare(String(right[sort.key] || ""), "zh-Hans-CN", {
+            numeric: true,
+          }) * direction
+        );
+      });
+  }, [scenarios, search, sort]);
+
+  const toggleSort = (key: SortKey) => {
+    setSort((current) => ({
+      key,
+      direction: current.key === key && current.direction === "asc" ? "desc" : "asc",
+    }));
+  };
+
+  const renderSortableHeader = (key: SortKey, label: string) => {
+    const active = sort.key === key;
+    const Icon = active ? (sort.direction === "asc" ? ArrowUp : ArrowDown) : ArrowUpDown;
+    return (
+      <th>
+        <button
+          type="button"
+          onClick={() => toggleSort(key)}
+          className="inline-flex items-center gap-1.5 text-xs font-medium uppercase text-slate-500 transition-colors hover:text-slate-800"
+        >
+          <span>{label}</span>
+          <Icon className="h-3.5 w-3.5" />
+        </button>
+      </th>
+    );
+  };
 
   return (
     <div>
@@ -112,7 +155,7 @@ export default function ScenarioManager() {
           <table className="data-table">
             <thead>
               <tr>
-                <th>ID</th><th>名称</th><th>描述</th><th>创建时间</th><th className="text-center">当前</th><th className="text-right">操作</th>
+                <th>ID</th>{renderSortableHeader("name", "名称")}<th>描述</th><th>创建时间</th>{renderSortableHeader("updated_at", "更新时间")}<th className="text-center">当前</th><th className="text-right">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -121,7 +164,8 @@ export default function ScenarioManager() {
                   <td className="font-mono text-xs text-slate-500">{s.id}</td>
                   <td className="font-medium text-slate-700">{s.name}</td>
                   <td className="text-slate-500 max-w-xs truncate">{s.description}</td>
-                  <td className="text-slate-400 text-xs whitespace-nowrap">{s.created_at}</td>
+                  <td className="text-slate-400 text-xs whitespace-nowrap">{formatDateTime(s.created_at)}</td>
+                  <td className="text-slate-400 text-xs whitespace-nowrap">{formatDateTime(s.updated_at)}</td>
                   <td className="text-center">
                     { s.is_default ? (
                       <span className="inline-flex items-center gap-1 text-xs text-emerald-600 font-medium"><span className="w-2 h-2 rounded-full bg-emerald-500" />默认</span>

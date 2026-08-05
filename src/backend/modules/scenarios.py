@@ -39,8 +39,12 @@ async def create_scenario(body: dict = Body(...)):
     os.makedirs(os.path.join(Cfg.scenarios_root, ontology_dir), exist_ok=True)
     conn = get_db()
     try:
-        conn.execute("INSERT INTO scenarios (id, name, description, data_dir, ontology_dir) VALUES (?,?,?,?,?)",
-                     (sid, name, desc, data_dir, ontology_dir))
+        conn.execute(
+            """INSERT INTO scenarios
+               (id, name, description, data_dir, ontology_dir, created_at, updated_at)
+               VALUES (?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+            (sid, name, desc, data_dir, ontology_dir),
+        )
         conn.commit()
     except IntegrityError:
         conn.close()
@@ -68,8 +72,8 @@ async def delete_scenario(scenario_id: str):
 @router.post("/api/admin/scenarios/{scenario_id}/default")
 async def set_default_scenario(scenario_id: str):
     conn = get_db()
-    conn.execute("UPDATE scenarios SET is_default=0")
-    conn.execute("UPDATE scenarios SET is_default=1 WHERE id=?", (scenario_id,))
+    conn.execute("UPDATE scenarios SET is_default=0, updated_at=CURRENT_TIMESTAMP WHERE is_default=1")
+    conn.execute("UPDATE scenarios SET is_default=1, updated_at=CURRENT_TIMESTAMP WHERE id=?", (scenario_id,))
     conn.commit()
     conn.close()
     return {"status": "ok"}
@@ -81,7 +85,7 @@ async def toggle_scenario(scenario_id: str, body: dict = Body(...)):
     is_active = body.get("is_active", 1)
     is_active = 0 if is_active == 1 else 1
     conn = get_db()
-    conn.execute("UPDATE scenarios SET is_active=? WHERE id=?", (is_active, scenario_id))
+    conn.execute("UPDATE scenarios SET is_active=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (is_active, scenario_id))
     conn.commit()
     conn.close()
     return {"status": "ok"}
@@ -89,7 +93,7 @@ async def toggle_scenario(scenario_id: str, body: dict = Body(...)):
 @router.put("/api/admin/scenarios/{scenario_id}")
 async def update_scenario(scenario_id: str, body: dict = Body(...)):
     conn = get_db()
-    conn.execute("UPDATE scenarios SET name=?, description=? WHERE id=?",
+    conn.execute("UPDATE scenarios SET name=?, description=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                  (body.get("name",""), body.get("description",""), scenario_id))
     conn.commit()
     conn.close()

@@ -1,5 +1,6 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
+import { ArrowDown, ArrowUp, ArrowUpDown } from "lucide-react";
 import { useApp } from "@/contexts/AppContext";
 import { useApi } from "@/hooks/useApi";
 import { getCacheData, setCacheData, invalidateCache } from "@/lib/cache";
@@ -10,6 +11,10 @@ import SearchInput from "@/components/ui/SearchInput";
 import LoadingSpinner from "@/components/ui/LoadingSpinner";
 import ScenarioSelector from "@/components/ScenarioSelector";
 import type { GlossaryTerm } from "@/lib/types";
+import { formatDateTime } from "@/lib/dateTime";
+
+type SortKey = "term" | "updated_at";
+type SortDirection = "asc" | "desc";
 
 const normalizeAliases = (aliases: unknown): string[] => {
   const values = Array.isArray(aliases) ? aliases : [aliases];
@@ -29,6 +34,10 @@ export default function GlossaryManager() {
   const [aliasText, setAliasText] = useState("");
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [sort, setSort] = useState<{ key: SortKey; direction: SortDirection }>({
+    key: "updated_at",
+    direction: "desc",
+  });
 
   const cacheKey = `glossary:${activeScenario}`;
 
@@ -99,14 +108,48 @@ export default function GlossaryManager() {
     }
   };
 
-  const filtered = terms.filter(
-    (t) =>
-      !search ||
-      t.term.toLowerCase().includes(search.toLowerCase()) ||
-      normalizeAliases(t.aliases).some((a) =>
-        a.toLowerCase().includes(search.toLowerCase()),
-      ),
-  );
+  const filtered = useMemo(() => {
+    const keyword = search.toLowerCase();
+    return terms
+      .filter(
+        (t) =>
+          !keyword ||
+          t.term.toLowerCase().includes(keyword) ||
+          normalizeAliases(t.aliases).some((a) => a.toLowerCase().includes(keyword)),
+      )
+      .sort((left, right) => {
+        const direction = sort.direction === "asc" ? 1 : -1;
+        return (
+          String(left[sort.key] || "").localeCompare(String(right[sort.key] || ""), "zh-Hans-CN", {
+            numeric: true,
+          }) * direction
+        );
+      });
+  }, [search, sort, terms]);
+
+  const toggleSort = (key: SortKey) => {
+    setSort((current) => ({
+      key,
+      direction: current.key === key && current.direction === "asc" ? "desc" : "asc",
+    }));
+  };
+
+  const renderSortableHeader = (key: SortKey, label: string) => {
+    const active = sort.key === key;
+    const Icon = active ? (sort.direction === "asc" ? ArrowUp : ArrowDown) : ArrowUpDown;
+    return (
+      <th>
+        <button
+          type="button"
+          onClick={() => toggleSort(key)}
+          className="inline-flex items-center gap-1.5 text-xs font-medium uppercase text-slate-500 transition-colors hover:text-slate-800"
+        >
+          <span>{label}</span>
+          <Icon className="h-3.5 w-3.5" />
+        </button>
+      </th>
+    );
+  };
 
   if (!activeScenario)
     return (
@@ -158,9 +201,10 @@ export default function GlossaryManager() {
           <table className="data-table">
             <thead>
               <tr>
-                <th>术语</th>
+                {renderSortableHeader("term", "术语")}
                 <th>别名</th>
                 <th>描述</th>
+                {renderSortableHeader("updated_at", "更新时间")}
                 <th className="text-right">操作</th>
               </tr>
             </thead>
@@ -173,6 +217,9 @@ export default function GlossaryManager() {
                   </td>
                   <td className="max-w-xs truncate text-slate-500">
                     {t.description}
+                  </td>
+                  <td className="whitespace-nowrap text-xs text-slate-400">
+                    {formatDateTime(t.updated_at)}
                   </td>
                   <td className="text-right">
                     <button
